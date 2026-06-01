@@ -19,8 +19,10 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif", ".png", ".jpg", ".jpeg", ".webp"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif"}
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+VIDEO_EXTENSIONS     = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif"}
+AUDIO_VIDEO_EXTS     = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+MAX_FILE_SIZE        = 25 * 1024 * 1024   # 25 MB
+MAX_REPETITIONS      = 100
 
 # ─── Effect definitions ───────────────────────────────────────────────────────
 
@@ -32,13 +34,10 @@ IHTX_PRESETS = {
     "static":  "VHS TV static noise overlay",
     "melt":    "perspective warp melt",
     "corrupt": "scanlines + gamma crush",
-    "huehsv":  "haldclut hue rotation via ImageMagick  — usage: !huehsv [0‑1]",
-    "pinch":   "pinch/punch lens warp via geq  — usage: !pinch [strength] [radius] [cx] [cy]",
-    "pitch":   "rubberband pitch shift (audio only)  — usage: !pitch [semitones]",
 }
 
 _BASE_NOISE = "noise=alls=40:allf=t+u"
-_SHAKE = "crop=iw-20:ih-20:10+5*sin(t*30):10+5*cos(t*17),scale=iw+20:ih+20"
+_SHAKE      = "crop=iw-20:ih-20:10+5*sin(t*30):10+5*cos(t*17),scale=iw+20:ih+20"
 _CHROMAB = (
     "[0:v]split=3[r][g][b];"
     "[r]lutrgb=r=val:g=0:b=0,pad=iw+6:ih:3:0[ro];"
@@ -48,26 +47,26 @@ _CHROMAB = (
     "[rg][bo]blend=all_mode=addition"
 )
 
-# Each entry: {"vf": str|None, "complex": str|None}
+# vf: simple -vf chain | complex: -filter_complex graph
 _PRESET_MAP: dict[str, dict] = {
     "chaos": {
-        "vf": f"{_SHAKE},{_BASE_NOISE},hue=h=t*180:s=2,eq=contrast=1.5:brightness=0.05:saturation=3",
+        "vf":      f"{_SHAKE},{_BASE_NOISE},hue=h=t*180:s=2,eq=contrast=1.5:brightness=0.05:saturation=3",
         "complex": None,
     },
     "glitch": {
-        "vf": f"rgbashift=rh=8:rv=-8:gh=-4:gv=4:bh=6:bv=-6,{_BASE_NOISE},eq=contrast=1.8:saturation=0",
+        "vf":      f"rgbashift=rh=8:rv=-8:gh=-4:gv=4:bh=6:bv=-6,{_BASE_NOISE},eq=contrast=1.8:saturation=0",
         "complex": None,
     },
     "shake": {
-        "vf": f"{_SHAKE},{_BASE_NOISE},eq=contrast=1.3:saturation=1.5",
+        "vf":      f"{_SHAKE},{_BASE_NOISE},eq=contrast=1.3:saturation=1.5",
         "complex": None,
     },
     "rainbow": {
-        "vf": None,
+        "vf":      None,
         "complex": _CHROMAB,
     },
     "static": {
-        "vf": f"{_BASE_NOISE},curves=vintage,eq=contrast=1.2",
+        "vf":      f"{_BASE_NOISE},curves=vintage,eq=contrast=1.2",
         "complex": None,
     },
     "melt": {
@@ -79,7 +78,7 @@ _PRESET_MAP: dict[str, dict] = {
         "complex": None,
     },
     "corrupt": {
-        "vf": f"drawgrid=x=0:y=0:w=iw:h=5:t=1:color=white@0.1,{_BASE_NOISE},eq=gamma=1.5:saturation=0.3:contrast=2",
+        "vf":      f"drawgrid=x=0:y=0:w=iw:h=5:t=1:color=white@0.1,{_BASE_NOISE},eq=gamma=1.5:saturation=0.3:contrast=2",
         "complex": None,
     },
 }
@@ -87,7 +86,6 @@ _PRESET_MAP: dict[str, dict] = {
 
 def build_pinch_vf(strength: float = 1.0, radius: float = 0.5,
                    cx: float = 0.5, cy: float = 0.5) -> str:
-    """Build the FFmpeg vf string for the Pinch and Punch lens-warp effect."""
     gauss_arg = (
         f"-3.3333*pow(hypot("
         f"(X-W*{cx})/(W*{radius}),"
@@ -100,127 +98,116 @@ def build_pinch_vf(strength: float = 1.0, radius: float = 0.5,
 
 
 def build_huehsv_haldclut(tmpdir: str, amount: float = 0.5) -> str:
-    """
-    Generate a HaldCLUT PNG via ImageMagick with hue rotation.
-    hue_value = amount * 200 + 100  (ImageMagick modulate scale: 100 = no change)
-    Returns the path to the generated hald clut PNG.
-    """
-    hue_val = int(amount * 200 + 100)
+    hue_val   = int(amount * 200 + 100)
     clut_path = os.path.join(tmpdir, "hald_clut.png")
-    cmd = ["magick", "hald:8", "-modulate", f"100,100,{hue_val}", clut_path]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result    = subprocess.run(
+        ["magick", "hald:8", "-modulate", f"100,100,{hue_val}", clut_path],
+        capture_output=True, text=True, timeout=30,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"ImageMagick failed: {result.stderr}")
     return clut_path
 
 
-# ─── FFmpeg runner ────────────────────────────────────────────────────────────
+# ─── FFmpeg primitives ────────────────────────────────────────────────────────
+
+def _run(cmd: list[str], timeout: int = 180) -> tuple[bool, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (True, "") if r.returncode == 0 else (False, r.stderr[-2000:])
+    except subprocess.TimeoutExpired:
+        return False, f"FFmpeg timed out (>{timeout}s)"
+    except Exception as e:
+        return False, str(e)
+
 
 def _ffmpeg_single(input_path: str, output_path: str, vf: str | None,
                    fc: str | None, is_video: bool, duration: int = 30) -> tuple[bool, str]:
-    """Run ffmpeg with a single input."""
     if is_video:
         if fc:
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-filter_complex", fc,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy", "-t", str(duration),
-                output_path,
-            ]
+            cmd = ["ffmpeg", "-y", "-i", input_path,
+                   "-filter_complex", fc,
+                   "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                   "-c:a", "copy", "-t", str(duration), output_path]
         else:
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy", "-t", str(duration),
-                output_path,
-            ]
+            cmd = ["ffmpeg", "-y", "-i", input_path,
+                   "-vf", vf,
+                   "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                   "-c:a", "copy", "-t", str(duration), output_path]
     else:
-        # Static image → 3-second animated GIF
-        palette_chain = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+        pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
         if fc:
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", input_path,
-                "-filter_complex", fc + palette_chain,
-                "-t", "3", output_path,
-            ]
+            cmd = ["ffmpeg", "-y", "-loop", "1", "-i", input_path,
+                   "-filter_complex", fc + pal, "-t", "3", output_path]
         else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", input_path,
-                "-vf", vf + palette_chain,
-                "-t", "3", output_path,
-            ]
-
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return (True, "") if r.returncode == 0 else (False, r.stderr[-2000:])
-    except subprocess.TimeoutExpired:
-        return False, "FFmpeg timed out (>120s)"
-    except Exception as e:
-        return False, str(e)
+            cmd = ["ffmpeg", "-y", "-loop", "1", "-i", input_path,
+                   "-vf", vf + pal, "-t", "3", output_path]
+    return _run(cmd)
 
 
 def _ffmpeg_haldclut(input_path: str, clut_path: str, output_path: str,
-                     is_video: bool) -> tuple[bool, str]:
-    """Run ffmpeg with haldclut applied from a second input (the CLUT image)."""
+                     is_video: bool, duration: int = 30) -> tuple[bool, str]:
     if is_video:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-i", clut_path,
-            "-filter_complex", "[0:v][1:v]haldclut",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "copy", "-t", "30",
-            output_path,
-        ]
+        cmd = ["ffmpeg", "-y",
+               "-i", input_path, "-i", clut_path,
+               "-filter_complex", "[0:v][1:v]haldclut",
+               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+               "-c:a", "copy", "-t", str(duration), output_path]
     else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", input_path,
-            "-i", clut_path,
-            "-filter_complex",
-            "[0:v][1:v]haldclut,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
-            "-t", "3", output_path,
-        ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return (True, "") if r.returncode == 0 else (False, r.stderr[-2000:])
-    except subprocess.TimeoutExpired:
-        return False, "FFmpeg timed out (>120s)"
-    except Exception as e:
-        return False, str(e)
+        cmd = ["ffmpeg", "-y",
+               "-loop", "1", "-i", input_path, "-i", clut_path,
+               "-filter_complex",
+               "[0:v][1:v]haldclut,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+               "-t", "3", output_path]
+    return _run(cmd)
 
 
-def run_preset(input_path: str, output_path: str, preset: str,
-               is_video: bool) -> tuple[bool, str]:
-    cfg = _PRESET_MAP[preset]
-    return _ffmpeg_single(input_path, output_path, cfg["vf"], cfg["complex"], is_video)
+def _ffmpeg_multipass_preset(
+    input_path: str, output_path: str, tmpdir: str,
+    preset: str, is_video: bool,
+    repetitions: int, duration: int,
+) -> tuple[bool, str]:
+    """Apply a preset effect N times, piping each pass into the next."""
+    cfg  = _PRESET_MAP[preset]
+    ext  = Path(input_path).suffix
+    cur  = input_path
+
+    for i in range(repetitions):
+        is_last = (i == repetitions - 1)
+        nxt     = output_path if is_last else os.path.join(tmpdir, f"pass_{i}{ext}")
+        ok, err = _ffmpeg_single(cur, nxt, cfg["vf"], cfg["complex"], is_video, duration)
+        if not ok:
+            return False, f"Pass {i+1}/{repetitions} failed: {err}"
+        cur = nxt
+
+    return True, ""
 
 
-def _ffmpeg_pitch(input_path: str, output_path: str, semitones: float) -> tuple[bool, str]:
+def _ffmpeg_multipitch(
+    input_path: str, output_path: str,
+    semitones_list: list[float],
+) -> tuple[bool, str]:
     """
-    Pitch-shift audio using FFmpeg's rubberband filter.
-    pitch ratio = 2^(semitones/12)
+    Split audio into N streams, pitch-shift each via rubberband, mix together.
     Video stream is copied untouched.
     """
-    ratio = 2 ** (semitones / 12)
+    n   = len(semitones_list)
+    fc  = f"[0:a]asplit={n}" + "".join(f"[a{i}]" for i in range(n)) + ";"
+    fc += ";".join(
+        f"[a{i}]rubberband=pitch={2 ** (st / 12):.6f}[p{i}]"
+        for i, st in enumerate(semitones_list)
+    ) + ";"
+    fc += "".join(f"[p{i}]" for i in range(n)) + f"amix=inputs={n}:normalize=0[aout]"
+
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
-        "-af", f"rubberband=pitch={ratio:.6f}",
+        "-filter_complex", fc,
+        "-map", "0:v", "-map", "[aout]",
         "-c:v", "copy",
         "-t", "300",
         output_path,
     ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        return (True, "") if r.returncode == 0 else (False, r.stderr[-2000:])
-    except subprocess.TimeoutExpired:
-        return False, "FFmpeg timed out (>180s)"
-    except Exception as e:
-        return False, str(e)
+    return _run(cmd, timeout=300)
 
 
 # ─── Download helper ──────────────────────────────────────────────────────────
@@ -230,9 +217,8 @@ async def download_attachment(attachment: discord.Attachment, dest: str):
         async with session.get(attachment.url) as resp:
             if resp.status != 200:
                 raise ValueError(f"HTTP {resp.status}")
-            data = await resp.read()
-    with open(dest, "wb") as f:
-        f.write(data)
+            with open(dest, "wb") as f:
+                f.write(await resp.read())
 
 
 # ─── Shared processing core ───────────────────────────────────────────────────
@@ -241,14 +227,14 @@ async def process_and_reply(
     ctx: commands.Context,
     effect_label: str,
     desc: str,
-    worker,          # sync callable(input_path, output_path, tmpdir, is_video) -> (ok, err)
+    worker,   # sync callable(input_path, output_path, tmpdir, is_video) -> (ok, err)
+    out_ext_override: str | None = None,
 ):
     if not ctx.message.attachments:
-        await ctx.reply(f"Attach a video or image and re-run the command.")
+        await ctx.reply("Attach a video or image and re-run the command.")
         return
 
     attachment = ctx.message.attachments[0]
-
     if attachment.size > MAX_FILE_SIZE:
         await ctx.reply(f"File too large ({attachment.size / 1024 / 1024:.1f} MB, max 25 MB).")
         return
@@ -259,12 +245,12 @@ async def process_and_reply(
         return
 
     is_video = suffix in VIDEO_EXTENSIONS
-    out_ext = ".mp4" if is_video else ".gif"
+    out_ext  = out_ext_override or (".mp4" if is_video else ".gif")
 
-    status_msg = await ctx.reply(f"⚙️ Applying **{effect_label}** ({desc})…")
+    status_msg = await ctx.reply(f"⚙️ Applying **{effect_label}** — {desc}…")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"input{suffix}")
+        input_path  = os.path.join(tmpdir, f"input{suffix}")
         output_path = os.path.join(tmpdir, f"output{out_ext}")
 
         try:
@@ -287,15 +273,15 @@ async def process_and_reply(
             return
 
         if os.path.getsize(output_path) > MAX_FILE_SIZE:
-            await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Try a shorter clip.")
+            await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Try shorter clip or fewer repetitions.")
             return
 
-        stem = Path(attachment.filename).stem
-        out_filename = f"ihtx_{effect_label.replace(' ', '_')}_{stem}{out_ext}"
+        stem        = Path(attachment.filename).stem
+        out_fn      = f"ihtx_{effect_label.replace(' ', '_')}_{stem}{out_ext}"
         try:
             await ctx.reply(
-                content=f"✅ **IHTX `{effect_label}`** applied!",
-                file=discord.File(output_path, filename=out_filename),
+                content=f"✅ **{effect_label}** applied!",
+                file=discord.File(output_path, filename=out_fn),
             )
             await status_msg.delete()
         except discord.HTTPException as e:
@@ -315,18 +301,27 @@ async def on_ready():
 
 
 @bot.command(name="ihtx", aliases=["effect", "destroy"])
-async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
-    """Apply an IHTX FFmpeg effect preset. Attach a file.
-    Usage: !ihtx [preset]
-    For huehsv or pinch with args use the dedicated commands instead.
+async def ihtx_command(
+    ctx: commands.Context,
+    preset: str = "chaos",
+    repetitions: int = 1,
+    duration: int = 30,
+):
+    """Apply an IHTX effect preset with optional repetitions and duration.
+
+    !ihtx [preset] [repetitions=1] [duration=30]
+      preset      — effect name (default: chaos)
+      repetitions — 1–100, how many times to chain the effect (default: 1)
+      duration    — output length in seconds (default: 30)
+
+    Examples:
+      !ihtx glitch         → glitch once, 30s
+      !ihtx chaos 5        → chaos applied 5× in sequence
+      !ihtx shake 3 10     → shake 3× on a 10-second output
     """
     preset = preset.lower()
-    if preset not in IHTX_PRESETS:
-        plist = ", ".join(f"`{p}`" for p in IHTX_PRESETS)
-        await ctx.reply(f"Unknown preset. Available: {plist}")
-        return
 
-    # Route special presets to their dedicated handlers
+    # Route dedicated commands
     if preset == "huehsv":
         await huehsv_command(ctx, 0.5)
         return
@@ -334,52 +329,71 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
         await pinch_command(ctx, 1.0, 0.5, 0.5, 0.5)
         return
     if preset == "pitch":
-        await pitch_command(ctx, 12.0)
+        await pitch_command(ctx, "12")
         return
+
+    if preset not in IHTX_PRESETS:
+        plist = ", ".join(f"`{p}`" for p in IHTX_PRESETS)
+        await ctx.reply(
+            f"Unknown preset `{preset}`. Available: {plist}\n"
+            f"Also: `!huehsv`, `!pinch`, `!pitch`"
+        )
+        return
+
+    repetitions = max(1, min(MAX_REPETITIONS, repetitions))
+    duration    = max(1, min(600, duration))
 
     if not ctx.message.attachments:
         plist = ", ".join(f"`{p}`" for p in IHTX_PRESETS)
         await ctx.reply(
-            f"**I Hate The X — IHTX Bot**\n"
-            f"Attach a video or image and use `!ihtx [preset]`.\n\n"
-            f"**Presets:** {plist}\n\n"
-            f"`!ihtx chaos` — {IHTX_PRESETS['chaos']}\n"
-            f"`!ihtx glitch` — {IHTX_PRESETS['glitch']}\n"
-            f"`!ihtx rainbow` — {IHTX_PRESETS['rainbow']}\n"
-            f"`!huehsv [0‑1]` — hue rotation\n"
-            f"`!pinch [strength] [radius] [cx] [cy]` — lens warp\n"
+            "**I Hate The X — IHTX Bot**\n"
+            "Attach a video or image and run:\n"
+            "`!ihtx [preset] [repetitions=1] [duration=30]`\n\n"
+            f"**Presets:** {plist}\n"
+            "**Dedicated:** `!huehsv` · `!pinch` · `!pitch`\n\n"
+            "Example: `!ihtx glitch 5 15` — glitch effect ×5, 15 seconds"
         )
         return
 
-    def worker(input_path, output_path, tmpdir, is_video):
-        return run_preset(input_path, output_path, preset, is_video)
+    rep_label = f"×{repetitions}" if repetitions > 1 else ""
+    label     = f"IHTX {preset}{rep_label}"
+    desc      = f"{IHTX_PRESETS[preset]}, {repetitions} pass(es), {duration}s"
 
-    await process_and_reply(ctx, preset, IHTX_PRESETS[preset], worker)
+    if repetitions > 10:
+        desc += " ⚠️ many passes — may take a while"
+
+    def worker(input_path, output_path, tmpdir, is_video):
+        return _ffmpeg_multipass_preset(
+            input_path, output_path, tmpdir,
+            preset, is_video, repetitions, duration,
+        )
+
+    await process_and_reply(ctx, label, desc, worker)
 
 
 @bot.command(name="huehsv")
-async def huehsv_command(ctx: commands.Context, amount: float = 0.5):
-    """Apply HueHSV haldclut hue rotation via ImageMagick.
+async def huehsv_command(ctx: commands.Context, amount: float = 0.5, duration: int = 30):
+    """HueHSV haldclut hue rotation via ImageMagick.
 
-    !huehsv [amount]
-      amount — 0.0 to 1.0  (default 0.5)
-               Hue value = amount × 200 + 100 in ImageMagick modulate scale
-               0.0 → hue 100 (no shift), 0.5 → hue 200 (+180°), 1.0 → hue 300 (wraps)
+    !huehsv [amount] [duration=30]
+      amount   — 0.0–1.0 (default 0.5); hue = amount×200+100
+      duration — output seconds (default 30)
     """
-    amount = max(0.0, min(2.0, float(amount)))
+    amount   = max(0.0, min(2.0, float(amount)))
+    duration = max(1, min(600, int(duration)))
 
     def worker(input_path, output_path, tmpdir, is_video):
         try:
             clut_path = build_huehsv_haldclut(tmpdir, amount)
         except RuntimeError as e:
             return False, str(e)
-        return _ffmpeg_haldclut(input_path, clut_path, output_path, is_video)
+        return _ffmpeg_haldclut(input_path, clut_path, output_path, is_video, duration)
 
     hue_val = int(amount * 200 + 100)
     await process_and_reply(
         ctx,
         f"huehsv({amount:.2f})",
-        f"HaldCLUT hue rotation — modulate hue={hue_val}",
+        f"HaldCLUT hue rotation — modulate hue={hue_val}, {duration}s",
         worker,
     )
 
@@ -388,88 +402,113 @@ async def huehsv_command(ctx: commands.Context, amount: float = 0.5):
 async def pinch_command(
     ctx: commands.Context,
     strength: float = 1.0,
-    radius: float = 0.5,
-    cx: float = 0.5,
-    cy: float = 0.5,
+    radius: float   = 0.5,
+    cx: float       = 0.5,
+    cy: float       = 0.5,
+    duration: int   = 30,
 ):
-    """Apply Pinch and Punch lens-warp effect via geq.
+    """Pinch and Punch lens-warp via FFmpeg geq.
 
-    !pinch [strength] [radius] [cx] [cy]
-      strength — distortion intensity, can be negative for punch-out (default 1.0)
-      radius   — effect radius as fraction of image size (default 0.5)
-      cx       — horizontal center as fraction of width  (default 0.5)
-      cy       — vertical center as fraction of height   (default 0.5)
-
-    Examples:
-      !pinch              → default pinch-in
-      !pinch -1           → punch-out
-      !pinch 2 0.3        → strong pinch, smaller radius
-      !pinch 1 0.5 0.2 0.8 → off-center warp
+    !pinch [strength] [radius] [cx] [cy] [duration=30]
+      strength — intensity; negative = punch-out (default 1.0)
+      radius   — effect radius as fraction of image (default 0.5)
+      cx / cy  — warp center 0–1 (default 0.5 0.5)
+      duration — output seconds (default 30)
     """
     strength = float(strength)
-    radius = max(0.01, float(radius))
-    cx = max(0.0, min(1.0, float(cx)))
-    cy = max(0.0, min(1.0, float(cy)))
+    radius   = max(0.01, float(radius))
+    cx       = max(0.0, min(1.0, float(cx)))
+    cy       = max(0.0, min(1.0, float(cy)))
+    duration = max(1, min(600, int(duration)))
 
     vf = build_pinch_vf(strength, radius, cx, cy)
 
     def worker(input_path, output_path, tmpdir, is_video):
-        return _ffmpeg_single(input_path, output_path, vf, None, is_video)
+        return _ffmpeg_single(input_path, output_path, vf, None, is_video, duration)
 
     direction = "pinch-in" if strength > 0 else "punch-out"
     await process_and_reply(
         ctx,
-        f"pinch(s={strength},r={radius},cx={cx},cy={cy})",
-        f"{direction} lens warp — strength={strength}, radius={radius}",
+        f"pinch(s={strength},r={radius})",
+        f"{direction} lens warp, {duration}s",
         worker,
     )
 
 
 @bot.command(name="pitch")
-async def pitch_command(ctx: commands.Context, semitones: float = 12.0):
-    """Pitch-shift audio using rubberband (video stream copied untouched).
+async def pitch_command(ctx: commands.Context, *args: str):
+    """Pitch-shift audio via rubberband. Supports multiple semitone values (multipitch chord).
 
-    !pitch [semitones]
-      semitones — how many semitones to shift (default +12 = one octave up)
-                  positive = higher pitch, negative = lower pitch
-                  range: -24 to +24  (beyond that quality degrades)
+    !pitch [semitone1] [semitone2] ...
+      Provide one or more semitone values.
+      Single value  → simple pitch shift.
+      Multiple      → each shifted independently then mixed together (chord/harmony).
 
     Examples:
-      !pitch          → +12 semitones (octave up)
-      !pitch -12      → one octave down
-      !pitch 7        → perfect fifth up
-      !pitch -5       → perfect fourth down
+      !pitch 12           → octave up
+      !pitch -12          → octave down
+      !pitch 0 7 12       → root + perfect fifth + octave (power chord)
+      !pitch -12 0 12     → sub-octave + original + octave above
+      !pitch 0 4 7        → major chord (root + major third + fifth)
+      !pitch 3.5          → minor third + quartertone up
     """
-    semitones = max(-36.0, min(36.0, float(semitones)))
-    suffix = None
+    # Parse semitone args
+    if not args:
+        semitones_list = [12.0]
+    else:
+        try:
+            semitones_list = [max(-36.0, min(36.0, float(s))) for s in args]
+        except ValueError:
+            await ctx.reply("⚠️ Semitone values must be numbers. Example: `!pitch 0 7 12`")
+            return
+
+    # Cap at 8 simultaneous pitches (FFmpeg amix limit is generous but keep it sane)
+    if len(semitones_list) > 8:
+        await ctx.reply("⚠️ Maximum 8 simultaneous pitches. Truncating to first 8.")
+        semitones_list = semitones_list[:8]
 
     if not ctx.message.attachments:
+        examples = [
+            "`!pitch 12` — octave up",
+            "`!pitch -12` — octave down",
+            "`!pitch 0 7 12` — power chord (root+5th+octave)",
+            "`!pitch 0 4 7` — major chord",
+            "`!pitch -12 0 12` — sub + original + octave",
+        ]
         await ctx.reply(
-            "Attach a **video with audio** (mp4, mov, mkv, webm, avi) and re-run.\n"
-            "Usage: `!pitch [semitones]`  (default +12 = octave up)\n"
-            "Example: `!pitch -7`"
+            "Attach a **video with audio** (mp4, mov, mkv, webm, avi) and re-run.\n\n"
+            "**Usage:** `!pitch [semitone1] [semitone2] ...`\n"
+            "Multiple values = multipitch chord (mixed together)\n\n"
+            + "\n".join(examples)
         )
         return
 
     attachment = ctx.message.attachments[0]
-    suffix = Path(attachment.filename).suffix.lower()
+    suffix     = Path(attachment.filename).suffix.lower()
 
-    if suffix not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
-        await ctx.reply("⚠️ `!pitch` works on video files with audio (mp4, mov, avi, mkv, webm). GIFs and images have no audio track.")
+    if suffix not in AUDIO_VIDEO_EXTS:
+        await ctx.reply("⚠️ `!pitch` works on video files with audio (mp4, mov, avi, mkv, webm).")
         return
 
     if attachment.size > MAX_FILE_SIZE:
         await ctx.reply(f"File too large ({attachment.size / 1024 / 1024:.1f} MB, max 25 MB).")
         return
 
-    ratio = 2 ** (semitones / 12)
-    direction = "▲" if semitones >= 0 else "▼"
+    # Build label
+    is_multi  = len(semitones_list) > 1
+    st_str    = " + ".join(f"{s:+.1f}st" for s in semitones_list)
+    ratios    = [2 ** (s / 12) for s in semitones_list]
+    ratio_str = " + ".join(f"{r:.4f}×" for r in ratios)
+    kind      = "multipitch" if is_multi else "pitch"
+    direction = "▲" if not is_multi and semitones_list[0] >= 0 else ("▼" if not is_multi else "🎵")
+
     status_msg = await ctx.reply(
-        f"⚙️ Pitch shifting {direction} **{semitones:+.1f} semitones** (ratio {ratio:.4f}×) via rubberband…"
+        f"⚙️ {'Multipitch mixing' if is_multi else 'Pitch shifting'} {direction} **{st_str}** "
+        f"({ratio_str}) via rubberband…"
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"input{suffix}")
+        input_path  = os.path.join(tmpdir, f"input{suffix}")
         output_path = os.path.join(tmpdir, f"output{suffix}")
 
         try:
@@ -480,7 +519,7 @@ async def pitch_command(ctx: commands.Context, semitones: float = 12.0):
 
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
-            None, lambda: _ffmpeg_pitch(input_path, output_path, semitones)
+            None, lambda: _ffmpeg_multipitch(input_path, output_path, semitones_list)
         )
 
         if not ok:
@@ -491,13 +530,13 @@ async def pitch_command(ctx: commands.Context, semitones: float = 12.0):
             await status_msg.edit(content="❌ Output too large for Discord (>25 MB).")
             return
 
-        stem = Path(attachment.filename).stem
-        sign = "+" if semitones >= 0 else ""
-        out_filename = f"pitch_{sign}{semitones:.1f}st_{stem}{suffix}"
+        stem      = Path(attachment.filename).stem
+        st_tag    = st_str.replace(" + ", "_").replace("+", "p").replace("-", "m").replace(".", "d")
+        out_fn    = f"{kind}_{st_tag}_{stem}{suffix}"
         try:
             await ctx.reply(
-                content=f"✅ **Pitch shifted {direction} {semitones:+.1f} semitones** (ratio {ratio:.4f}×)",
-                file=discord.File(output_path, filename=out_filename),
+                content=f"✅ **{'Multipitch' if is_multi else 'Pitch'} {st_str}** applied!",
+                file=discord.File(output_path, filename=out_fn),
             )
             await status_msg.delete()
         except discord.HTTPException as e:
@@ -506,25 +545,18 @@ async def pitch_command(ctx: commands.Context, semitones: float = 12.0):
 
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
-    """List all available IHTX effects."""
-    embed = discord.Embed(
-        title="IHTX Bot — Effects",
-        color=discord.Color.red(),
-    )
-    standard = {k: v for k, v in IHTX_PRESETS.items() if k not in ("huehsv", "pinch")}
-    special   = {k: v for k, v in IHTX_PRESETS.items() if k in ("huehsv", "pinch")}
-
+    embed = discord.Embed(title="IHTX Bot — Effects", color=discord.Color.red())
     embed.add_field(
-        name="Standard presets — `!ihtx [preset]`",
-        value="\n".join(f"`{k}` — {v}" for k, v in standard.items()),
+        name="!ihtx [preset] [repetitions=1] [duration=30]",
+        value="\n".join(f"`{k}` — {v}" for k, v in IHTX_PRESETS.items()),
         inline=False,
     )
     embed.add_field(
-        name="Parameterised effects",
+        name="Dedicated parameterised commands",
         value=(
-            "`!huehsv [amount]` — HaldCLUT hue rotation (0‑1, default 0.5)\n"
-            "`!pinch [strength] [radius] [cx] [cy]` — lens pinch/punch warp\n"
-            "`!pitch [semitones]` — rubberband pitch shift (default +12 = octave up)"
+            "`!huehsv [amount] [duration]` — HaldCLUT hue rotation (ImageMagick)\n"
+            "`!pinch [strength] [radius] [cx] [cy] [duration]` — geq lens warp\n"
+            "`!pitch [st1] [st2] ...` — rubberband pitch shift / multipitch chord"
         ),
         inline=False,
     )
@@ -536,27 +568,42 @@ async def presets_command(ctx: commands.Context):
 async def help_command(ctx: commands.Context):
     embed = discord.Embed(title="IHTX Bot — Help", color=discord.Color.dark_red())
     embed.add_field(
-        name="!ihtx [preset]",
-        value="Apply a preset IHTX effect to an attachment. Default: `chaos`",
+        name="!ihtx [preset] [repetitions=1] [duration=30]",
+        value=(
+            "Apply a visual IHTX effect. Attach a video or image.\n"
+            "`repetitions` 1–100 — chains the effect that many times (each pass feeds the next)\n"
+            "`duration` — output length in seconds (default 30)\n"
+            "Example: `!ihtx chaos 10 20` — chaos ×10, 20s"
+        ),
         inline=False,
     )
     embed.add_field(
-        name="!huehsv [amount]",
+        name="!huehsv [amount=0.5] [duration=30]",
         value=(
             "HaldCLUT hue rotation via ImageMagick.\n"
-            "`amount` 0‑1 (default 0.5) → hue value = amount×200+100\n"
+            "hue = amount×200+100  (0.0→no shift, 0.5→+180°, 1.0→wraps)\n"
             "Example: `!huehsv 0.75`"
         ),
         inline=False,
     )
     embed.add_field(
-        name="!pinch [strength] [radius] [cx] [cy]",
+        name="!pinch [strength=1] [radius=0.5] [cx=0.5] [cy=0.5] [duration=30]",
         value=(
-            "Pinch/punch lens warp via FFmpeg geq.\n"
-            "`strength` — intensity, negative = punch-out (default 1.0)\n"
-            "`radius`   — effect radius, fraction of image (default 0.5)\n"
-            "`cx` `cy`  — warp center, 0‑1 (default 0.5 0.5)\n"
+            "Pinch/punch lens warp via geq.\n"
+            "Negative strength = punch-out. cx/cy = warp center (0–1).\n"
             "Example: `!pinch -1 0.4 0.3 0.6`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="!pitch [semitone1] [semitone2] ...",
+        value=(
+            "Pitch-shift audio via rubberband (video copied untouched).\n"
+            "**Multiple values = multipitch** — each shifted independently, then mixed.\n"
+            "`!pitch 12` — octave up\n"
+            "`!pitch 0 7 12` — power chord\n"
+            "`!pitch 0 4 7` — major chord\n"
+            "`!pitch -12 0 12` — sub + root + octave"
         ),
         inline=False,
     )
@@ -566,19 +613,10 @@ async def help_command(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
-        name="!pitch [semitones]",
-        value=(
-            "Pitch-shift audio via rubberband (video stream copied untouched).\n"
-            "`semitones` — positive = higher, negative = lower (default +12 = octave up)\n"
-            "Examples: `!pitch 7` (5th up) · `!pitch -12` (octave down) · `!pitch 3.5`"
-        ),
-        inline=False,
-    )
-    embed.add_field(
         name="Supported formats",
         value=(
-            "Video (audio effects): mp4, mov, avi, mkv, webm\n"
-            "Video/image (visual effects): + gif, png, jpg, jpeg, webp\n"
+            "Visual effects: mp4, mov, avi, mkv, webm, gif, png, jpg, jpeg, webp\n"
+            "Audio effects (!pitch): mp4, mov, avi, mkv, webm only\n"
             "Max 25 MB"
         ),
         inline=False,
