@@ -156,7 +156,7 @@ def is_true(val: str) -> bool:
 def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float]:
     """Extract rep and duration from entries (removed from step list)."""
     rep      = 1
-    duration = 30.0
+    duration = 0.5
     for k, v in entries:
         if k in ("rep", "repetitions"):
             try:
@@ -441,11 +441,11 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
     """
     pipe_str = pipe_str.strip()
 
-    if not pipe_str or not ctx.message.attachments:
+    if not pipe_str:
         await ctx.reply(HELP_TEXT)
         return
 
-    # Parse
+    # Parse early so we can show help if steps are empty
     entries  = parse_pipe(pipe_str)
     rep, dur = extract_globals(entries)
     steps    = build_steps(entries)
@@ -454,8 +454,26 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
         await ctx.reply("No valid effects found in pipe. " + HELP_TEXT)
         return
 
-    # Validate attachment
-    attachment = ctx.message.attachments[0]
+    # Resolve attachment: own message first, then the message being replied to
+    attachment = None
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message.reference:
+        try:
+            ref_msg = ctx.message.reference.resolved
+            if ref_msg is None:
+                ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref_msg and ref_msg.attachments:
+                attachment = ref_msg.attachments[0]
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    if attachment is None:
+        await ctx.reply(
+            "No attachment found. Either attach a file to your `!ihtx` message, "
+            "or **reply to a message** that contains a video or image."
+        )
+        return
     if attachment.size > MAX_FILE_SIZE:
         await ctx.reply(f"File too large ({attachment.size / 1024 / 1024:.1f} MB, max 25 MB).")
         return
