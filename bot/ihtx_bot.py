@@ -34,6 +34,7 @@ IHTX_PRESETS = {
     "corrupt": "scanlines + gamma crush",
     "huehsv":  "haldclut hue rotation via ImageMagick  — usage: !huehsv [0‑1]",
     "pinch":   "pinch/punch lens warp via geq  — usage: !pinch [strength] [radius] [cx] [cy]",
+    "pitch":   "rubberband pitch shift (audio only)  — usage: !pitch [semitones]",
 }
 
 _BASE_NOISE = "noise=alls=40:allf=t+u"
@@ -199,6 +200,29 @@ def run_preset(input_path: str, output_path: str, preset: str,
     return _ffmpeg_single(input_path, output_path, cfg["vf"], cfg["complex"], is_video)
 
 
+def _ffmpeg_pitch(input_path: str, output_path: str, semitones: float) -> tuple[bool, str]:
+    """
+    Pitch-shift audio using FFmpeg's rubberband filter.
+    pitch ratio = 2^(semitones/12)
+    Video stream is copied untouched.
+    """
+    ratio = 2 ** (semitones / 12)
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-af", f"rubberband=pitch={ratio:.6f}",
+        "-c:v", "copy",
+        "-t", "300",
+        output_path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        return (True, "") if r.returncode == 0 else (False, r.stderr[-2000:])
+    except subprocess.TimeoutExpired:
+        return False, "FFmpeg timed out (>180s)"
+    except Exception as e:
+        return False, str(e)
+
+
 # ─── Download helper ──────────────────────────────────────────────────────────
 
 async def download_attachment(attachment: discord.Attachment, dest: str):
@@ -309,6 +333,9 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
     if preset == "pinch":
         await pinch_command(ctx, 1.0, 0.5, 0.5, 0.5)
         return
+    if preset == "pitch":
+        await pitch_command(ctx, 12.0)
+        return
 
     if not ctx.message.attachments:
         plist = ", ".join(f"`{p}`" for p in IHTX_PRESETS)
@@ -398,6 +425,85 @@ async def pinch_command(
     )
 
 
+@bot.command(name="pitch")
+async def pitch_command(ctx: commands.Context, semitones: float = 12.0):
+    """Pitch-shift audio using rubberband (video stream copied untouched).
+
+    !pitch [semitones]
+      semitones — how many semitones to shift (default +12 = one octave up)
+                  positive = higher pitch, negative = lower pitch
+                  range: -24 to +24  (beyond that quality degrades)
+
+    Examples:
+      !pitch          → +12 semitones (octave up)
+      !pitch -12      → one octave down
+      !pitch 7        → perfect fifth up
+      !pitch -5       → perfect fourth down
+    """
+    semitones = max(-36.0, min(36.0, float(semitones)))
+    suffix = None
+
+    if not ctx.message.attachments:
+        await ctx.reply(
+            "Attach a **video with audio** (mp4, mov, mkv, webm, avi) and re-run.\n"
+            "Usage: `!pitch [semitones]`  (default +12 = octave up)\n"
+            "Example: `!pitch -7`"
+        )
+        return
+
+    attachment = ctx.message.attachments[0]
+    suffix = Path(attachment.filename).suffix.lower()
+
+    if suffix not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        await ctx.reply("⚠️ `!pitch` works on video files with audio (mp4, mov, avi, mkv, webm). GIFs and images have no audio track.")
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large ({attachment.size / 1024 / 1024:.1f} MB, max 25 MB).")
+        return
+
+    ratio = 2 ** (semitones / 12)
+    direction = "▲" if semitones >= 0 else "▼"
+    status_msg = await ctx.reply(
+        f"⚙️ Pitch shifting {direction} **{semitones:+.1f} semitones** (ratio {ratio:.4f}×) via rubberband…"
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, f"output{suffix}")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Download failed: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, lambda: _ffmpeg_pitch(input_path, output_path, semitones)
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ FFmpeg rubberband failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        if os.path.getsize(output_path) > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output too large for Discord (>25 MB).")
+            return
+
+        stem = Path(attachment.filename).stem
+        sign = "+" if semitones >= 0 else ""
+        out_filename = f"pitch_{sign}{semitones:.1f}st_{stem}{suffix}"
+        try:
+            await ctx.reply(
+                content=f"✅ **Pitch shifted {direction} {semitones:+.1f} semitones** (ratio {ratio:.4f}×)",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Upload failed: {e}")
+
+
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX effects."""
@@ -417,7 +523,8 @@ async def presets_command(ctx: commands.Context):
         name="Parameterised effects",
         value=(
             "`!huehsv [amount]` — HaldCLUT hue rotation (0‑1, default 0.5)\n"
-            "`!pinch [strength] [radius] [cx] [cy]` — lens pinch/punch warp"
+            "`!pinch [strength] [radius] [cx] [cy]` — lens pinch/punch warp\n"
+            "`!pitch [semitones]` — rubberband pitch shift (default +12 = octave up)"
         ),
         inline=False,
     )
@@ -459,8 +566,21 @@ async def help_command(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
+        name="!pitch [semitones]",
+        value=(
+            "Pitch-shift audio via rubberband (video stream copied untouched).\n"
+            "`semitones` — positive = higher, negative = lower (default +12 = octave up)\n"
+            "Examples: `!pitch 7` (5th up) · `!pitch -12` (octave down) · `!pitch 3.5`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="Supported formats",
-        value="mp4, mov, avi, mkv, webm, gif, png, jpg, jpeg, webp (max 25 MB)",
+        value=(
+            "Video (audio effects): mp4, mov, avi, mkv, webm\n"
+            "Video/image (visual effects): + gif, png, jpg, jpeg, webp\n"
+            "Max 25 MB"
+        ),
         inline=False,
     )
     embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
