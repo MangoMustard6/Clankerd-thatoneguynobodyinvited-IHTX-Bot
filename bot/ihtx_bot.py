@@ -114,25 +114,47 @@ One command, pipe-style syntax:
 `chaos` `glitch` `shake` `rainbow` `static` `melt` `corrupt`
 
 **Parameterised effects:**
-`huehsv=0.5` — hue amount 0–1
+`huehsv=0.5` — hue shift via hald-CLUT (0–2)
 `pinch=1;0.5;0.5;0.5` — strength;radius;cx;cy (all optional)
-`pitch=0;7;12` — semitones separated by `;` (multipitch = mixed)
-`reverse=true` — reverse video + audio (applied after all other effects)
+`pitch=0;7;12` — semitones `;`-separated (multipitch = mixed)
+`reverse=true` — reverse video + audio (applied last)
+`hue2=90` — secondary hue rotation in degrees + premultiply blend
+
+**Wave distortion:**
+`wave=hs;hf;ha;hp;vs;vf;va;vp;separate;noclip`
+  h = horizontal  v = vertical  s=speed f=freq a=amp p=phase
+  separate=true — two geq passes instead of one combined
+  noclip=true   — drawbox border to suppress edge wrap artifacts
+  Example: `wave=1;1;1;0;0.5;1;0.5;0` (horizontal wobble + light vertical)
+
+**TV / CRT simulator:**
+`tv=line_sync;zoom_grill;vertical`
+  line_sync 0–1 — hsync degradation (0=strong contrast, 1=flat)
+  zoom_grill >0 — scanline width (1=tight, 2=wide bands)
+  vertical=true — vertical bars instead of horizontal scanlines
+  Example: `tv=0.3;1;false`
+
+**Mirror:**
+`hmirror=1` — left half reflected right (left mirror)
+`hmirror=2` — right half reflected left (right mirror)
+`vmirror=1` — top half reflected down  (top mirror)
+`vmirror=2` — bottom half reflected up (bottom mirror)
 
 **Global options:**
 `rep=N` — render cycles (default 1)
 `duration=N` — seconds per segment (default 0.5)
 `concat=true` — **TRUE IHTX MODE** ✦
-  Each rep: re-encodes from the *previous* render (artifacts compound).
-  All segments are then joined → total = rep × duration seconds.
-  Escalates from slightly degraded → pure chaos across the video.
+  Each rep re-encodes from the *previous* render (artifacts compound).
+  All segments joined → total = rep × duration seconds.
+  Escalates from slightly degraded → pure chaos.
 
 **Examples:**
 `!ihtx chaos=true`
+`!ihtx wave=1;2;1;0;1;1;0.5;0`
+`!ihtx tv=0.2;1.5,hmirror=1`
 `!ihtx glitch=true,concat=true,rep=20,duration=0.5`
-`!ihtx shake=true,glitch=true,pitch=1;6;7;-5,pinch=0.5`
-`!ihtx huehsv=0.8,concat=true,rep=30,duration=0.4`
-`!ihtx corrupt=true,reverse=true,concat=true,rep=15`
+`!ihtx wave=1;1;1,concat=true,rep=15,duration=0.4`
+`!ihtx hmirror=1,vmirror=1,hue2=180`
 """
 
 
@@ -231,6 +253,51 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
             if is_true(val):
                 steps.append({"type": "reverse"})
 
+        elif key == "wave":
+            p = [x.strip() for x in val.split(";")]
+            def _wfp(i, d):
+                try: return float(p[i]) if len(p) > i else d
+                except ValueError: return d
+            def _wbp(i, d=False):
+                if len(p) <= i: return d
+                return p[i].lower() in ("1","true","t","y","yes","+","on")
+            steps.append({
+                "type": "wave",
+                "hs": _wfp(0, 1.0), "hf": _wfp(1, 1.0), "ha": _wfp(2, 1.0), "hp": _wfp(3, 0.0),
+                "vs": _wfp(4, 0.0), "vf": _wfp(5, 0.0), "va": _wfp(6, 0.0), "vp": _wfp(7, 0.0),
+                "separate": _wbp(8), "noclip": _wbp(9),
+            })
+
+        elif key == "tv":
+            p = [x.strip() for x in val.split(";")]
+            def _tvfp(i, d):
+                try: return float(p[i]) if len(p) > i else d
+                except ValueError: return d
+            def _tvbp(i, d=False):
+                if len(p) <= i: return d
+                return p[i].lower() in ("1","true","t","y","yes","+","on")
+            steps.append({
+                "type": "tv",
+                "line_sync":  max(0.0, min(1.0, _tvfp(0, 0.25))),
+                "zoom_grill": max(0.1, _tvfp(1, 1.0)),
+                "vertical":   _tvbp(2),
+            })
+
+        elif key == "hmirror":
+            try: side = max(1, min(2, int(val)))
+            except ValueError: side = 1
+            steps.append({"type": "hmirror", "side": side})
+
+        elif key == "vmirror":
+            try: side = max(1, min(2, int(val)))
+            except ValueError: side = 1
+            steps.append({"type": "vmirror", "side": side})
+
+        elif key == "hue2":
+            try: degrees = max(-360.0, min(360.0, float(val)))
+            except ValueError: degrees = 0.0
+            steps.append({"type": "hue2", "degrees": degrees})
+
     return steps
 
 
@@ -246,6 +313,109 @@ def _build_pinch_vf(strength: float, radius: float, cx: float, cy: float) -> str
     px = f"W*{cx}+(X-W*{cx})*(1-({strength})*gauss({gauss_arg}))"
     py = f"H*{cy}+(Y-H*{cy})*(1-({strength})*gauss({gauss_arg}))"
     return f"format=yuv444p,geq='p({px},{py})',scale=iw:ih,format=yuv420p"
+
+
+def _get_video_dims(path: str) -> tuple[int, int]:
+    """Return (width, height) of the first video stream; defaults to 640×640."""
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:nk=1", path,
+        ], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            w, h = r.stdout.strip().split(",")
+            return int(w), int(h)
+    except Exception:
+        pass
+    return 640, 640
+
+
+def _build_wave_vf(
+    src: str,
+    hs: float, hf: float, ha: float, hp: float,
+    vs: float, vf_: float, va: float, vp: float,
+    separate: bool, noclip: bool,
+) -> str:
+    """
+    Sine-wave spatial displacement.
+    h_off = sin(T*5*hs + hp*15 + Y/H*PI*hf) * -15*ha   (horizontal shift)
+    v_off = sin(T*5*vs + vp*15 + X/W*PI*vf) * -15*va   (vertical shift)
+    """
+    w, h = _get_video_dims(src)
+    h_off = f"(sin((T*5*{hs}+({hp}*15))+(Y/H)*(PI*{hf})))*(-15*{ha})"
+    v_off = f"(sin((T*5*{vs}+({vp}*15))+(X/W)*(PI*{vf_})))*(-15*{va})"
+    prefix = "drawbox=t=1," if noclip else ""
+    if separate:
+        geq_str = f"geq='p(X-({h_off}),Y)',geq='p(X,Y-({v_off}))'"
+    else:
+        geq_str = f"geq='p(X-({h_off}),Y-({v_off}))'"
+    return (
+        f"{prefix}format=yuv444p,scale=640:640,"
+        f"{geq_str},"
+        f"scale={w}:{h},setsar=1:1,format=yuv420p"
+    )
+
+
+def _build_tv_vf(line_sync: float, zoom_grill: float, vertical: bool) -> str:
+    """
+    CRT/TV simulator.
+    line_sync  0–1  — amount of hsync distortion (contrast degradation)
+    zoom_grill >0   — scanline pitch (1 = 1 line per 2px, 2 = wider bands)
+    vertical        — rotate scanlines 90° (vertical bars instead of horizontal)
+    """
+    contrast = (1.0 - line_sync) * 2.366666
+    freq      = 2.0 / max(0.01, zoom_grill)
+    if vertical:
+        luma = f"lum(X,Y)*(0.65+0.35*sin(X*{freq:.6f}*PI))"
+    else:
+        luma = f"lum(X,Y)*(0.65+0.35*sin(Y*{freq:.6f}*PI))"
+    return (
+        f"format=yuv444p,"
+        f"eq=contrast={contrast:.6f},"
+        f"hue=b=-0.033,"
+        f"geq='lum={luma}',"
+        f"format=yuv420p"
+    )
+
+
+def _build_mirror_complex(axis: str, side: int) -> str:
+    """
+    axis='h', side=1 → left half reflected to fill right  (left mirror)
+    axis='h', side=2 → right half reflected to fill left  (right mirror)
+    axis='v', side=1 → top half reflected to fill bottom  (top mirror)
+    axis='v', side=2 → bottom half reflected to fill top  (bottom mirror)
+    """
+    if axis == "h":
+        if side == 1:
+            return (
+                "[0:v]split[a][b];"
+                "[a]crop=iw/2:ih:0:0[lft];"
+                "[lft]hflip[rgt];"
+                "[lft][rgt]hstack"
+            )
+        else:
+            return (
+                "[0:v]split[a][b];"
+                "[a]crop=iw/2:ih:iw/2:0[rgt];"
+                "[rgt]hflip[lm];"
+                "[lm][rgt]hstack"
+            )
+    else:  # v
+        if side == 1:
+            return (
+                "[0:v]split[a][b];"
+                "[a]crop=iw:ih/2:0:0[top];"
+                "[top]vflip[bot];"
+                "[top][bot]vstack"
+            )
+        else:
+            return (
+                "[0:v]split[a][b];"
+                "[a]crop=iw:ih/2:0:ih/2[bot];"
+                "[bot]vflip[tm];"
+                "[tm][bot]vstack"
+            )
 
 
 def _build_huehsv_clut(tmpdir: str, amount: float) -> str:
@@ -373,6 +543,31 @@ def _apply_step(
 
     elif t == "reverse":
         return _apply_reverse(src, dst, is_video)
+
+    elif t == "wave":
+        vf = _build_wave_vf(
+            src,
+            step["hs"], step["hf"], step["ha"], step["hp"],
+            step["vs"], step["vf"], step["va"], step["vp"],
+            step["separate"], step["noclip"],
+        )
+        return _apply_vf(src, dst, vf, is_video, duration)
+
+    elif t == "tv":
+        vf = _build_tv_vf(step["line_sync"], step["zoom_grill"], step["vertical"])
+        return _apply_vf(src, dst, vf, is_video, duration)
+
+    elif t == "hmirror":
+        fc = _build_mirror_complex("h", step["side"])
+        return _apply_complex(src, dst, fc, is_video, duration)
+
+    elif t == "vmirror":
+        fc = _build_mirror_complex("v", step["side"])
+        return _apply_complex(src, dst, fc, is_video, duration)
+
+    elif t == "hue2":
+        vf = f"hue=h={step['degrees']},frei0r=premultiply"
+        return _apply_vf(src, dst, vf, is_video, duration)
 
     return False, f"Unknown step type: {t}"
 
@@ -600,6 +795,21 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
             effect_parts.append("pitch(" + ";".join(f"{st:+.1f}" for st in s["semitones"]) + ")")
         elif s["type"] == "reverse":
             effect_parts.append("reverse")
+        elif s["type"] == "wave":
+            flags = []
+            if s["separate"]: flags.append("sep")
+            if s["noclip"]:   flags.append("noclip")
+            tag = f",{','.join(flags)}" if flags else ""
+            effect_parts.append(f"wave(h={s['hs']};{s['hf']};{s['ha']},v={s['vs']};{s['vf']};{s['va']}{tag})")
+        elif s["type"] == "tv":
+            vert = ",vert" if s["vertical"] else ""
+            effect_parts.append(f"tv({s['line_sync']:.2f};{s['zoom_grill']:.1f}{vert})")
+        elif s["type"] == "hmirror":
+            effect_parts.append("hmirror-left" if s["side"] == 1 else "hmirror-right")
+        elif s["type"] == "vmirror":
+            effect_parts.append("vmirror-top" if s["side"] == 1 else "vmirror-bottom")
+        elif s["type"] == "hue2":
+            effect_parts.append(f"hue2({s['degrees']:+.0f}°)")
 
     pipeline_label = " → ".join(effect_parts)
 
