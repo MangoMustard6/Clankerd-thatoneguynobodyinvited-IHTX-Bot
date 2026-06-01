@@ -11,8 +11,11 @@ Pipe syntax (comma-separated key=value):
   pinch=1;0.5;0.5;0.5   strength;radius;cx;cy  (all optional, defaults shown)
   pitch=0;7;12          semicolon-separated semitones (multipitch = mixed together)
   reverse=true          reverse video + audio (applied once at end)
-  rep=N                 repeat the whole visual+audio pipeline N times (1-100)
-  duration=N            output duration in seconds (default 30)
+  rep=N                 number of render cycles (default 1)
+  duration=N            seconds per segment (default 0.5)
+  concat=true           TRUE IHTX MODE — render→render→concat
+                        each rep re-encodes the previous segment (artifacts compound),
+                        then all segments are joined: total = rep × duration seconds
 """
 
 import discord
@@ -117,15 +120,19 @@ One command, pipe-style syntax:
 `reverse=true` — reverse video + audio (applied after all other effects)
 
 **Global options:**
-`rep=N` — repeat whole pipeline N times (1–100)
-`duration=N` — output length in seconds (default 30)
+`rep=N` — render cycles (default 1)
+`duration=N` — seconds per segment (default 0.5)
+`concat=true` — **TRUE IHTX MODE** ✦
+  Each rep: re-encodes from the *previous* render (artifacts compound).
+  All segments are then joined → total = rep × duration seconds.
+  Escalates from slightly degraded → pure chaos across the video.
 
 **Examples:**
 `!ihtx chaos=true`
+`!ihtx glitch=true,concat=true,rep=20,duration=0.5`
 `!ihtx shake=true,glitch=true,pitch=1;6;7;-5,pinch=0.5`
-`!ihtx glitch=5,reverse=true,duration=15`
-`!ihtx rainbow=true,huehsv=0.8,pitch=0;12,rep=3`
-`!ihtx corrupt=10,pitch=-12;0;12,reverse=true`
+`!ihtx huehsv=0.8,concat=true,rep=30,duration=0.4`
+`!ihtx corrupt=true,reverse=true,concat=true,rep=15`
 """
 
 
@@ -153,10 +160,11 @@ def is_true(val: str) -> bool:
     return val.strip().lower() in ("true", "1", "yes", "on")
 
 
-def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float]:
-    """Extract rep and duration from entries (removed from step list)."""
+def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float, bool]:
+    """Extract rep, duration, and concat from entries."""
     rep      = 1
     duration = 0.5
+    concat   = False
     for k, v in entries:
         if k in ("rep", "repetitions"):
             try:
@@ -168,14 +176,16 @@ def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float]:
                 duration = max(0.1, min(MAX_DURATION, float(v)))
             except ValueError:
                 pass
-    return rep, duration
+        elif k == "concat":
+            concat = is_true(v)
+    return rep, duration, concat
 
 
 def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
     """Convert ordered entries into step dicts (skip rep/duration/unknown/false)."""
     steps = []
     for key, val in entries:
-        if key in ("rep", "repetitions", "duration"):
+        if key in ("rep", "repetitions", "duration", "concat"):
             continue
 
         if key in VISUAL_PRESETS:
@@ -408,6 +418,95 @@ def execute_pipeline(
     return True, ""
 
 
+def _render_to_ts(
+    src: str, dst: str, tmpdir: str,
+    steps: list[dict], is_source_video: bool,
+    duration: float, seg_idx: int,
+) -> tuple[bool, str]:
+    """
+    Render src through all steps → dst as MPEG-TS (H.264+AAC).
+    Images are first looped into a short video.
+    TS format is required for the byte-level concat protocol.
+    """
+    # Images → looping video with silent audio so TS has consistent streams
+    if not is_source_video:
+        loop_mp4 = os.path.join(tmpdir, f"loop_{seg_idx}.mp4")
+        ok, err = _run([
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", src,
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac",
+            "-t", str(duration), "-shortest",
+            loop_mp4,
+        ])
+        if not ok:
+            return False, f"Image→video failed: {err}"
+        src = loop_mp4
+        is_source_video = True
+
+    # Apply effect steps (visual + pitch, treat as video from here)
+    main_steps  = [s for s in steps if s["type"] != "reverse"]
+    has_reverse = any(s["type"] == "reverse" for s in steps)
+    intermediate = src
+
+    for i, step in enumerate(main_steps):
+        nxt = os.path.join(tmpdir, f"seg{seg_idx}_step{i}.mp4")
+        ok, err = _apply_step(step, intermediate, nxt, tmpdir, True, duration, i)
+        if not ok:
+            return False, f"Seg {seg_idx} step {i} ({step.get('name', step['type'])}) failed: {err}"
+        intermediate = nxt
+
+    if has_reverse:
+        rev_out = os.path.join(tmpdir, f"seg{seg_idx}_rev.mp4")
+        ok, err  = _apply_reverse(intermediate, rev_out, True)
+        if not ok:
+            return False, f"Seg {seg_idx} reverse failed: {err}"
+        intermediate = rev_out
+
+    # Final encode to .ts — H.264 + AAC required for concat protocol
+    ok, err = _run([
+        "ffmpeg", "-y", "-i", intermediate,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+        "-c:a", "aac", "-ar", "44100",
+        "-t", str(duration),
+        dst,
+    ])
+    return ok, err
+
+
+def execute_ihtx_concat(
+    input_path: str, output_path: str, tmpdir: str,
+    steps: list[dict], is_video: bool, rep: int, duration: float,
+) -> tuple[bool, str]:
+    """
+    TRUE IHTX algorithm (render → render → concat):
+
+    segment_1 = render(original)          ← slightly degraded
+    segment_2 = render(segment_1)         ← more artifacts (re-encode loss)
+    ...
+    segment_N = render(segment_{N-1})     ← pure chaos
+
+    output = byte-level concat of all segments (no extra re-encode at join)
+    Total length = rep × duration seconds. Escalates left→right.
+    """
+    ts_files = []
+    cur      = input_path
+
+    for i in range(rep):
+        ts_path = os.path.join(tmpdir, f"{i + 1}.ts")
+        ok, err = _render_to_ts(cur, ts_path, tmpdir, steps, is_video, duration, i + 1)
+        if not ok:
+            return False, f"Segment {i + 1}/{rep} failed:\n{err}"
+        ts_files.append(ts_path)
+        cur = ts_path   # ← each segment re-rendered from the previous one
+
+    # Byte-level concat via MPEG-TS concat protocol (no re-encode)
+    concat_uri = "concat:" + "|".join(ts_files)
+    ok, err = _run(["ffmpeg", "-y", "-i", concat_uri, "-c", "copy", output_path], timeout=600)
+    return ok, err
+
+
 # ─── Download helper ──────────────────────────────────────────────────────────
 
 async def download_attachment(attachment: discord.Attachment, dest: str):
@@ -446,9 +545,9 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
         return
 
     # Parse early so we can show help if steps are empty
-    entries  = parse_pipe(pipe_str)
-    rep, dur = extract_globals(entries)
-    steps    = build_steps(entries)
+    entries          = parse_pipe(pipe_str)
+    rep, dur, concat = extract_globals(entries)
+    steps            = build_steps(entries)
 
     if not steps:
         await ctx.reply("No valid effects found in pipe. " + HELP_TEXT)
@@ -484,7 +583,8 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
         return
 
     is_video = suffix in VIDEO_EXTENSIONS
-    out_ext  = ".mp4" if is_video else ".gif"
+    # concat mode always produces .mp4 (TS concat → mp4 mux)
+    out_ext  = ".mp4" if (is_video or concat) else ".gif"
 
     # Build human-readable label
     effect_parts = []
@@ -502,15 +602,19 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
             effect_parts.append("reverse")
 
     pipeline_label = " → ".join(effect_parts)
-    rep_label      = f" ×{rep}" if rep > 1 else ""
-    full_label     = f"{pipeline_label}{rep_label}, {dur}s"
 
-    total_visual_passes = sum(
-        s.get("passes", 1) for s in steps if s["type"] in ("preset", "pinch", "huehsv")
-    ) * rep
-    warn = ""
-    if total_visual_passes > 15:
-        warn = f" ⚠️ {total_visual_passes} visual passes — may take a while"
+    if concat:
+        total_secs = rep * dur
+        rep_label  = f" ×{rep} concat"
+        full_label = f"✦ IHTX {pipeline_label} — {rep} segments × {dur}s = {total_secs:.1f}s"
+        warn       = f" ⚠️ {rep} render passes + concat — may take a while" if rep > 10 else ""
+    else:
+        rep_label  = f" ×{rep}" if rep > 1 else ""
+        full_label = f"{pipeline_label}{rep_label}, {dur}s"
+        total_visual_passes = sum(
+            s.get("passes", 1) for s in steps if s["type"] in ("preset", "pinch", "huehsv")
+        ) * rep
+        warn = f" ⚠️ {total_visual_passes} visual passes — may take a while" if total_visual_passes > 15 else ""
 
     status_msg = await ctx.reply(f"⚙️ Pipeline: **{full_label}**{warn}")
 
@@ -526,10 +630,16 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
 
         loop = asyncio.get_event_loop()
         try:
-            ok, err = await loop.run_in_executor(
-                None,
-                lambda: execute_pipeline(input_path, output_path, tmpdir, steps, is_video, rep, dur),
-            )
+            if concat:
+                ok, err = await loop.run_in_executor(
+                    None,
+                    lambda: execute_ihtx_concat(input_path, output_path, tmpdir, steps, is_video, rep, dur),
+                )
+            else:
+                ok, err = await loop.run_in_executor(
+                    None,
+                    lambda: execute_pipeline(input_path, output_path, tmpdir, steps, is_video, rep, dur),
+                )
         except Exception as e:
             await status_msg.edit(content=f"❌ Processing error: {e}")
             return
@@ -539,16 +649,17 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
             return
 
         if os.path.getsize(output_path) > MAX_FILE_SIZE:
-            await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Reduce duration or passes.")
+            await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Reduce `rep` or `duration`.")
             return
 
         stem   = Path(attachment.filename).stem
         tag    = re.sub(r"[^\w]", "_", pipeline_label)[:40]
         out_fn = f"ihtx_{tag}_{stem}{out_ext}"
 
+        done_label = f"✦ IHTX {pipeline_label}{rep_label}" if concat else f"**{pipeline_label}**{rep_label}"
         try:
             await ctx.reply(
-                content=f"✅ **{pipeline_label}**{rep_label} — done!",
+                content=f"✅ {done_label} — done!",
                 file=discord.File(output_path, filename=out_fn),
             )
             await status_msg.delete()
