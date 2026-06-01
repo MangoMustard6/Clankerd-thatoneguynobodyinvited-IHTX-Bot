@@ -153,10 +153,10 @@ def is_true(val: str) -> bool:
     return val.strip().lower() in ("true", "1", "yes", "on")
 
 
-def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, int]:
+def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float]:
     """Extract rep and duration from entries (removed from step list)."""
     rep      = 1
-    duration = 30
+    duration = 30.0
     for k, v in entries:
         if k in ("rep", "repetitions"):
             try:
@@ -165,7 +165,7 @@ def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, int]:
                 pass
         elif k == "duration":
             try:
-                duration = max(1, min(MAX_DURATION, int(v)))
+                duration = max(0.1, min(MAX_DURATION, float(v)))
             except ValueError:
                 pass
     return rep, duration
@@ -369,7 +369,7 @@ def _apply_step(
 
 def execute_pipeline(
     input_path: str, output_path: str, tmpdir: str,
-    steps: list[dict], is_video: bool, rep: int, duration: int,
+    steps: list[dict], is_video: bool, rep: int, duration: float,
 ) -> tuple[bool, str]:
     """
     Run the pipeline.
