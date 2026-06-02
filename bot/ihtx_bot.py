@@ -606,17 +606,17 @@ def execute_pipeline(
     return True, ""
 
 
-def _render_to_ts(
+def _render_to_mkv(
     src: str, dst: str, tmpdir: str,
     steps: list[dict], is_source_video: bool,
     duration: float, seg_idx: int,
 ) -> tuple[bool, str]:
     """
-    Render src through all steps → dst as MPEG-TS (H.264+AAC).
+    Render src through all steps → dst as MKV (FFV1 + PCM).
     Images are first looped into a short video.
-    TS format is required for the byte-level concat protocol.
+    MKV correctly identifies FFV1 as video streams (unlike TS).
     """
-    # Images → looping video with silent audio so TS has consistent streams
+    # Images → looping video with silent audio so segments have consistent streams
     if not is_source_video:
         loop_mkv = os.path.join(tmpdir, f"loop_{seg_idx}.mkv")
         ok, err = _run([
@@ -652,7 +652,7 @@ def _render_to_ts(
             return False, f"Seg {seg_idx} reverse failed: {err}"
         intermediate = rev_out
 
-    # Final encode to .ts — ffv1 + PCM in TS container
+    # Final encode — ffv1 + PCM in MKV container
     ok, err = _run([
         "ffmpeg", "-y", "-i", intermediate,
         "-c:v", "ffv1",
@@ -675,23 +675,30 @@ def execute_ihtx_concat(
     ...
     segment_N = render(segment_{N-1})     ← pure chaos
 
-    output = byte-level concat of all segments (no extra re-encode at join)
-    Total length = rep × duration seconds. Escalates left→right.
+    All segments are MKV (FFV1+PCM). Concat uses the concat demuxer with a file
+    list (no re-encode at join). Total length = rep × duration seconds.
     """
-    ts_files = []
-    cur      = input_path
+    seg_files = []
+    cur       = input_path
 
     for i in range(rep):
-        ts_path = os.path.join(tmpdir, f"{i + 1}.ts")
-        ok, err = _render_to_ts(cur, ts_path, tmpdir, steps, is_video, duration, i + 1)
+        seg_path = os.path.join(tmpdir, f"{i + 1}.mkv")
+        ok, err = _render_to_mkv(cur, seg_path, tmpdir, steps, is_video, duration, i + 1)
         if not ok:
             return False, f"Segment {i + 1}/{rep} failed:\n{err}"
-        ts_files.append(ts_path)
-        cur = ts_path   # ← each segment re-rendered from the previous one
+        seg_files.append(seg_path)
+        cur = seg_path   # ← each segment re-rendered from the previous one
 
-    # Byte-level concat via MPEG-TS concat protocol (no re-encode)
-    concat_uri = "concat:" + "|".join(ts_files)
-    ok, err = _run(["ffmpeg", "-y", "-i", concat_uri, "-c", "copy", output_path], timeout=600)
+    # Concat demuxer with a file list (no re-encode at join)
+    list_path = os.path.join(tmpdir, "concat_list.txt")
+    with open(list_path, "w") as f:
+        for p in seg_files:
+            f.write(f"file '{p}'\n")
+
+    ok, err = _run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+        "-c", "copy", output_path,
+    ], timeout=600)
     return ok, err
 
 
