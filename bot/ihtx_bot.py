@@ -618,7 +618,7 @@ def _render_to_ts(
     """
     # Images → looping video with silent audio so TS has consistent streams
     if not is_source_video:
-        loop_mp4 = os.path.join(tmpdir, f"loop_{seg_idx}.mp4")
+        loop_mkv = os.path.join(tmpdir, f"loop_{seg_idx}.mkv")
         ok, err = _run([
             "ffmpeg", "-y",
             "-loop", "1", "-i", src,
@@ -626,11 +626,11 @@ def _render_to_ts(
             "-c:v", "ffv1",
             "-c:a", "pcm_s16le",
             "-t", str(duration), "-shortest",
-            loop_mp4,
+            loop_mkv,
         ])
         if not ok:
             return False, f"Image→video failed: {err}"
-        src = loop_mp4
+        src = loop_mkv
         is_source_video = True
 
     # Apply effect steps (visual + pitch, treat as video from here)
@@ -639,14 +639,14 @@ def _render_to_ts(
     intermediate = src
 
     for i, step in enumerate(main_steps):
-        nxt = os.path.join(tmpdir, f"seg{seg_idx}_step{i}.mp4")
+        nxt = os.path.join(tmpdir, f"seg{seg_idx}_step{i}.mkv")
         ok, err = _apply_step(step, intermediate, nxt, tmpdir, True, duration, i)
         if not ok:
             return False, f"Seg {seg_idx} step {i} ({step.get('name', step['type'])}) failed: {err}"
         intermediate = nxt
 
     if has_reverse:
-        rev_out = os.path.join(tmpdir, f"seg{seg_idx}_rev.mp4")
+        rev_out = os.path.join(tmpdir, f"seg{seg_idx}_rev.mkv")
         ok, err  = _apply_reverse(intermediate, rev_out, True)
         if not ok:
             return False, f"Seg {seg_idx} reverse failed: {err}"
@@ -771,8 +771,8 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
         return
 
     is_video = suffix in VIDEO_EXTENSIONS
-    # concat mode always produces .mp4 (TS concat → mp4 mux)
-    out_ext  = ".mp4" if (is_video or concat) else ".gif"
+    # concat mode always produces .mkv (FFV1 only works in MKV/AVI, not MP4)
+    out_ext  = ".mkv" if (is_video or concat) else ".gif"
 
     # Build human-readable label
     effect_parts = []
