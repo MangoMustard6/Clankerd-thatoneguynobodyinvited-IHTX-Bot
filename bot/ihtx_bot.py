@@ -130,11 +130,24 @@ One command, pipe-style syntax:
 **Speed:**
 `speed=2` — 2x fast forward (also accepts <1 for slow motion)
 
+**Flip:**
+`hflip=true` — horizontal flip (left↔right)
+`vflip=true` — vertical flip (top↔bottom)
+
 **Mirror:**
 `hmirror=1` — left half reflected right (left mirror)
 `hmirror=2` — right half reflected left (right mirror)
 `vmirror=1` — top half reflected down  (top mirror)
 `vmirror=2` — bottom half reflected up (bottom mirror)
+
+**Swirl:**
+`swirl=strength;radius;cx;cy;fallout;lock`
+  strength — rotation angle in degrees (default 90)
+  radius   — 0–1 relative to min(width,height) (default 0.5)
+  cx, cy   — center position 0–1 (default 0.5)
+  fallout  — `linear` or `quad` (default quad)
+  lock     — `true` forces square working area (default false)
+  Example: `swirl=180;0.5;0.5;0.5;linear`
 
 **Global options:**
 `rep=N` — render cycles (default 1)
@@ -151,6 +164,8 @@ One command, pipe-style syntax:
 `!ihtx glitch=true,concat=true,rep=20,duration=0.5`
 `!ihtx wave=1;1;1,concat=true,rep=15,duration=0.4`
 `!ihtx hmirror=1,vmirror=1,hue2=180`
+`!ihtx hflip=true,swirl=180;0.5;0.5;0.5;linear`
+`!ihtx vflip=true,swirl=90;0.3;0.5;0.5;quad;true`
 """
 
 
@@ -284,6 +299,36 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
             except ValueError: degrees = 0.0
             steps.append({"type": "hue2", "degrees": degrees})
 
+        elif key == "hflip":
+            if is_true(val):
+                steps.append({"type": "hflip"})
+
+        elif key == "vflip":
+            if is_true(val):
+                steps.append({"type": "vflip"})
+
+        elif key == "swirl":
+            p = [x.strip() for x in val.split(";")]
+            def _swfp(i, d):
+                try: return float(p[i]) if len(p) > i else d
+                except ValueError: return d
+            def _swbp(i, d=False):
+                if len(p) <= i: return d
+                return p[i].lower() in ("1","true","t","y","yes","+","on")
+            _lock = _swbp(5)
+            _fall = p[4].lower() if len(p) > 4 else "quad"
+            if _fall not in ("linear", "quad"):
+                _fall = "quad"
+            steps.append({
+                "type": "swirl",
+                "strength":  _swfp(0, 90.0),
+                "radius":    _swfp(1, 0.5),
+                "cx":        _swfp(2, 0.5),
+                "cy":        _swfp(3, 0.5),
+                "fallout":   _fall,
+                "lock":      _lock,
+            })
+
     return steps
 
 
@@ -374,43 +419,71 @@ def _apply_speed(src: str, dst: str, rate: float, is_video: bool, duration: int)
     return _run(cmd)
 
 
-def _build_mirror_complex(axis: str, side: int) -> str:
+def _build_mirror_vf(axis: str, side: int) -> str:
     """
     axis='h', side=1 → left half reflected to fill right  (left mirror)
     axis='h', side=2 → right half reflected to fill left  (right mirror)
     axis='v', side=1 → top half reflected to fill bottom  (top mirror)
     axis='v', side=2 → bottom half reflected to fill top  (bottom mirror)
+    All use simple -vf (no filter_complex), so audio is preserved.
     """
     if axis == "h":
         if side == 1:
+            # Crop left half, hflip it, paste on right half
             return (
-                "[0:v]split[a][b];"
-                "[a]crop=iw/2:ih:0:0[lft];"
-                "[lft]hflip[rgt];"
-                "[lft][rgt]hstack"
+                "split[lft_src][full];"
+                "[lft_src]crop=iw/2:ih:0:0,hflip[lft];"
+                "[full][lft]overlay=0:0"
             )
         else:
+            # Crop right half, hflip it, paste on left half
             return (
-                "[0:v]split[a][b];"
-                "[a]crop=iw/2:ih:iw/2:0[rgt];"
-                "[rgt]hflip[lm];"
-                "[lm][rgt]hstack"
+                "split[rgt_src][full];"
+                "[rgt_src]crop=iw/2:ih:iw/2:0,hflip[rgt];"
+                "[full][rgt]overlay=0:0"
             )
     else:  # v
         if side == 1:
+            # Crop top half, vflip it, paste on bottom half
             return (
-                "[0:v]split[a][b];"
-                "[a]crop=iw:ih/2:0:0[top];"
-                "[top]vflip[bot];"
-                "[top][bot]vstack"
+                "split[top_src][full];"
+                "[top_src]crop=iw:ih/2:0:0,vflip[top];"
+                "[full][top]overlay=0:0"
             )
         else:
+            # Crop bottom half, vflip it, paste on top half
             return (
-                "[0:v]split[a][b];"
-                "[a]crop=iw:ih/2:0:ih/2[bot];"
-                "[bot]vflip[tm];"
-                "[tm][bot]vstack"
+                "split[bot_src][full];"
+                "[bot_src]crop=iw:ih/2:0:ih/2,vflip[bot];"
+                "[full][bot]overlay=0:0"
             )
+
+
+def _build_swirl_vf(strength: float, radius: float, cx: float, cy: float, fallout: str, lock: bool) -> str:
+    """
+    Rotational swirl via geq. Maps each pixel to a rotated position based on
+    distance from center. fallout=linear or quad controls the falloff curve.
+    lock=true forces a square working area (scale=h:h) before mapping back.
+    """
+    _cx = f"W*{cx}"
+    _cy = f"H*{cy}"
+    _rad = f"min(W,H)*{radius}"
+    _strength = f"({strength})/180*PI"
+    dist = f"hypot(X-{_cx},Y-{_cy})+1e-6"
+    angle = f"atan2(Y-{_cy},X-{_cx})"
+    if fallout == "linear":
+        falloff = f"if(lt({dist},{_rad}),1-({dist})/({_rad}),0)"
+    else:
+        falloff = f"if(lt({dist},{_rad}),1-({dist})/({_rad}),0)^2"
+    nx = f"{_cx}+({dist})*cos(({angle})+({_strength})*({falloff}))"
+    ny = f"{_cy}+({dist})*sin(({angle})+({_strength})*({falloff}))"
+    if lock:
+        return (
+            f"format=yuv444p,scale=H:H,"
+            f"geq='p({nx},{ny})',"
+            f"scale=iw:ih,setsar=1:1,format=yuv420p"
+        )
+    return f"format=yuv444p,geq='p({nx},{ny})',scale=iw:ih,format=yuv420p"
 
 
 def _build_huehsv_clut(tmpdir: str, amount: float) -> str:
@@ -551,15 +624,25 @@ def _apply_step(
         return _apply_speed(src, dst, step["rate"], is_video, duration)
 
     elif t == "hmirror":
-        fc = _build_mirror_complex("h", step["side"])
-        return _apply_complex(src, dst, fc, is_video, duration)
+        vf = _build_mirror_vf("h", step["side"])
+        return _apply_vf(src, dst, vf, is_video, duration)
 
     elif t == "vmirror":
-        fc = _build_mirror_complex("v", step["side"])
-        return _apply_complex(src, dst, fc, is_video, duration)
+        vf = _build_mirror_vf("v", step["side"])
+        return _apply_vf(src, dst, vf, is_video, duration)
 
     elif t == "hue2":
         vf = f"hue=h={step['degrees']},frei0r=premultiply"
+        return _apply_vf(src, dst, vf, is_video, duration)
+
+    elif t == "hflip":
+        return _apply_vf(src, dst, "hflip", is_video, duration)
+
+    elif t == "vflip":
+        return _apply_vf(src, dst, "vflip", is_video, duration)
+
+    elif t == "swirl":
+        vf = _build_swirl_vf(step["strength"], step["radius"], step["cx"], step["cy"], step["fallout"], step["lock"])
         return _apply_vf(src, dst, vf, is_video, duration)
 
     return False, f"Unknown step type: {t}"
@@ -809,6 +892,13 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
             effect_parts.append("vmirror-top" if s["side"] == 1 else "vmirror-bottom")
         elif s["type"] == "hue2":
             effect_parts.append(f"hue2({s['degrees']:+.0f}°)")
+        elif s["type"] == "hflip":
+            effect_parts.append("hflip")
+        elif s["type"] == "vflip":
+            effect_parts.append("vflip")
+        elif s["type"] == "swirl":
+            lock = ",lock" if s["lock"] else ""
+            effect_parts.append(f"swirl({s['strength']:.0f}°;r={s['radius']:.1f};f={s['fallout']}{lock})")
 
     pipeline_label = " → ".join(effect_parts)
 
