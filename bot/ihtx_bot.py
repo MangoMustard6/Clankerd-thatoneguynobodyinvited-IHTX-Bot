@@ -127,12 +127,8 @@ One command, pipe-style syntax:
   noclip=true   — drawbox border to suppress edge wrap artifacts
   Example: `wave=1;1;1;0;0.5;1;0.5;0` (horizontal wobble + light vertical)
 
-**TV / CRT simulator:**
-`tv=line_sync;zoom_grill;vertical`
-  line_sync 0–1 — hsync degradation (0=strong contrast, 1=flat)
-  zoom_grill >0 — scanline width (1=tight, 2=wide bands)
-  vertical=true — vertical bars instead of horizontal scanlines
-  Example: `tv=0.3;1;false`
+**Speed:**
+`speed=2` — 2x fast forward (also accepts <1 for slow motion)
 
 **Mirror:**
 `hmirror=1` — left half reflected right (left mirror)
@@ -151,7 +147,7 @@ One command, pipe-style syntax:
 **Examples:**
 `!ihtx chaos=true`
 `!ihtx wave=1;2;1;0;1;1;0.5;0`
-`!ihtx tv=0.2;1.5,hmirror=1`
+`!ihtx speed=2,hmirror=1`
 `!ihtx glitch=true,concat=true,rep=20,duration=0.5`
 `!ihtx wave=1;1;1,concat=true,rep=15,duration=0.4`
 `!ihtx hmirror=1,vmirror=1,hue2=180`
@@ -268,20 +264,10 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
                 "separate": _wbp(8), "noclip": _wbp(9),
             })
 
-        elif key == "tv":
-            p = [x.strip() for x in val.split(";")]
-            def _tvfp(i, d):
-                try: return float(p[i]) if len(p) > i else d
-                except ValueError: return d
-            def _tvbp(i, d=False):
-                if len(p) <= i: return d
-                return p[i].lower() in ("1","true","t","y","yes","+","on")
-            steps.append({
-                "type": "tv",
-                "line_sync":  max(0.0, min(1.0, _tvfp(0, 0.25))),
-                "zoom_grill": max(0.1, _tvfp(1, 1.0)),
-                "vertical":   _tvbp(2),
-            })
+        elif key == "speed":
+            try: rate = max(0.01, min(100.0, float(val)))
+            except ValueError: rate = 1.0
+            steps.append({"type": "speed", "rate": rate})
 
         elif key == "hmirror":
             try: side = max(1, min(2, int(val)))
@@ -357,26 +343,35 @@ def _build_wave_vf(
     )
 
 
-def _build_tv_vf(line_sync: float, zoom_grill: float, vertical: bool) -> str:
+def _apply_speed(src: str, dst: str, rate: float, is_video: bool, duration: int) -> tuple[bool, str]:
     """
-    CRT/TV simulator.
-    line_sync  0–1  — amount of hsync distortion (contrast degradation)
-    zoom_grill >0   — scanline pitch (1 = 1 line per 2px, 2 = wider bands)
-    vertical        — rotate scanlines 90° (vertical bars instead of horizontal)
+    Change playback rate.
+    rate > 1 = fast forward, rate < 1 = slow motion.
+    Video: setpts. Audio: chained atempo (clamped to 0.5–2.0 per filter).
     """
-    contrast = (1.0 - line_sync) * 2.366666
-    freq      = 2.0 / max(0.01, zoom_grill)
-    if vertical:
-        luma = f"lum(X,Y)*(0.65+0.35*sin(X*{freq:.6f}*PI))"
-    else:
-        luma = f"lum(X,Y)*(0.65+0.35*sin(Y*{freq:.6f}*PI))"
-    return (
-        f"format=yuv444p,"
-        f"eq=contrast={contrast:.6f},"
-        f"hue=b=-0.033,"
-        f"geq='lum={luma}',"
-        f"format=yuv420p"
-    )
+    if not is_video:
+        # Images have no audio, just setpts for video
+        vf = f"setpts={1.0/rate:.6f}*PTS"
+        return _apply_vf(src, dst, vf, False, duration)
+
+    # Build atempo chain
+    tempo = 1.0 / rate
+    chains = []
+    while tempo > 2.0:
+        chains.append("atempo=2.0")
+        tempo /= 2.0
+    while tempo < 0.5:
+        chains.append("atempo=0.5")
+        tempo /= 0.5
+    if tempo != 1.0:
+        chains.append(f"atempo={tempo:.4f}")
+    af = ",".join(chains) if chains else "anull"
+    vf = f"setpts={1.0/rate:.6f}*PTS"
+    cmd = ["ffmpeg", "-y", "-i", src,
+           "-vf", vf, "-af", af,
+           "-c:v", "ffv1", "-c:a", "pcm_s16le",
+           "-t", str(duration), dst]
+    return _run(cmd)
 
 
 def _build_mirror_complex(axis: str, side: int) -> str:
@@ -447,8 +442,7 @@ def _apply_vf(src: str, dst: str, vf: str, is_video: bool, duration: int) -> tup
     if is_video:
         cmd = ["ffmpeg", "-y", "-i", src,
                "-vf", vf,
-               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-               "-c:a", "copy", "-t", str(duration), dst]
+               "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", str(duration), dst]
     else:
         pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
         cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src,
@@ -460,8 +454,7 @@ def _apply_complex(src: str, dst: str, fc: str, is_video: bool, duration: int) -
     if is_video:
         cmd = ["ffmpeg", "-y", "-i", src,
                "-filter_complex", fc,
-               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-               "-c:a", "copy", "-t", str(duration), dst]
+               "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", str(duration), dst]
     else:
         pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
         cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src,
@@ -473,8 +466,7 @@ def _apply_haldclut(src: str, clut: str, dst: str, is_video: bool, duration: int
     if is_video:
         cmd = ["ffmpeg", "-y", "-i", src, "-i", clut,
                "-filter_complex", "[0:v][1:v]haldclut",
-               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-               "-c:a", "copy", "-t", str(duration), dst]
+               "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", str(duration), dst]
     else:
         pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
         cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src, "-i", clut,
@@ -484,16 +476,18 @@ def _apply_haldclut(src: str, clut: str, dst: str, is_video: bool, duration: int
 
 def _apply_pitch(src: str, dst: str, semitones: list[float]) -> tuple[bool, str]:
     n  = len(semitones)
+    # 2.14748e+09 / 4.9 = 438261224.49 (rubberband detector freq)
+    _det = "2.14748e+09/4.9"
     fc = f"[0:a]asplit={n}" + "".join(f"[a{i}]" for i in range(n)) + ";"
     fc += ";".join(
-        f"[a{i}]rubberband=pitch={2 ** (st / 12):.6f}[p{i}]"
+        f"[a{i}]rubberband=pitch={2 ** (st / 12):.6f}:window=short:transients=crisp:detector={_det}[p{i}]"
         for i, st in enumerate(semitones)
     ) + ";"
-    fc += "".join(f"[p{i}]" for i in range(n)) + f"amix=inputs={n}:normalize=0[aout]"
+    fc += "".join(f"[p{i}]" for i in range(n)) + f"amix=inputs={n}:normalize=0,highpass=5[aout]"
     cmd = ["ffmpeg", "-y", "-i", src,
            "-filter_complex", fc,
            "-map", "0:v", "-map", "[aout]",
-           "-c:v", "copy", "-t", "300", dst]
+           "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", "300", dst]
     return _run(cmd, timeout=300)
 
 
@@ -501,7 +495,7 @@ def _apply_reverse(src: str, dst: str, is_video: bool) -> tuple[bool, str]:
     if is_video:
         cmd = ["ffmpeg", "-y", "-i", src,
                "-vf", "reverse", "-af", "areverse",
-               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+               "-c:v", "ffv1", "-c:a", "pcm_s16le",
                dst]
     else:
         cmd = ["ffmpeg", "-y", "-i", src,
@@ -553,9 +547,8 @@ def _apply_step(
         )
         return _apply_vf(src, dst, vf, is_video, duration)
 
-    elif t == "tv":
-        vf = _build_tv_vf(step["line_sync"], step["zoom_grill"], step["vertical"])
-        return _apply_vf(src, dst, vf, is_video, duration)
+    elif t == "speed":
+        return _apply_speed(src, dst, step["rate"], is_video, duration)
 
     elif t == "hmirror":
         fc = _build_mirror_complex("h", step["side"])
@@ -630,8 +623,8 @@ def _render_to_ts(
             "ffmpeg", "-y",
             "-loop", "1", "-i", src,
             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac",
+            "-c:v", "ffv1",
+            "-c:a", "pcm_s16le",
             "-t", str(duration), "-shortest",
             loop_mp4,
         ])
@@ -659,11 +652,11 @@ def _render_to_ts(
             return False, f"Seg {seg_idx} reverse failed: {err}"
         intermediate = rev_out
 
-    # Final encode to .ts — H.264 + AAC required for concat protocol
+    # Final encode to .ts — ffv1 + PCM in TS container
     ok, err = _run([
         "ffmpeg", "-y", "-i", intermediate,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
-        "-c:a", "aac", "-ar", "44100",
+        "-c:v", "ffv1",
+        "-c:a", "pcm_s16le", "-ar", "44100",
         "-t", str(duration),
         dst,
     ])
@@ -801,9 +794,8 @@ async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
             if s["noclip"]:   flags.append("noclip")
             tag = f",{','.join(flags)}" if flags else ""
             effect_parts.append(f"wave(h={s['hs']};{s['hf']};{s['ha']},v={s['vs']};{s['vf']};{s['va']}{tag})")
-        elif s["type"] == "tv":
-            vert = ",vert" if s["vertical"] else ""
-            effect_parts.append(f"tv({s['line_sync']:.2f};{s['zoom_grill']:.1f}{vert})")
+        elif s["type"] == "speed":
+            effect_parts.append(f"speed×{s['rate']:.2f}")
         elif s["type"] == "hmirror":
             effect_parts.append("hmirror-left" if s["side"] == 1 else "hmirror-right")
         elif s["type"] == "vmirror":
