@@ -1286,8 +1286,10 @@ async def on_message(message: discord.Message):
     except Exception as e:
         err = str(e)
         print(f"Autoreply error: {err}", flush=True)
-        if "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
-            await message.channel.send("❌ Autoreply error: invalid API key. Use `g!autoreply off` to disable.")
+        if "insufficient_quota" in err or "quota" in err.lower():
+            await message.reply("❌ Autoreply is out of OpenAI credits. Top up at <https://platform.openai.com/settings/billing> or disable with `g!autoreply off`.")
+        elif "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
+            await message.reply("❌ Autoreply error: invalid API key. Use `g!autoreply off` to disable.")
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
