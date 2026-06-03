@@ -32,7 +32,7 @@ args = "python3 bot/ihtx_bot.py"
 outputType = "console"
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]
@@ -50,3 +50,11 @@ externalPort = 80
 [[ports]]
 localPort = 8082
 externalPort = 3000
+
+[userenv]
+
+[userenv.shared]
+PORT = "8081"
+
+[nix]
+channel = "stable-25_05"
