@@ -39,12 +39,6 @@ try:
 except ImportError:
     yt_dlp = None
 
-try:
-    from openai import AsyncOpenAI
-    _openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY")) if os.environ.get("OPENAI_API_KEY") else None
-except ImportError:
-    _openai_client = None
-
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     print("ERROR: DISCORD_TOKEN environment variable not set.", file=sys.stderr)
@@ -1101,43 +1095,6 @@ async def cmd_setlimit(ctx: commands.Context, user: discord.User | None = None, 
     await ctx.reply(f"✅ Set daily limit for {user} to {limit}.")
 
 
-@bot.command(name="tag")
-async def cmd_tag(ctx: commands.Context, action: str = "", name: str = "", *, pipe_str: str = ""):
-    if action == "save":
-        if not name or not pipe_str:
-            await ctx.reply("Usage: `g!tag save <name> <effect pipe>`")
-            return
-        tags[name] = {"pipe": pipe_str, "author": ctx.author.id}
-        _save_tags()
-        await ctx.reply(f"✅ Tag `{name}` saved.")
-    elif action == "use":
-        if name not in tags:
-            await ctx.reply(f"❌ Tag `{name}` not found.")
-            return
-        att = _get_attachment(ctx)
-        if not att:
-            await ctx.reply("❌ Attach or reply to a supported media file.")
-            return
-        # Delegate to ihtx with the tag's pipe
-        fake_ctx = ctx
-        await cmd_ihtx(fake_ctx, pipe_str=tags[name]["pipe"])
-    elif action == "list":
-        if not tags:
-            await ctx.reply("No tags saved yet.")
-        else:
-            lines = [f"`{n}`: {v['pipe']}" for n, v in list(tags.items())[:20]]
-            await ctx.reply("\n".join(lines))
-    elif action == "delete":
-        if not _is_owner(ctx) and tags.get(name, {}).get("author") != ctx.author.id:
-            await ctx.reply("❌ You can only delete your own tags.")
-            return
-        tags.pop(name, None)
-        _save_tags()
-        await ctx.reply(f"✅ Tag `{name}` deleted.")
-    else:
-        await ctx.reply("Usage: `g!tag save/use/list/delete <name> [pipe]`")
-
-
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CommandNotFound):
@@ -1148,148 +1105,86 @@ async def on_command_error(ctx: commands.Context, error):
     print(f"Command error in {ctx.command}: {error}", flush=True)
 
 
-# ─── Autoreply ────────────────────────────────────────────────────────────────
+# ─── Tag system ───────────────────────────────────────────────────────────────
 
-AUTOREPLY_FILE = Path("bot/autoreply.json")
-
-# channel_id -> {"enabled": bool, "prompt": str, "history": [...]}
-autoreply_state: dict[int, dict] = {}
-
-DEFAULT_AUTOREPLY_PROMPT = (
-    "You are a witty and helpful Discord bot named Glossi. "
-    "Reply concisely in 1–3 sentences. Match the tone of the conversation."
-)
-
-def _load_autoreply():
-    global autoreply_state
-    if AUTOREPLY_FILE.exists():
-        try:
-            raw = json.loads(AUTOREPLY_FILE.read_text())
-            autoreply_state = {int(k): v for k, v in raw.items()}
-        except Exception:
-            autoreply_state = {}
-
-def _save_autoreply():
-    AUTOREPLY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    AUTOREPLY_FILE.write_text(json.dumps(
-        {str(k): {**v, "history": v.get("history", [])} for k, v in autoreply_state.items()},
-        indent=2
-    ))
-
-_load_autoreply()
-
-
-@bot.command(name="autoreply")
-async def cmd_autoreply(ctx: commands.Context, action: str = "", *, rest: str = ""):
+@bot.command(name="tagcreate")
+async def cmd_tagcreate(ctx: commands.Context, name: str = "", *, body: str = ""):
     """
-    g!autoreply on          — enable autoreply in this channel
-    g!autoreply off         — disable autoreply in this channel
-    g!autoreply prompt <..> — set a custom system prompt for this channel
-    g!autoreply reset       — reset prompt to default and clear history
-    g!autoreply status      — show current settings for this channel
+    g!tagcreate <name> tagscript=<text> iscript=<text>
+    Stores a tag with both a tagscript and an iscript field.
     """
-    if not _is_owner(ctx):
-        await ctx.reply("❌ Only owners can configure autoreply.")
+    if not name or not body.strip():
+        await ctx.reply("Usage: `g!tagcreate <name> tagscript=<text> iscript=<text>`")
         return
+    # Parse key=value pairs from body
+    fields = {}
+    for part in re.split(r"\s+\b(?=tagscript|iscript)", body.strip()):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            fields[k.strip()] = v.strip()
+    if not fields.get("tagscript"):
+        await ctx.reply("❌ `tagscript` is required. Usage: `g!tagcreate <name> tagscript=<text> iscript=<text>`")
+        return
+    tags[name] = {
+        "tagscript": fields["tagscript"],
+        "iscript": fields.get("iscript", ""),
+        "author": ctx.author.id,
+    }
+    _save_tags()
+    await ctx.reply(f"✅ Tag `{name}` created with tagscript and iscript.")
 
-    cid = ctx.channel.id
-    state = autoreply_state.setdefault(cid, {"enabled": False, "prompt": DEFAULT_AUTOREPLY_PROMPT, "history": []})
 
-    if action == "on":
-        if _openai_client is None:
-            await ctx.reply("❌ OpenAI is not available. Check that `OPENAI_API_KEY` is set.")
-            return
-        state["enabled"] = True
-        _save_autoreply()
-        await ctx.reply("✅ Autoreply **enabled** in this channel. I'll reply to every message.")
+@bot.command(name="taguse")
+async def cmd_taguse(ctx: commands.Context, name: str = ""):
+    """
+    g!taguse <name> — run a tag's tagscript as an IHTX effect pipe.
+    Attach or reply to a media file.
+    """
+    if not name:
+        await ctx.reply("Usage: `g!taguse <name>`")
+        return
+    if name not in tags:
+        await ctx.reply(f"❌ Tag `{name}` not found.")
+        return
+    att = _get_attachment(ctx)
+    if not att:
+        await ctx.reply("❌ Attach or reply to a supported media file.")
+        return
+    # Use tagscript as the effect pipe
+    pipe_str = tags[name].get("tagscript", "")
+    await cmd_ihtx(ctx, pipe_str=pipe_str)
 
-    elif action == "off":
-        state["enabled"] = False
-        _save_autoreply()
-        await ctx.reply("✅ Autoreply **disabled** in this channel.")
 
-    elif action == "prompt":
-        if not rest.strip():
-            await ctx.reply("Usage: `g!autoreply prompt <your system prompt>`")
-            return
-        state["prompt"] = rest.strip()
-        state["history"] = []
-        _save_autoreply()
-        await ctx.reply(f"✅ System prompt updated and history cleared.\n> {rest.strip()[:200]}")
-
-    elif action == "reset":
-        state["prompt"] = DEFAULT_AUTOREPLY_PROMPT
-        state["history"] = []
-        _save_autoreply()
-        await ctx.reply("✅ Prompt reset to default and history cleared.")
-
-    elif action == "status":
-        enabled = "✅ On" if state["enabled"] else "❌ Off"
-        prompt_preview = state.get("prompt", DEFAULT_AUTOREPLY_PROMPT)[:120]
-        history_len = len(state.get("history", []))
-        await ctx.reply(
-            f"**Autoreply status for this channel**\n"
-            f"State: {enabled}\n"
-            f"History turns: {history_len // 2}\n"
-            f"Prompt: `{prompt_preview}{'…' if len(state.get('prompt','')) > 120 else ''}`"
-        )
-
+@bot.command(name="taglist")
+async def cmd_taglist(ctx: commands.Context):
+    """
+    g!taglist — show all saved tags.
+    """
+    if not tags:
+        await ctx.reply("No tags saved yet.")
     else:
-        await ctx.reply(
-            "**Autoreply commands:**\n"
-            "`g!autoreply on` — enable in this channel\n"
-            "`g!autoreply off` — disable in this channel\n"
-            "`g!autoreply prompt <text>` — set custom system prompt\n"
-            "`g!autoreply reset` — reset prompt & clear history\n"
-            "`g!autoreply status` — show current settings"
-        )
+        lines = [f"`{n}`: tagscript={v.get('tagscript','')[:30]}{'…' if len(v.get('tagscript',''))>30 else ''}  iscript={v.get('iscript','')[:30]}{'…' if len(v.get('iscript',''))>30 else ''}" for n, v in list(tags.items())[:20]]
+        await ctx.reply("\n".join(lines))
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    # Always process commands first
-    await bot.process_commands(message)
-
-    # Ignore the bot's own messages and commands
-    if message.author.bot:
+@bot.command(name="tagdelete")
+async def cmd_tagdelete(ctx: commands.Context, name: str = ""):
+    """
+    g!tagdelete <name> — delete a tag. Owners or the tag's creator can delete.
+    """
+    if not name:
+        await ctx.reply("Usage: `g!tagdelete <name>`")
         return
-    if message.content.startswith(bot.command_prefix):
+    if name not in tags:
+        await ctx.reply(f"❌ Tag `{name}` not found.")
         return
-
-    # Check if autoreply is enabled in this channel
-    state = autoreply_state.get(message.channel.id)
-    if not state or not state.get("enabled"):
+    if not _is_owner(ctx) and tags[name].get("author") != ctx.author.id:
+        await ctx.reply("❌ You can only delete your own tags.")
         return
-    if _openai_client is None:
-        return
-
-    # Build conversation history (keep last 20 turns = 40 messages)
-    history: list[dict] = state.setdefault("history", [])
-    history.append({"role": "user", "content": f"{message.author.display_name}: {message.content}"})
-    if len(history) > 40:
-        history[:] = history[-40:]
-
-    try:
-        async with message.channel.typing():
-            response = await _openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": state.get("prompt", DEFAULT_AUTOREPLY_PROMPT)},
-                    *history,
-                ],
-                max_tokens=256,
-            )
-        reply_text = response.choices[0].message.content or "…"
-        history.append({"role": "assistant", "content": reply_text})
-        _save_autoreply()
-        await message.reply(reply_text)
-    except Exception as e:
-        err = str(e)
-        print(f"Autoreply error: {err}", flush=True)
-        if "insufficient_quota" in err or "quota" in err.lower():
-            await message.reply("❌ Autoreply is out of OpenAI credits. Top up at <https://platform.openai.com/settings/billing> or disable with `g!autoreply off`.")
-        elif "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
-            await message.reply("❌ Autoreply error: invalid API key. Use `g!autoreply off` to disable.")
+    tags.pop(name, None)
+    _save_tags()
+    await ctx.reply(f"✅ Tag `{name}` deleted.")
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
