@@ -39,6 +39,12 @@ try:
 except ImportError:
     yt_dlp = None
 
+try:
+    from openai import AsyncOpenAI
+    _openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY")) if os.environ.get("OPENAI_API_KEY") else None
+except ImportError:
+    _openai_client = None
+
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     print("ERROR: DISCORD_TOKEN environment variable not set.", file=sys.stderr)
@@ -1140,6 +1146,148 @@ async def on_command_error(ctx: commands.Context, error):
         await ctx.reply(f"❌ Missing argument: `{error.param.name}`")
         return
     print(f"Command error in {ctx.command}: {error}", flush=True)
+
+
+# ─── Autoreply ────────────────────────────────────────────────────────────────
+
+AUTOREPLY_FILE = Path("bot/autoreply.json")
+
+# channel_id -> {"enabled": bool, "prompt": str, "history": [...]}
+autoreply_state: dict[int, dict] = {}
+
+DEFAULT_AUTOREPLY_PROMPT = (
+    "You are a witty and helpful Discord bot named Glossi. "
+    "Reply concisely in 1–3 sentences. Match the tone of the conversation."
+)
+
+def _load_autoreply():
+    global autoreply_state
+    if AUTOREPLY_FILE.exists():
+        try:
+            raw = json.loads(AUTOREPLY_FILE.read_text())
+            autoreply_state = {int(k): v for k, v in raw.items()}
+        except Exception:
+            autoreply_state = {}
+
+def _save_autoreply():
+    AUTOREPLY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTOREPLY_FILE.write_text(json.dumps(
+        {str(k): {**v, "history": v.get("history", [])} for k, v in autoreply_state.items()},
+        indent=2
+    ))
+
+_load_autoreply()
+
+
+@bot.command(name="autoreply")
+async def cmd_autoreply(ctx: commands.Context, action: str = "", *, rest: str = ""):
+    """
+    g!autoreply on          — enable autoreply in this channel
+    g!autoreply off         — disable autoreply in this channel
+    g!autoreply prompt <..> — set a custom system prompt for this channel
+    g!autoreply reset       — reset prompt to default and clear history
+    g!autoreply status      — show current settings for this channel
+    """
+    if not _is_owner(ctx):
+        await ctx.reply("❌ Only owners can configure autoreply.")
+        return
+
+    cid = ctx.channel.id
+    state = autoreply_state.setdefault(cid, {"enabled": False, "prompt": DEFAULT_AUTOREPLY_PROMPT, "history": []})
+
+    if action == "on":
+        if _openai_client is None:
+            await ctx.reply("❌ OpenAI is not available. Check that `OPENAI_API_KEY` is set.")
+            return
+        state["enabled"] = True
+        _save_autoreply()
+        await ctx.reply("✅ Autoreply **enabled** in this channel. I'll reply to every message.")
+
+    elif action == "off":
+        state["enabled"] = False
+        _save_autoreply()
+        await ctx.reply("✅ Autoreply **disabled** in this channel.")
+
+    elif action == "prompt":
+        if not rest.strip():
+            await ctx.reply("Usage: `g!autoreply prompt <your system prompt>`")
+            return
+        state["prompt"] = rest.strip()
+        state["history"] = []
+        _save_autoreply()
+        await ctx.reply(f"✅ System prompt updated and history cleared.\n> {rest.strip()[:200]}")
+
+    elif action == "reset":
+        state["prompt"] = DEFAULT_AUTOREPLY_PROMPT
+        state["history"] = []
+        _save_autoreply()
+        await ctx.reply("✅ Prompt reset to default and history cleared.")
+
+    elif action == "status":
+        enabled = "✅ On" if state["enabled"] else "❌ Off"
+        prompt_preview = state.get("prompt", DEFAULT_AUTOREPLY_PROMPT)[:120]
+        history_len = len(state.get("history", []))
+        await ctx.reply(
+            f"**Autoreply status for this channel**\n"
+            f"State: {enabled}\n"
+            f"History turns: {history_len // 2}\n"
+            f"Prompt: `{prompt_preview}{'…' if len(state.get('prompt','')) > 120 else ''}`"
+        )
+
+    else:
+        await ctx.reply(
+            "**Autoreply commands:**\n"
+            "`g!autoreply on` — enable in this channel\n"
+            "`g!autoreply off` — disable in this channel\n"
+            "`g!autoreply prompt <text>` — set custom system prompt\n"
+            "`g!autoreply reset` — reset prompt & clear history\n"
+            "`g!autoreply status` — show current settings"
+        )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Always process commands first
+    await bot.process_commands(message)
+
+    # Ignore the bot's own messages and commands
+    if message.author.bot:
+        return
+    if message.content.startswith(bot.command_prefix):
+        return
+
+    # Check if autoreply is enabled in this channel
+    state = autoreply_state.get(message.channel.id)
+    if not state or not state.get("enabled"):
+        return
+    if _openai_client is None:
+        return
+
+    # Build conversation history (keep last 20 turns = 40 messages)
+    history: list[dict] = state.setdefault("history", [])
+    history.append({"role": "user", "content": f"{message.author.display_name}: {message.content}"})
+    if len(history) > 40:
+        history[:] = history[-40:]
+
+    try:
+        async with message.channel.typing():
+            response = await _openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": state.get("prompt", DEFAULT_AUTOREPLY_PROMPT)},
+                    *history,
+                ],
+                max_tokens=256,
+            )
+        reply_text = response.choices[0].message.content or "…"
+        history.append({"role": "assistant", "content": reply_text})
+        _save_autoreply()
+        await message.reply(reply_text)
+    except Exception as e:
+        err = str(e)
+        print(f"Autoreply error: {err}", flush=True)
+        if "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
+            await message.channel.send("❌ Autoreply error: invalid API key. Use `g!autoreply off` to disable.")
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
