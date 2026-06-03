@@ -9,7 +9,7 @@ Pipe syntax (comma-separated key=value):
         =true  or  =N  (N passes of that effect)
   huehsv=0.5            hue amount 0-1
   pinch=1;0.5;0.5;0.5   strength;radius;cx;cy  (all optional, defaults shown)
-  pitch=0;7;12          semicolon-separated semitones (multipitch = mixed together)
+  multipitch=0;7;12     semicolon-separated semitones (each shifted, then amixed)
   reverse=true          reverse video + audio (applied once at end)
   rep=N                 number of render cycles (default 1)
   duration=N            seconds per segment (default 0.5)
@@ -21,23 +21,196 @@ Pipe syntax (comma-separated key=value):
 import discord
 from discord.ext import commands
 import asyncio
+import json
 import os
 import re
 import tempfile
 import subprocess
 import aiohttp
 import sys
+import time
+import urllib.parse
+import hashlib
+import datetime
 from pathlib import Path
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     print("ERROR: DISCORD_TOKEN environment variable not set.", file=sys.stderr)
     sys.exit(1)
 
+OWNER_ID = 1355759019330895973
+
+# ─── Owner IDs (can have multiple owners via g!owner command) ───────────────
+
+OWNER_IDS_FILE = Path("bot/owner_ids.json")
+owner_ids: set[int] = {OWNER_ID}
+
+def _load_owner_ids():
+    global owner_ids
+    if OWNER_IDS_FILE.exists():
+        try:
+            with open(OWNER_IDS_FILE) as f:
+                owner_ids = set(json.load(f))
+        except Exception:
+            owner_ids = {OWNER_ID}
+    else:
+        owner_ids = {OWNER_ID}
+
+def _save_owner_ids():
+    OWNER_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(OWNER_IDS_FILE, "w") as f:
+        json.dump(list(owner_ids), f)
+
+def _is_owner(ctx: commands.Context) -> bool:
+    return ctx.author.id in owner_ids
+
+def _is_owner_by_id(user_id: int) -> bool:
+    return user_id in owner_ids
+
+_load_owner_ids()
+
+# ─── Heavy command rate limiting ───────────────────────────────────────────
+
+# These commands are classified as "heavy" (CPU-intensive / FFmpeg)
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "ihtxsync", "download", "dl"}
+
+# Default limits: owner = 5340, everyone else = 10 per day
+HEAVY_LIMIT_DEFAULT = 10
+HEAVY_LIMIT_OWNER   = 5340
+
+LIMITS_FILE = Path("bot/limits.json")
+heavy_limits: dict[int, int] = {}  # per-user overrides
+heavy_usage: dict[int, list[float]] = {}  # user_id -> list of epoch timestamps
+
+def _load_limits():
+    global heavy_limits
+    if LIMITS_FILE.exists():
+        try:
+            with open(LIMITS_FILE) as f:
+                heavy_limits = {int(k): v for k, v in json.load(f).items()}
+        except Exception:
+            heavy_limits = {}
+
+def _save_limits():
+    LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LIMITS_FILE, "w") as f:
+        json.dump(heavy_limits, f)
+
+def _check_heavy_limit(user_id: int) -> tuple[bool, str]:
+    """Return (ok, reason) for a heavy command usage."""
+    if _is_owner_by_id(user_id):
+        return True, ""
+    limit = heavy_limits.get(user_id, HEAVY_LIMIT_DEFAULT)
+    now = time.time()
+    day_ago = now - 86400
+    # Clean old entries
+    usage = [t for t in heavy_usage.get(user_id, []) if t > day_ago]
+    heavy_usage[user_id] = usage
+    if len(usage) >= limit:
+        return False, f"Heavy command limit reached ({limit}/{limit} per 24h). Contact an owner."
+    usage.append(now)
+    return True, ""
+
+_load_limits()
+
+# ─── Blocklist (users) ───────────────────────────────────────────────────────
+
+BLOCKLIST_FILE = Path("bot/blocklist.json")
+blocklist: set[int] = set()
+
+def _load_blocklist():
+    global blocklist
+    if BLOCKLIST_FILE.exists():
+        try:
+            with open(BLOCKLIST_FILE) as f:
+                blocklist = set(json.load(f))
+        except Exception:
+            blocklist = set()
+
+def _save_blocklist():
+    BLOCKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(BLOCKLIST_FILE, "w") as f:
+        json.dump(list(blocklist), f)
+
+_load_blocklist()
+
+# ─── Channel blocklist ────────────────────────────────────────────────────────
+
+CHANNEL_BLOCK_FILE = Path("bot/channel_blocks.json")
+channel_blocks: set[int] = set()
+
+def _load_channel_blocks():
+    global channel_blocks
+    if CHANNEL_BLOCK_FILE.exists():
+        try:
+            with open(CHANNEL_BLOCK_FILE) as f:
+                channel_blocks = set(json.load(f))
+        except Exception:
+            channel_blocks = set()
+
+def _save_channel_blocks():
+    CHANNEL_BLOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHANNEL_BLOCK_FILE, "w") as f:
+        json.dump(list(channel_blocks), f)
+
+_load_channel_blocks()
+
+# ─── Tags (custom presets) ─────────────────────────────────────────────────────
+
+TAGS_FILE = Path("bot/tags.json")
+tags: dict[str, dict] = {}
+
+def _load_tags():
+    global tags
+    if TAGS_FILE.exists():
+        try:
+            with open(TAGS_FILE) as f:
+                tags = json.load(f)
+        except Exception:
+            tags = {}
+
+def _save_tags():
+    TAGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(TAGS_FILE, "w") as f:
+        json.dump(tags, f, indent=2)
+
+_load_tags()
+
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="g!", intents=intents)
+
+
+# ─── Global command checks ────────────────────────────────────────────────────
+
+@bot.check
+async def _global_checks(ctx: commands.Context) -> bool:
+    # Channel blocked
+    if ctx.channel.id in channel_blocks:
+        return False
+    # User blocked
+    if ctx.author.id in blocklist:
+        return False
+    # Heavy command rate limiting
+    if ctx.command and ctx.command.name in HEAVY_COMMANDS:
+        ok, reason = _check_heavy_limit(ctx.author.id)
+        if not ok:
+            await ctx.reply(f"❌ {reason}")
+            return False
+    return True
+
+# ─── Runtime stats ────────────────────────────────────────────────────────────
+
+_bot_start_time: float = time.time()
+_renders_completed: int = 0
+_renders_in_progress: int = 0
 
 SUPPORTED_EXTENSIONS  = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif", ".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS      = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif"}
@@ -108,7 +281,7 @@ HELP_TEXT = """\
 **I Hate The X — IHTX Bot**
 One command, pipe-style syntax:
 
-`!ihtx effect=value,effect=value,...`
+`g!ihtx effect=value,effect=value,...`
 
 **Visual effects** (value = `true` or N passes):
 `chaos` `glitch` `shake` `rainbow` `static` `melt` `corrupt`
@@ -116,7 +289,6 @@ One command, pipe-style syntax:
 **Parameterised effects:**
 `huehsv=0.5` — hue shift via hald-CLUT (0–2)
 `pinch=1;0.5;0.5;0.5` — strength;radius;cx;cy (all optional)
-`pitch=0;7;12` — semitones `;`-separated (multipitch = mixed)
 `reverse=true` — reverse video + audio (applied last)
 `hue2=90` — secondary hue rotation in degrees + premultiply blend
 
@@ -157,15 +329,30 @@ One command, pipe-style syntax:
   All segments joined → total = rep × duration seconds.
   Escalates from slightly degraded → pure chaos.
 
+**Split (zoom into half):**
+`split=left` — crop left half, scale to fill frame
+`split=right` — crop right half, scale to fill frame
+`vsplit=top` — crop top half, scale to fill frame
+`vsplit=bottom` — crop bottom half, scale to fill frame
+
+**LUT (colour grade):**
+`lut=https://example.com/film.cube` — download a .cube LUT and apply it via lut3d
+
+**Multipitch:**
+`multipitch=0;7;12` — semicolon-separated semitones; each is SoX-shifted then amixed
+  `sox b.wav out.wav pitch {cents} 25 5 8.5` — blended with `amix=N:normalize=0,highpass=5`
+
 **Examples:**
-`!ihtx chaos=true`
-`!ihtx wave=1;2;1;0;1;1;0.5;0`
-`!ihtx speed=2,hmirror=1`
-`!ihtx glitch=true,concat=true,rep=20,duration=0.5`
-`!ihtx wave=1;1;1,concat=true,rep=15,duration=0.4`
-`!ihtx hmirror=1,vmirror=1,hue2=180`
-`!ihtx hflip=true,swirl=180;0.5;0.5;0.5;linear`
-`!ihtx vflip=true,swirl=90;0.3;0.5;0.5;quad;true`
+`g!ihtx chaos=true`
+`g!ihtx wave=1;2;1;0;1;1;0.5;0`
+`g!ihtx speed=2,hmirror=1`
+`g!ihtx glitch=true,concat=true,rep=20,duration=0.5`
+`g!ihtx wave=1;1;1,concat=true,rep=15,duration=0.4`
+`g!ihtx hmirror=1,vmirror=1,hue2=180`
+`g!ihtx hflip=true,swirl=180;0.5;0.5;0.5;linear`
+`g!ihtx vflip=true,swirl=90;0.3;0.5;0.5;quad;true`
+`g!ihtx multipitch=12` — pitch up one octave
+`g!ihtx multipitch=-12;0;12` — multipitch (low + center + high octave mixed)
 """
 
 
@@ -249,7 +436,7 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
                 strength, radius, cx, cy = 1.0, 0.5, 0.5, 0.5
             steps.append({"type": "pinch", "strength": strength, "radius": radius, "cx": cx, "cy": cy})
 
-        elif key == "pitch":
+        elif key in ("multipitch", "soxpitch"):
             raw_parts = [p.strip() for p in val.split(";")]
             semitones = []
             for p in raw_parts:
@@ -258,7 +445,7 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
                 except ValueError:
                     pass
             if semitones:
-                steps.append({"type": "pitch", "semitones": semitones[:8]})
+                steps.append({"type": "multipitch", "semitones": semitones[:8]})
 
         elif key == "reverse":
             if is_true(val):
@@ -306,6 +493,21 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
         elif key == "vflip":
             if is_true(val):
                 steps.append({"type": "vflip"})
+
+        elif key == "split":
+            side = val.strip().lower()
+            if side in ("left", "right"):
+                steps.append({"type": "split", "side": side})
+
+        elif key == "vsplit":
+            side = val.strip().lower()
+            if side in ("top", "bottom"):
+                steps.append({"type": "vsplit", "side": side})
+
+        elif key == "lut":
+            url = val.strip()
+            if url:
+                steps.append({"type": "lut", "url": url})
 
         elif key == "swirl":
             p = [x.strip() for x in val.split(";")]
@@ -392,594 +594,4 @@ def _apply_speed(src: str, dst: str, rate: float, is_video: bool, duration: int)
     """
     Change playback rate.
     rate > 1 = fast forward, rate < 1 = slow motion.
-    Video: setpts. Audio: chained atempo (clamped to 0.5–2.0 per filter).
-    """
-    if not is_video:
-        # Images have no audio, just setpts for video
-        vf = f"setpts={1.0/rate:.6f}*PTS"
-        return _apply_vf(src, dst, vf, False, duration)
-
-    # Build atempo chain
-    tempo = 1.0 / rate
-    chains = []
-    while tempo > 2.0:
-        chains.append("atempo=2.0")
-        tempo /= 2.0
-    while tempo < 0.5:
-        chains.append("atempo=0.5")
-        tempo /= 0.5
-    if tempo != 1.0:
-        chains.append(f"atempo={tempo:.4f}")
-    af = ",".join(chains) if chains else "anull"
-    vf = f"setpts={1.0/rate:.6f}*PTS"
-    cmd = ["ffmpeg", "-y", "-i", src,
-           "-vf", vf, "-af", af,
-           "-c:v", "ffv1", "-c:a", "pcm_s16le",
-           "-t", str(duration), dst]
-    return _run(cmd)
-
-
-def _build_mirror_vf(axis: str, side: int) -> str:
-    """
-    axis='h', side=1 → left half reflected to fill right  (left mirror)
-    axis='h', side=2 → right half reflected to fill left  (right mirror)
-    axis='v', side=1 → top half reflected to fill bottom  (top mirror)
-    axis='v', side=2 → bottom half reflected to fill top  (bottom mirror)
-    All use simple -vf (no filter_complex), so audio is preserved.
-    """
-    if axis == "h":
-        if side == 1:
-            # Crop left half, hflip it, paste on right half
-            return (
-                "split[lft_src][full];"
-                "[lft_src]crop=iw/2:ih:0:0,hflip[lft];"
-                "[full][lft]overlay=0:0"
-            )
-        else:
-            # Crop right half, hflip it, paste on left half
-            return (
-                "split[rgt_src][full];"
-                "[rgt_src]crop=iw/2:ih:iw/2:0,hflip[rgt];"
-                "[full][rgt]overlay=0:0"
-            )
-    else:  # v
-        if side == 1:
-            # Crop top half, vflip it, paste on bottom half
-            return (
-                "split[top_src][full];"
-                "[top_src]crop=iw:ih/2:0:0,vflip[top];"
-                "[full][top]overlay=0:0"
-            )
-        else:
-            # Crop bottom half, vflip it, paste on top half
-            return (
-                "split[bot_src][full];"
-                "[bot_src]crop=iw:ih/2:0:ih/2,vflip[bot];"
-                "[full][bot]overlay=0:0"
-            )
-
-
-def _build_swirl_vf(strength: float, radius: float, cx: float, cy: float, fallout: str, lock: bool) -> str:
-    """
-    Rotational swirl via geq. Maps each pixel to a rotated position based on
-    distance from center. fallout=linear or quad controls the falloff curve.
-    lock=true forces a square working area (scale=h:h) before mapping back.
-    """
-    _cx = f"W*{cx}"
-    _cy = f"H*{cy}"
-    _rad = f"min(W,H)*{radius}"
-    _strength = f"({strength})/180*PI"
-    dist = f"hypot(X-{_cx},Y-{_cy})+1e-6"
-    angle = f"atan2(Y-{_cy},X-{_cx})"
-    if fallout == "linear":
-        falloff = f"if(lt({dist},{_rad}),1-({dist})/({_rad}),0)"
-    else:
-        falloff = f"if(lt({dist},{_rad}),1-({dist})/({_rad}),0)^2"
-    nx = f"{_cx}+({dist})*cos(({angle})+({_strength})*({falloff}))"
-    ny = f"{_cy}+({dist})*sin(({angle})+({_strength})*({falloff}))"
-    if lock:
-        return (
-            f"format=yuv444p,scale=H:H,"
-            f"geq='p({nx},{ny})',"
-            f"scale=iw:ih,setsar=1:1,format=yuv420p"
-        )
-    return f"format=yuv444p,geq='p({nx},{ny})',scale=iw:ih,format=yuv420p"
-
-
-def _build_huehsv_clut(tmpdir: str, amount: float) -> str:
-    hue_val   = int(amount * 200 + 100)
-    clut_path = os.path.join(tmpdir, f"hald_clut_{int(amount*1000)}.png")
-    if not os.path.exists(clut_path):
-        r = subprocess.run(
-            ["magick", "hald:8", "-modulate", f"100,100,{hue_val}", clut_path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"ImageMagick: {r.stderr[:500]}")
-    return clut_path
-
-
-# ─── FFmpeg runners ───────────────────────────────────────────────────────────
-
-def _run(cmd: list[str], timeout: int = 180) -> tuple[bool, str]:
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return (True, "") if r.returncode == 0 else (False, r.stderr[-2000:])
-    except subprocess.TimeoutExpired:
-        return False, f"FFmpeg timed out (>{timeout}s)"
-    except Exception as e:
-        return False, str(e)
-
-
-def _apply_vf(src: str, dst: str, vf: str, is_video: bool, duration: int) -> tuple[bool, str]:
-    if is_video:
-        cmd = ["ffmpeg", "-y", "-i", src,
-               "-vf", vf,
-               "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", str(duration), dst]
-    else:
-        pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src,
-               "-vf", vf + pal, "-t", "3", dst]
-    return _run(cmd)
-
-
-def _apply_complex(src: str, dst: str, fc: str, is_video: bool, duration: int) -> tuple[bool, str]:
-    if is_video:
-        cmd = ["ffmpeg", "-y", "-i", src,
-               "-filter_complex", fc,
-               "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", str(duration), dst]
-    else:
-        pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src,
-               "-filter_complex", fc + pal, "-t", "3", dst]
-    return _run(cmd)
-
-
-def _apply_haldclut(src: str, clut: str, dst: str, is_video: bool, duration: int) -> tuple[bool, str]:
-    if is_video:
-        cmd = ["ffmpeg", "-y", "-i", src, "-i", clut,
-               "-filter_complex", "[0:v][1:v]haldclut",
-               "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", str(duration), dst]
-    else:
-        pal = ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src, "-i", clut,
-               "-filter_complex", f"[0:v][1:v]haldclut{pal}", "-t", "3", dst]
-    return _run(cmd)
-
-
-def _apply_pitch(src: str, dst: str, semitones: list[float]) -> tuple[bool, str]:
-    n  = len(semitones)
-    # 2.14748e+09 / 4.9 = 438261224.49 (rubberband detector freq)
-    _det = "2.14748e+09/4.9"
-    fc = f"[0:a]asplit={n}" + "".join(f"[a{i}]" for i in range(n)) + ";"
-    fc += ";".join(
-        f"[a{i}]rubberband=pitch={2 ** (st / 12):.6f}:window=short:transients=crisp:detector={_det}[p{i}]"
-        for i, st in enumerate(semitones)
-    ) + ";"
-    fc += "".join(f"[p{i}]" for i in range(n)) + f"amix=inputs={n}:normalize=0,highpass=5[aout]"
-    cmd = ["ffmpeg", "-y", "-i", src,
-           "-filter_complex", fc,
-           "-map", "0:v", "-map", "[aout]",
-           "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", "300", dst]
-    return _run(cmd, timeout=300)
-
-
-def _apply_reverse(src: str, dst: str, is_video: bool) -> tuple[bool, str]:
-    if is_video:
-        cmd = ["ffmpeg", "-y", "-i", src,
-               "-vf", "reverse", "-af", "areverse",
-               "-c:v", "ffv1", "-c:a", "pcm_s16le",
-               dst]
-    else:
-        cmd = ["ffmpeg", "-y", "-i", src,
-               "-vf", "reverse", dst]
-    return _run(cmd, timeout=300)
-
-
-def _apply_step(
-    step: dict, src: str, dst: str, tmpdir: str,
-    is_video: bool, duration: int,
-    step_idx: int,
-) -> tuple[bool, str]:
-    """Apply a single pipeline step: src → dst."""
-    t = step["type"]
-
-    if t == "preset":
-        cfg = PRESET_FILTERS[step["name"]]
-        if cfg["complex"]:
-            return _apply_complex(src, dst, cfg["complex"], is_video, duration)
-        return _apply_vf(src, dst, cfg["vf"], is_video, duration)
-
-    elif t == "huehsv":
-        try:
-            clut = _build_huehsv_clut(tmpdir, step["amount"])
-        except RuntimeError as e:
-            return False, str(e)
-        return _apply_haldclut(src, clut, dst, is_video, duration)
-
-    elif t == "pinch":
-        vf = _build_pinch_vf(step["strength"], step["radius"], step["cx"], step["cy"])
-        return _apply_vf(src, dst, vf, is_video, duration)
-
-    elif t == "pitch":
-        if not is_video:
-            # No audio in images — skip gracefully by copying
-            import shutil; shutil.copy2(src, dst)
-            return True, ""
-        return _apply_pitch(src, dst, step["semitones"])
-
-    elif t == "reverse":
-        return _apply_reverse(src, dst, is_video)
-
-    elif t == "wave":
-        vf = _build_wave_vf(
-            src,
-            step["hs"], step["hf"], step["ha"], step["hp"],
-            step["vs"], step["vf"], step["va"], step["vp"],
-            step["separate"], step["noclip"],
-        )
-        return _apply_vf(src, dst, vf, is_video, duration)
-
-    elif t == "speed":
-        return _apply_speed(src, dst, step["rate"], is_video, duration)
-
-    elif t == "hmirror":
-        vf = _build_mirror_vf("h", step["side"])
-        return _apply_vf(src, dst, vf, is_video, duration)
-
-    elif t == "vmirror":
-        vf = _build_mirror_vf("v", step["side"])
-        return _apply_vf(src, dst, vf, is_video, duration)
-
-    elif t == "hue2":
-        vf = f"hue=h={step['degrees']},frei0r=premultiply"
-        return _apply_vf(src, dst, vf, is_video, duration)
-
-    elif t == "hflip":
-        return _apply_vf(src, dst, "hflip", is_video, duration)
-
-    elif t == "vflip":
-        return _apply_vf(src, dst, "vflip", is_video, duration)
-
-    elif t == "swirl":
-        vf = _build_swirl_vf(step["strength"], step["radius"], step["cx"], step["cy"], step["fallout"], step["lock"])
-        return _apply_vf(src, dst, vf, is_video, duration)
-
-    return False, f"Unknown step type: {t}"
-
-
-def execute_pipeline(
-    input_path: str, output_path: str, tmpdir: str,
-    steps: list[dict], is_video: bool, rep: int, duration: float,
-) -> tuple[bool, str]:
-    """
-    Run the pipeline.
-    - Non-reverse steps run rep times.
-    - Reverse steps (if any) run once at the very end.
-    """
-    # Separate reverse from everything else
-    main_steps    = [s for s in steps if s["type"] != "reverse"]
-    has_reverse   = any(s["type"] == "reverse" for s in steps)
-
-    ext     = Path(input_path).suffix
-    cur     = input_path
-    counter = 0
-
-    all_main = main_steps * rep   # repeat pipeline N times
-
-    for i, step in enumerate(all_main):
-        is_last_main = (i == len(all_main) - 1) and not has_reverse
-        nxt = output_path if is_last_main else os.path.join(tmpdir, f"s{counter}{ext}")
-        counter += 1
-        ok, err = _apply_step(step, cur, nxt, tmpdir, is_video, duration, i)
-        if not ok:
-            name = step.get("name", step["type"])
-            return False, f"Step {i+1}/{len(all_main)} ({name}) failed:\n{err}"
-        cur = nxt
-
-    if has_reverse:
-        ok, err = _apply_reverse(cur, output_path, is_video)
-        if not ok:
-            return False, f"Reverse failed:\n{err}"
-
-    # Edge case: no steps at all, just copy input to output
-    if not all_main and not has_reverse:
-        import shutil; shutil.copy2(input_path, output_path)
-
-    return True, ""
-
-
-def _render_to_mkv(
-    src: str, dst: str, tmpdir: str,
-    steps: list[dict], is_source_video: bool,
-    duration: float, seg_idx: int,
-) -> tuple[bool, str]:
-    """
-    Render src through all steps → dst as MKV (FFV1 + PCM).
-    Images are first looped into a short video.
-    MKV correctly identifies FFV1 as video streams (unlike TS).
-    """
-    # Images → looping video with silent audio so segments have consistent streams
-    if not is_source_video:
-        loop_mkv = os.path.join(tmpdir, f"loop_{seg_idx}.mkv")
-        ok, err = _run([
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", src,
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-c:v", "ffv1",
-            "-c:a", "pcm_s16le",
-            "-t", str(duration), "-shortest",
-            loop_mkv,
-        ])
-        if not ok:
-            return False, f"Image→video failed: {err}"
-        src = loop_mkv
-        is_source_video = True
-
-    # Apply effect steps (visual + pitch, treat as video from here)
-    main_steps  = [s for s in steps if s["type"] != "reverse"]
-    has_reverse = any(s["type"] == "reverse" for s in steps)
-    intermediate = src
-
-    for i, step in enumerate(main_steps):
-        nxt = os.path.join(tmpdir, f"seg{seg_idx}_step{i}.mkv")
-        ok, err = _apply_step(step, intermediate, nxt, tmpdir, True, duration, i)
-        if not ok:
-            return False, f"Seg {seg_idx} step {i} ({step.get('name', step['type'])}) failed: {err}"
-        intermediate = nxt
-
-    if has_reverse:
-        rev_out = os.path.join(tmpdir, f"seg{seg_idx}_rev.mkv")
-        ok, err  = _apply_reverse(intermediate, rev_out, True)
-        if not ok:
-            return False, f"Seg {seg_idx} reverse failed: {err}"
-        intermediate = rev_out
-
-    # Final encode — ffv1 + PCM in MKV container
-    ok, err = _run([
-        "ffmpeg", "-y", "-i", intermediate,
-        "-c:v", "ffv1",
-        "-c:a", "pcm_s16le", "-ar", "44100",
-        "-t", str(duration),
-        dst,
-    ])
-    return ok, err
-
-
-def execute_ihtx_concat(
-    input_path: str, output_path: str, tmpdir: str,
-    steps: list[dict], is_video: bool, rep: int, duration: float,
-) -> tuple[bool, str]:
-    """
-    TRUE IHTX algorithm (render → render → concat):
-
-    segment_1 = render(original)          ← slightly degraded
-    segment_2 = render(segment_1)         ← more artifacts (re-encode loss)
-    ...
-    segment_N = render(segment_{N-1})     ← pure chaos
-
-    All segments are MKV (FFV1+PCM). Concat uses the concat demuxer with a file
-    list (no re-encode at join). Total length = rep × duration seconds.
-    """
-    seg_files = []
-    cur       = input_path
-
-    for i in range(rep):
-        seg_path = os.path.join(tmpdir, f"{i + 1}.mkv")
-        ok, err = _render_to_mkv(cur, seg_path, tmpdir, steps, is_video, duration, i + 1)
-        if not ok:
-            return False, f"Segment {i + 1}/{rep} failed:\n{err}"
-        seg_files.append(seg_path)
-        cur = seg_path   # ← each segment re-rendered from the previous one
-
-    # Concat demuxer with a file list (no re-encode at join)
-    list_path = os.path.join(tmpdir, "concat_list.txt")
-    with open(list_path, "w") as f:
-        for p in seg_files:
-            f.write(f"file '{p}'\n")
-
-    ok, err = _run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c", "copy", output_path,
-    ], timeout=600)
-    return ok, err
-
-
-# ─── Download helper ──────────────────────────────────────────────────────────
-
-async def download_attachment(attachment: discord.Attachment, dest: str):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(attachment.url) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            with open(dest, "wb") as f:
-                f.write(await resp.read())
-
-
-# ─── Commands ─────────────────────────────────────────────────────────────────
-
-@bot.event
-async def on_ready():
-    print(f"IHTX Bot online as {bot.user} (ID: {bot.user.id})")
-    print("------")
-    await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.watching,
-        name="logos get destroyed | !ihtx"
-    ))
-
-
-@bot.command(name="ihtx", aliases=["effect", "destroy"])
-async def ihtx_command(ctx: commands.Context, *, pipe_str: str = ""):
-    """
-    Apply IHTX effects via pipe syntax.
-    !ihtx effect=value,effect=value,...
-
-    Run !ihtxhelp for full documentation.
-    """
-    pipe_str = pipe_str.strip()
-
-    if not pipe_str:
-        await ctx.reply(HELP_TEXT)
-        return
-
-    # Parse early so we can show help if steps are empty
-    entries          = parse_pipe(pipe_str)
-    rep, dur, concat = extract_globals(entries)
-    steps            = build_steps(entries)
-
-    if not steps:
-        await ctx.reply("No valid effects found in pipe. " + HELP_TEXT)
-        return
-
-    # Resolve attachment: own message first, then the message being replied to
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref_msg = ctx.message.reference.resolved
-            if ref_msg is None:
-                ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref_msg and ref_msg.attachments:
-                attachment = ref_msg.attachments[0]
-        except (discord.NotFound, discord.HTTPException):
-            pass
-
-    if attachment is None:
-        await ctx.reply(
-            "No attachment found. Either attach a file to your `!ihtx` message, "
-            "or **reply to a message** that contains a video or image."
-        )
-        return
-    if attachment.size > MAX_FILE_SIZE:
-        await ctx.reply(f"File too large ({attachment.size / 1024 / 1024:.1f} MB, max 25 MB).")
-        return
-
-    suffix = Path(attachment.filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        await ctx.reply(f"Unsupported type `{suffix}`. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-        return
-
-    is_video = suffix in VIDEO_EXTENSIONS
-    # concat mode always produces .mkv (FFV1 only works in MKV/AVI, not MP4)
-    out_ext  = ".mkv" if (is_video or concat) else ".gif"
-
-    # Build human-readable label
-    effect_parts = []
-    for s in steps:
-        if s["type"] == "preset":
-            label = s["name"] if s["passes"] == 1 else f"{s['name']}×{s['passes']}"
-            effect_parts.append(label)
-        elif s["type"] == "huehsv":
-            effect_parts.append(f"huehsv({s['amount']:.2f})")
-        elif s["type"] == "pinch":
-            effect_parts.append(f"pinch({s['strength']})")
-        elif s["type"] == "pitch":
-            effect_parts.append("pitch(" + ";".join(f"{st:+.1f}" for st in s["semitones"]) + ")")
-        elif s["type"] == "reverse":
-            effect_parts.append("reverse")
-        elif s["type"] == "wave":
-            flags = []
-            if s["separate"]: flags.append("sep")
-            if s["noclip"]:   flags.append("noclip")
-            tag = f",{','.join(flags)}" if flags else ""
-            effect_parts.append(f"wave(h={s['hs']};{s['hf']};{s['ha']},v={s['vs']};{s['vf']};{s['va']}{tag})")
-        elif s["type"] == "speed":
-            effect_parts.append(f"speed×{s['rate']:.2f}")
-        elif s["type"] == "hmirror":
-            effect_parts.append("hmirror-left" if s["side"] == 1 else "hmirror-right")
-        elif s["type"] == "vmirror":
-            effect_parts.append("vmirror-top" if s["side"] == 1 else "vmirror-bottom")
-        elif s["type"] == "hue2":
-            effect_parts.append(f"hue2({s['degrees']:+.0f}°)")
-        elif s["type"] == "hflip":
-            effect_parts.append("hflip")
-        elif s["type"] == "vflip":
-            effect_parts.append("vflip")
-        elif s["type"] == "swirl":
-            lock = ",lock" if s["lock"] else ""
-            effect_parts.append(f"swirl({s['strength']:.0f}°;r={s['radius']:.1f};f={s['fallout']}{lock})")
-
-    pipeline_label = " → ".join(effect_parts)
-
-    if concat:
-        total_secs = rep * dur
-        rep_label  = f" ×{rep} concat"
-        full_label = f"✦ IHTX {pipeline_label} — {rep} segments × {dur}s = {total_secs:.1f}s"
-        warn       = f" ⚠️ {rep} render passes + concat — may take a while" if rep > 10 else ""
-    else:
-        rep_label  = f" ×{rep}" if rep > 1 else ""
-        full_label = f"{pipeline_label}{rep_label}, {dur}s"
-        total_visual_passes = sum(
-            s.get("passes", 1) for s in steps if s["type"] in ("preset", "pinch", "huehsv")
-        ) * rep
-        warn = f" ⚠️ {total_visual_passes} visual passes — may take a while" if total_visual_passes > 15 else ""
-
-    status_msg = await ctx.reply(f"⚙️ Pipeline: **{full_label}**{warn}")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path  = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, f"output{out_ext}")
-
-        try:
-            await download_attachment(attachment, input_path)
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Download failed: {e}")
-            return
-
-        loop = asyncio.get_event_loop()
-        try:
-            if concat:
-                ok, err = await loop.run_in_executor(
-                    None,
-                    lambda: execute_ihtx_concat(input_path, output_path, tmpdir, steps, is_video, rep, dur),
-                )
-            else:
-                ok, err = await loop.run_in_executor(
-                    None,
-                    lambda: execute_pipeline(input_path, output_path, tmpdir, steps, is_video, rep, dur),
-                )
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Processing error: {e}")
-            return
-
-        if not ok:
-            await status_msg.edit(content=f"❌ Failed:\n```\n{err[-1500:]}\n```")
-            return
-
-        if os.path.getsize(output_path) > MAX_FILE_SIZE:
-            await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Reduce `rep` or `duration`.")
-            return
-
-        stem   = Path(attachment.filename).stem
-        tag    = re.sub(r"[^\w]", "_", pipeline_label)[:40]
-        out_fn = f"ihtx_{tag}_{stem}{out_ext}"
-
-        done_label = f"✦ IHTX {pipeline_label}{rep_label}" if concat else f"**{pipeline_label}**{rep_label}"
-        try:
-            await ctx.reply(
-                content=f"✅ {done_label} — done!",
-                file=discord.File(output_path, filename=out_fn),
-            )
-            await status_msg.delete()
-        except discord.HTTPException as e:
-            await status_msg.edit(content=f"❌ Upload failed: {e}")
-
-
-@bot.command(name="ihtxhelp", aliases=["bothelp"])
-async def help_command(ctx: commands.Context):
-    await ctx.reply(HELP_TEXT)
-
-
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.CommandNotFound):
-        return
-    if isinstance(error, commands.BadArgument):
-        await ctx.reply(f"Bad argument: {error}. Use `!ihtxhelp`.")
-        return
-    raise error
-
-
-if __name__ == "__main__":
-    bot.run(TOKEN)
+    Video: setpt
