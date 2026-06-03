@@ -594,4 +594,554 @@ def _apply_speed(src: str, dst: str, rate: float, is_video: bool, duration: int)
     """
     Change playback rate.
     rate > 1 = fast forward, rate < 1 = slow motion.
-    Video: setpt
+    Video: setpts=PTS/rate, audio: atempo (chained if rate outside 0.5-2.0).
+    Returns (success, error_message).
+    """
+    try:
+        cmd = ["ffmpeg", "-y", "-i", src]
+        if is_video:
+            vf = f"setpts={1.0/rate}*PTS"
+            # Build atempo chain (each filter limited to 0.5–2.0 range)
+            af_filters = []
+            r = rate
+            while r > 2.0:
+                af_filters.append("atempo=2.0")
+                r /= 2.0
+            while r < 0.5:
+                af_filters.append("atempo=0.5")
+                r /= 0.5
+            af_filters.append(f"atempo={r:.6f}")
+            af = ",".join(af_filters)
+            cmd += ["-vf", vf, "-af", af]
+        else:
+            # Audio only
+            af_filters = []
+            r = rate
+            while r > 2.0:
+                af_filters.append("atempo=2.0")
+                r /= 2.0
+            while r < 0.5:
+                af_filters.append("atempo=0.5")
+                r /= 0.5
+            af_filters.append(f"atempo={r:.6f}")
+            af = ",".join(af_filters)
+            cmd += ["-af", af]
+        cmd += ["-t", str(duration), dst]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return False, result.stderr[-300:] if result.stderr else "ffmpeg error"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+# ─── Core render engine ───────────────────────────────────────────────────────
+
+async def _run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
+    """Run an ffmpeg command asynchronously."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return False, stderr.decode(errors="replace")[-400:]
+    return True, ""
+
+
+async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: float, tmp_dir: str) -> tuple[bool, str]:
+    """Apply a single step to src -> dst. Returns (ok, err)."""
+    t = step["type"]
+
+    if t == "preset":
+        filt = PRESET_FILTERS[step["name"]]
+        for _ in range(step["passes"]):
+            tmp = dst + ".pass.mp4"
+            if filt["complex"]:
+                cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", f"[0:v]{filt['complex']}[outv]",
+                       "-map", "[outv]", "-map", "0:a?", "-c:a", "copy", "-t", str(duration), tmp]
+            else:
+                cmd = ["ffmpeg", "-y", "-i", src, "-vf", filt["vf"],
+                       "-map", "0:v", "-map", "0:a?", "-c:a", "copy", "-t", str(duration), tmp]
+            ok, err = await _run_ffmpeg(cmd)
+            if not ok:
+                return False, err
+            os.replace(tmp, dst)
+            src = dst
+        if src != dst:
+            import shutil; shutil.copy2(src, dst)
+        return True, ""
+
+    elif t == "huehsv":
+        amount = step["amount"]
+        vf = f"hue=h={amount * 180}:s={1 + amount}"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "pinch":
+        vf = _build_pinch_vf(step["strength"], step["radius"], step["cx"], step["cy"])
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "multipitch":
+        semitones = step["semitones"]
+        # Extract audio, pitch-shift each, amix
+        base_wav = os.path.join(tmp_dir, "mp_base.wav")
+        cmd_ex = ["ffmpeg", "-y", "-i", src, "-vn", "-ar", "44100", base_wav]
+        ok, err = await _run_ffmpeg(cmd_ex)
+        if not ok:
+            return False, err
+        shifted_wavs = []
+        for i, semi in enumerate(semitones):
+            cents = int(semi * 100)
+            out_wav = os.path.join(tmp_dir, f"mp_shift_{i}.wav")
+            proc = await asyncio.create_subprocess_exec(
+                "sox", base_wav, out_wav, "pitch", str(cents), "25", "5", "8.5",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode == 0:
+                shifted_wavs.append(out_wav)
+        if not shifted_wavs:
+            import shutil; shutil.copy2(src, dst)
+            return True, ""
+        # amix shifted wavs
+        mixed_wav = os.path.join(tmp_dir, "mp_mixed.wav")
+        fc_inputs = "".join(f"[{i}:a]" for i in range(len(shifted_wavs)))
+        amix_cmd = ["ffmpeg", "-y"] + sum([["-i", w] for w in shifted_wavs], []) + [
+            "-filter_complex", f"{fc_inputs}amix=inputs={len(shifted_wavs)}:normalize=0,highpass=f=5[out]",
+            "-map", "[out]", mixed_wav,
+        ]
+        ok, err = await _run_ffmpeg(amix_cmd)
+        if not ok:
+            return False, err
+        # Merge back with video
+        if is_video:
+            cmd_merge = ["ffmpeg", "-y", "-i", src, "-i", mixed_wav,
+                         "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-t", str(duration), dst]
+        else:
+            import shutil; shutil.copy2(mixed_wav, dst)
+            return True, ""
+        return await _run_ffmpeg(cmd_merge)
+
+    elif t == "reverse":
+        if is_video:
+            cmd = ["ffmpeg", "-y", "-i", src, "-vf", "reverse", "-af", "areverse",
+                   "-t", str(duration), dst]
+        else:
+            cmd = ["ffmpeg", "-y", "-i", src, "-af", "areverse", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "wave":
+        vf = _build_wave_vf(
+            src, step["hs"], step["hf"], step["ha"], step["hp"],
+            step["vs"], step["vf"], step["va"], step["vp"],
+            step["separate"], step["noclip"],
+        )
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "speed":
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _apply_speed, src, dst, step["rate"], is_video, int(duration)
+        )
+        return ok, err
+
+    elif t == "hmirror":
+        side = step["side"]
+        if side == 1:
+            vf = "crop=iw/2:ih:0:0,scale=iw*2:ih"
+        else:
+            vf = "crop=iw/2:ih:iw/2:0,scale=iw*2:ih,hflip"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "vmirror":
+        side = step["side"]
+        if side == 1:
+            vf = "crop=iw:ih/2:0:0,scale=iw:ih*2"
+        else:
+            vf = "crop=iw:ih/2:0:ih/2,scale=iw:ih*2,vflip"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "hue2":
+        degrees = step["degrees"]
+        vf = f"hue=h={degrees},premultiply"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "hflip":
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", "hflip", "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "vflip":
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", "vflip", "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "split":
+        side = step["side"]
+        if side == "left":
+            vf = "crop=iw/2:ih:0:0,scale=iw*2:ih"
+        else:
+            vf = "crop=iw/2:ih:iw/2:0,scale=iw*2:ih"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "vsplit":
+        side = step["side"]
+        if side == "top":
+            vf = "crop=iw:ih/2:0:0,scale=iw:ih*2"
+        else:
+            vf = "crop=iw:ih/2:0:ih/2,scale=iw:ih*2"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "lut":
+        url = step["url"]
+        lut_path = os.path.join(tmp_dir, "custom.cube")
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        return False, f"LUT download failed: HTTP {r.status}"
+                    with open(lut_path, "wb") as f:
+                        f.write(await r.read())
+        except Exception as e:
+            return False, f"LUT download error: {e}"
+        vf = f"lut3d=file='{lut_path}'"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    elif t == "swirl":
+        strength = step["strength"]
+        radius   = step["radius"]
+        cx       = step["cx"]
+        cy       = step["cy"]
+        fallout  = step["fallout"]
+        lock     = step["lock"]
+        w, h = _get_video_dims(src)
+        size = min(w, h) if lock else max(w, h)
+        r_px = radius * size
+        # Build swirl geq expression
+        if fallout == "linear":
+            weight = f"clip(1-hypot((X-W*{cx})/({r_px}),(Y-H*{cy})/({r_px})),0,1)"
+        else:
+            weight = f"clip(1-pow(hypot((X-W*{cx})/({r_px}),(Y-H*{cy})/({r_px})),2),0,1)"
+        angle_expr = f"{strength}*PI/180*{weight}"
+        px = f"W*{cx}+cos({angle_expr})*(X-W*{cx})-sin({angle_expr})*(Y-H*{cy})"
+        py = f"H*{cy}+sin({angle_expr})*(X-W*{cx})+cos({angle_expr})*(Y-H*{cy})"
+        vf = f"format=yuv444p,geq='p({px},{py})',scale=iw:ih,format=yuv420p"
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
+               "-c:a", "copy", "-t", str(duration), dst]
+        return await _run_ffmpeg(cmd)
+
+    # Unknown step — pass through
+    import shutil
+    shutil.copy2(src, dst)
+    return True, ""
+
+
+async def _render(src: str, steps: list[dict], duration: float, is_video: bool, concat: bool, rep: int, tmp_dir: str) -> tuple[bool, str, str]:
+    """
+    Run all steps over rep repetitions.
+    concat=True: each rep re-encodes from previous output, then segments are concatenated.
+    concat=False: steps applied sequentially, repeated rep times, only final result returned.
+    Returns (ok, output_path, error).
+    """
+    segments = []
+    current = src
+
+    for rep_i in range(rep):
+        step_src = current
+        for si, step in enumerate(steps):
+            step_dst = os.path.join(tmp_dir, f"rep{rep_i}_step{si}.mp4")
+            ok, err = await _apply_step(step, step_src, step_dst, is_video, duration, tmp_dir)
+            if not ok:
+                return False, "", err
+            step_src = step_dst
+        seg_path = os.path.join(tmp_dir, f"seg_{rep_i}.mp4")
+        os.replace(step_src, seg_path)
+        segments.append(seg_path)
+        if concat:
+            current = seg_path  # next rep starts from this degraded output
+        else:
+            current = src  # repeat from original
+
+    if concat and len(segments) > 1:
+        # Concatenate all segments
+        list_file = os.path.join(tmp_dir, "concat_list.txt")
+        with open(list_file, "w") as f:
+            for seg in segments:
+                f.write(f"file '{seg}'\n")
+        final = os.path.join(tmp_dir, "final.mp4")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+               "-c", "copy", final]
+        ok, err = await _run_ffmpeg(cmd)
+        if not ok:
+            return False, "", err
+        return True, final, ""
+    else:
+        return True, segments[-1], ""
+
+
+# ─── Attachment helpers ────────────────────────────────────────────────────────
+
+async def _download_attachment(attachment: discord.Attachment, tmp_dir: str) -> tuple[bool, str, str]:
+    """Download attachment to tmp_dir. Returns (ok, path, err)."""
+    ext = Path(attachment.filename).suffix.lower()
+    dst = os.path.join(tmp_dir, f"input{ext}")
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(attachment.url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                if r.status != 200:
+                    return False, "", f"Download failed: HTTP {r.status}"
+                with open(dst, "wb") as f:
+                    f.write(await r.read())
+        return True, dst, ""
+    except Exception as e:
+        return False, "", str(e)
+
+
+def _get_attachment(ctx: commands.Context) -> discord.Attachment | None:
+    """Get the first supported attachment from the message or its reference."""
+    for att in ctx.message.attachments:
+        if Path(att.filename).suffix.lower() in SUPPORTED_EXTENSIONS:
+            return att
+    if ctx.message.reference and ctx.message.reference.resolved:
+        ref = ctx.message.reference.resolved
+        if isinstance(ref, discord.Message):
+            for att in ref.attachments:
+                if Path(att.filename).suffix.lower() in SUPPORTED_EXTENSIONS:
+                    return att
+    return None
+
+
+# ─── Discord commands ──────────────────────────────────────────────────────────
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} ({bot.user.id})", flush=True)
+
+
+@bot.command(name="ihtx", aliases=["effect", "destroy"])
+async def cmd_ihtx(ctx: commands.Context, *, pipe_str: str = ""):
+    global _renders_completed, _renders_in_progress
+    att = _get_attachment(ctx)
+    if not att:
+        await ctx.reply("❌ Attach or reply to a supported media file.\nSupported: " + ", ".join(sorted(SUPPORTED_EXTENSIONS)))
+        return
+    if att.size > MAX_FILE_SIZE:
+        await ctx.reply(f"❌ File too large (max {MAX_FILE_SIZE // 1024 // 1024} MB).")
+        return
+    if not pipe_str.strip():
+        await ctx.reply(f"❌ No effects specified.\n{HELP_TEXT[:1800]}")
+        return
+
+    entries = parse_pipe(pipe_str)
+    rep, duration, concat = extract_globals(entries)
+    steps = build_steps(entries)
+    if not steps:
+        await ctx.reply("❌ No valid effects found. Use `g!help_ihtx` for options.")
+        return
+
+    ext = Path(att.filename).suffix.lower()
+    is_video = ext in VIDEO_EXTENSIONS
+
+    status_msg = await ctx.reply("⚙️ Processing…")
+    _renders_in_progress += 1
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ok, src, err = await _download_attachment(att, tmp_dir)
+            if not ok:
+                await status_msg.edit(content=f"❌ Download failed: {err}")
+                return
+            ok, out_path, err = await _render(src, steps, duration, is_video, concat, rep, tmp_dir)
+            if not ok:
+                await status_msg.edit(content=f"❌ Render failed: {err[:300]}")
+                return
+            out_size = os.path.getsize(out_path)
+            if out_size > MAX_FILE_SIZE:
+                await status_msg.edit(content=f"❌ Output too large ({out_size // 1024 // 1024} MB > 25 MB). Try fewer reps or shorter duration.")
+                return
+            out_name = f"ihtx_{Path(att.filename).stem}.mp4"
+            await status_msg.delete()
+            await ctx.reply(file=discord.File(out_path, filename=out_name))
+            _renders_completed += 1
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Unexpected error: {e}")
+    finally:
+        _renders_in_progress -= 1
+
+
+@bot.command(name="help_ihtx", aliases=["ihtxhelp", "ihelp"])
+async def cmd_help_ihtx(ctx: commands.Context):
+    # Split help text to stay within Discord's 2000-char limit
+    chunks = []
+    current = ""
+    for line in HELP_TEXT.splitlines(keepends=True):
+        if len(current) + len(line) > 1900:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await ctx.send(chunk)
+
+
+@bot.command(name="stats")
+async def cmd_stats(ctx: commands.Context):
+    uptime = datetime.timedelta(seconds=int(time.time() - _bot_start_time))
+    await ctx.reply(
+        f"📊 **IHTX Bot Stats**\n"
+        f"Uptime: {uptime}\n"
+        f"Renders completed: {_renders_completed}\n"
+        f"Renders in progress: {_renders_in_progress}"
+    )
+
+
+@bot.command(name="ping")
+async def cmd_ping(ctx: commands.Context):
+    latency_ms = round(bot.latency * 1000)
+    await ctx.reply(f"🏓 Pong! `{latency_ms}ms`")
+
+
+# ─── Owner-only commands ───────────────────────────────────────────────────────
+
+@bot.command(name="owner")
+async def cmd_owner(ctx: commands.Context, action: str = "", user: discord.User | None = None):
+    if not _is_owner(ctx):
+        return
+    if action == "add" and user:
+        owner_ids.add(user.id)
+        _save_owner_ids()
+        await ctx.reply(f"✅ Added {user} as owner.")
+    elif action == "remove" and user:
+        owner_ids.discard(user.id)
+        _save_owner_ids()
+        await ctx.reply(f"✅ Removed {user} from owners.")
+    elif action == "list":
+        await ctx.reply(f"Owners: {', '.join(str(i) for i in owner_ids)}")
+    else:
+        await ctx.reply("Usage: `g!owner add/remove/list @user`")
+
+
+@bot.command(name="block")
+async def cmd_block(ctx: commands.Context, user: discord.User | None = None):
+    if not _is_owner(ctx):
+        return
+    if not user:
+        await ctx.reply("Usage: `g!block @user`")
+        return
+    blocklist.add(user.id)
+    _save_blocklist()
+    await ctx.reply(f"✅ Blocked {user}.")
+
+
+@bot.command(name="unblock")
+async def cmd_unblock(ctx: commands.Context, user: discord.User | None = None):
+    if not _is_owner(ctx):
+        return
+    if not user:
+        await ctx.reply("Usage: `g!unblock @user`")
+        return
+    blocklist.discard(user.id)
+    _save_blocklist()
+    await ctx.reply(f"✅ Unblocked {user}.")
+
+
+@bot.command(name="blockchannel")
+async def cmd_blockchannel(ctx: commands.Context):
+    if not _is_owner(ctx):
+        return
+    channel_blocks.add(ctx.channel.id)
+    _save_channel_blocks()
+    await ctx.reply("✅ This channel is now blocked.")
+
+
+@bot.command(name="unblockchannel")
+async def cmd_unblockchannel(ctx: commands.Context):
+    if not _is_owner(ctx):
+        return
+    channel_blocks.discard(ctx.channel.id)
+    _save_channel_blocks()
+    await ctx.reply("✅ This channel is now unblocked.")
+
+
+@bot.command(name="setlimit")
+async def cmd_setlimit(ctx: commands.Context, user: discord.User | None = None, limit: int = HEAVY_LIMIT_DEFAULT):
+    if not _is_owner(ctx):
+        return
+    if not user:
+        await ctx.reply("Usage: `g!setlimit @user N`")
+        return
+    heavy_limits[user.id] = max(0, limit)
+    _save_limits()
+    await ctx.reply(f"✅ Set daily limit for {user} to {limit}.")
+
+
+@bot.command(name="tag")
+async def cmd_tag(ctx: commands.Context, action: str = "", name: str = "", *, pipe_str: str = ""):
+    if action == "save":
+        if not name or not pipe_str:
+            await ctx.reply("Usage: `g!tag save <name> <effect pipe>`")
+            return
+        tags[name] = {"pipe": pipe_str, "author": ctx.author.id}
+        _save_tags()
+        await ctx.reply(f"✅ Tag `{name}` saved.")
+    elif action == "use":
+        if name not in tags:
+            await ctx.reply(f"❌ Tag `{name}` not found.")
+            return
+        att = _get_attachment(ctx)
+        if not att:
+            await ctx.reply("❌ Attach or reply to a supported media file.")
+            return
+        # Delegate to ihtx with the tag's pipe
+        fake_ctx = ctx
+        await cmd_ihtx(fake_ctx, pipe_str=tags[name]["pipe"])
+    elif action == "list":
+        if not tags:
+            await ctx.reply("No tags saved yet.")
+        else:
+            lines = [f"`{n}`: {v['pipe']}" for n, v in list(tags.items())[:20]]
+            await ctx.reply("\n".join(lines))
+    elif action == "delete":
+        if not _is_owner(ctx) and tags.get(name, {}).get("author") != ctx.author.id:
+            await ctx.reply("❌ You can only delete your own tags.")
+            return
+        tags.pop(name, None)
+        _save_tags()
+        await ctx.reply(f"✅ Tag `{name}` deleted.")
+    else:
+        await ctx.reply("Usage: `g!tag save/use/list/delete <name> [pipe]`")
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"❌ Missing argument: `{error.param.name}`")
+        return
+    print(f"Command error in {ctx.command}: {error}", flush=True)
+
+
+# ─── Entry point ───────────────────────────────────────────────────────────────
+
+bot.run(TOKEN)
