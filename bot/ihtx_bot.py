@@ -380,10 +380,11 @@ def is_true(val: str) -> bool:
     return val.strip().lower() in ("true", "1", "yes", "on")
 
 
-def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float, bool]:
-    """Extract rep, duration, and concat from entries."""
+def extract_globals(entries: list[tuple[str, str]]) -> tuple[int, float | None, bool]:
+    """Extract rep, duration, and concat from entries.
+    duration=None means 'use the full video' (no -t truncation)."""
     rep      = 1
-    duration = 0.5
+    duration = None
     concat   = False
     for k, v in entries:
         if k in ("rep", "repetitions"):
@@ -508,6 +509,29 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
             url = val.strip()
             if url:
                 steps.append({"type": "lut", "url": url})
+
+        elif key == "gradient":
+            val = val.strip()
+            mode = "new"
+            args_str = ""
+            if val == "older":
+                mode = "older"
+            elif val == "old":
+                mode = "old"
+            elif val.startswith("older,"):
+                mode = "older"
+                args_str = val[6:].strip()
+            elif val.startswith("old,"):
+                mode = "old"
+                args_str = val[4:].strip()
+            elif val.startswith("new,"):
+                mode = "new"
+                args_str = val[4:].strip()
+            else:
+                # default: treat as color args for new mode
+                mode = "new"
+                args_str = val
+            steps.append({"type": "gradient", "mode": mode, "args": args_str})
 
         elif key == "swirl":
             p = [x.strip() for x in val.split(";")]
@@ -635,6 +659,50 @@ def _apply_speed(src: str, dst: str, rate: float, is_video: bool, duration: int)
         return False, str(e)
 
 
+# ─── Gradient builder ───────────────────────────────────────────────────────
+
+def _build_gradient_vf(mode: str, raw: str) -> str:
+    """Build a ffmpeg -vf string from gradient color arguments.
+    mode: 'older' = simple RGB curves, 'old' = RGBA with alphamerge,
+          'new'  = RGBA with per-color control points."""
+    raw = raw.strip()
+    if not raw:
+        # Default demo colours
+        colors = [[255, 0, 0], [255, 255, 0], [0, 255, 0], [0, 255, 255], [0, 0, 255], [255, 0, 255], [255, 0, 0]]
+    else:
+        colors = []
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            vals = [max(0, min(255, int(x.strip()))) for x in part.split(",") if x.strip()]
+            if len(vals) >= 3:
+                colors.append(vals)
+        if not colors:
+            colors = [[255, 0, 0], [255, 255, 0], [0, 255, 0]]
+
+    # Pad alpha to 255 if missing
+    for c in colors:
+        if len(c) < 4:
+            c.append(255)
+
+    def _curve(ch_values):
+        return " ".join(f"{i}/{v/255:.6f}" for i, v in enumerate(ch_values))
+
+    r = _curve([c[0] for c in colors])
+    g = _curve([c[1] for c in colors])
+    b = _curve([c[2] for c in colors])
+
+    if mode == "older":
+        return f"format=gray,curves=r='{r}':g='{g}':b='{b}'"
+
+    a = _curve([c[3] for c in colors])
+    return (
+        f'"split=3[a][b][t];[a]format=gray,curves=r={r}:g={g}:b={b}[aa];'
+        f'[b]format=gray,curves=all={a}[bb];[aa][bb]alphamerge[c];[t][c]overlay"'
+    )
+
+
 # ─── Core render engine ───────────────────────────────────────────────────────
 
 async def _run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
@@ -650,7 +718,25 @@ async def _run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
-async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: float, tmp_dir: str) -> tuple[bool, str]:
+def _ffmpeg_cmd(src: str, dst: str, duration: float | None, vf: str | None = None, fc: str | None = None, audio_copy: bool = True, pix_fmt: bool = False) -> list[str]:
+    """Build an ffmpeg command with optional duration, vf, and filter_complex."""
+    cmd = ["ffmpeg", "-y", "-i", src]
+    if fc:
+        cmd += ["-filter_complex", f"[0:v]{fc}[outv]", "-map", "[outv]"]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["-map", "0:v", "-map", "0:a?"]
+    if audio_copy:
+        cmd += ["-c:a", "copy"]
+    if duration is not None:
+        cmd += ["-t", str(duration)]
+    if pix_fmt:
+        cmd += ["-pix_fmt", "yuv420p"]
+    cmd += [dst]
+    return cmd
+
+
+async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: float | None, tmp_dir: str) -> tuple[bool, str]:
     """Apply a single step to src -> dst. Returns (ok, err)."""
     t = step["type"]
 
@@ -660,10 +746,16 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             tmp = dst + ".pass.mp4"
             if filt["complex"]:
                 cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", f"[0:v]{filt['complex']}[outv]",
-                       "-map", "[outv]", "-map", "0:a?", "-c:a", "copy", "-t", str(duration), tmp]
+                       "-map", "[outv]", "-map", "0:a?", "-c:a", "copy"]
+                if duration is not None:
+                    cmd += ["-t", str(duration)]
+                cmd += [tmp]
             else:
                 cmd = ["ffmpeg", "-y", "-i", src, "-vf", filt["vf"],
-                       "-map", "0:v", "-map", "0:a?", "-c:a", "copy", "-t", str(duration), tmp]
+                       "-map", "0:v", "-map", "0:a?", "-c:a", "copy"]
+                if duration is not None:
+                    cmd += ["-t", str(duration)]
+                cmd += [tmp]
             ok, err = await _run_ffmpeg(cmd)
             if not ok:
                 return False, err
@@ -676,19 +768,26 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
     elif t == "huehsv":
         amount = step["amount"]
         vf = f"hue=h={amount * 180}:s={1 + amount}"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "pinch":
         vf = _build_pinch_vf(step["strength"], step["radius"], step["cx"], step["cy"])
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
+
+    elif t == "gradient":
+        if step["mode"] == "older":
+            vf = _build_gradient_vf("older", step["args"])
+            return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf, pix_fmt=True))
+        else:
+            fc = _build_gradient_vf(step["mode"], step["args"])
+            cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", f"[0:v]{fc}[outv]", "-map", "[outv]", "-map", "0:a?", "-c:a", "copy"]
+            if duration is not None:
+                cmd += ["-t", str(duration)]
+            cmd += ["-pix_fmt", "yuv420p", dst]
+            return await _run_ffmpeg(cmd)
 
     elif t == "multipitch":
         semitones = step["semitones"]
-        # Extract audio, pitch-shift each, amix
         base_wav = os.path.join(tmp_dir, "mp_base.wav")
         cmd_ex = ["ffmpeg", "-y", "-i", src, "-vn", "-ar", "44100", base_wav]
         ok, err = await _run_ffmpeg(cmd_ex)
@@ -708,7 +807,6 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         if not shifted_wavs:
             import shutil; shutil.copy2(src, dst)
             return True, ""
-        # amix shifted wavs
         mixed_wav = os.path.join(tmp_dir, "mp_mixed.wav")
         fc_inputs = "".join(f"[{i}:a]" for i in range(len(shifted_wavs)))
         amix_cmd = ["ffmpeg", "-y"] + sum([["-i", w] for w in shifted_wavs], []) + [
@@ -718,21 +816,26 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         ok, err = await _run_ffmpeg(amix_cmd)
         if not ok:
             return False, err
-        # Merge back with video
         if is_video:
             cmd_merge = ["ffmpeg", "-y", "-i", src, "-i", mixed_wav,
-                         "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-t", str(duration), dst]
+                         "-map", "0:v", "-map", "1:a", "-c:v", "copy"]
+            if duration is not None:
+                cmd_merge += ["-t", str(duration)]
+            cmd_merge += [dst]
         else:
             import shutil; shutil.copy2(mixed_wav, dst)
             return True, ""
         return await _run_ffmpeg(cmd_merge)
 
     elif t == "reverse":
+        cmd = ["ffmpeg", "-y", "-i", src]
         if is_video:
-            cmd = ["ffmpeg", "-y", "-i", src, "-vf", "reverse", "-af", "areverse",
-                   "-t", str(duration), dst]
+            cmd += ["-vf", "reverse", "-af", "areverse"]
         else:
-            cmd = ["ffmpeg", "-y", "-i", src, "-af", "areverse", "-t", str(duration), dst]
+            cmd += ["-af", "areverse"]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += [dst]
         return await _run_ffmpeg(cmd)
 
     elif t == "wave":
@@ -741,14 +844,12 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             step["vs"], step["vf"], step["va"], step["vp"],
             step["separate"], step["noclip"],
         )
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "speed":
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
-            None, _apply_speed, src, dst, step["rate"], is_video, int(duration)
+            None, _apply_speed, src, dst, step["rate"], is_video, int(duration) if duration is not None else 0
         )
         return ok, err
 
@@ -758,9 +859,7 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             vf = "crop=iw/2:ih:0:0,scale=iw*2:ih"
         else:
             vf = "crop=iw/2:ih:iw/2:0,scale=iw*2:ih,hflip"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "vmirror":
         side = step["side"]
@@ -768,26 +867,18 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             vf = "crop=iw:ih/2:0:0,scale=iw:ih*2"
         else:
             vf = "crop=iw:ih/2:0:ih/2,scale=iw:ih*2,vflip"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "hue2":
         degrees = step["degrees"]
         vf = f"hue=h={degrees},premultiply"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "hflip":
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", "hflip", "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf="hflip"))
 
     elif t == "vflip":
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", "vflip", "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf="vflip"))
 
     elif t == "split":
         side = step["side"]
@@ -795,9 +886,7 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             vf = "crop=iw/2:ih:0:0,scale=iw*2:ih"
         else:
             vf = "crop=iw/2:ih:iw/2:0,scale=iw*2:ih"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "vsplit":
         side = step["side"]
@@ -805,9 +894,7 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             vf = "crop=iw:ih/2:0:0,scale=iw:ih*2"
         else:
             vf = "crop=iw:ih/2:0:ih/2,scale=iw:ih*2"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "lut":
         url = step["url"]
@@ -822,9 +909,7 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         except Exception as e:
             return False, f"LUT download error: {e}"
         vf = f"lut3d=file='{lut_path}'"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     elif t == "swirl":
         strength = step["strength"]
@@ -836,7 +921,6 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         w, h = _get_video_dims(src)
         size = min(w, h) if lock else max(w, h)
         r_px = radius * size
-        # Build swirl geq expression
         if fallout == "linear":
             weight = f"clip(1-hypot((X-W*{cx})/({r_px}),(Y-H*{cy})/({r_px})),0,1)"
         else:
@@ -845,9 +929,7 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         px = f"W*{cx}+cos({angle_expr})*(X-W*{cx})-sin({angle_expr})*(Y-H*{cy})"
         py = f"H*{cy}+sin({angle_expr})*(X-W*{cx})+cos({angle_expr})*(Y-H*{cy})"
         vf = f"format=yuv444p,geq='p({px},{py})',scale=iw:ih,format=yuv420p"
-        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v", "-map", "0:a?",
-               "-c:a", "copy", "-t", str(duration), dst]
-        return await _run_ffmpeg(cmd)
+        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
 
     # Unknown step — pass through
     import shutil
@@ -855,7 +937,7 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
     return True, ""
 
 
-async def _render(src: str, steps: list[dict], duration: float, is_video: bool, concat: bool, rep: int, tmp_dir: str) -> tuple[bool, str, str]:
+async def _render(src: str, steps: list[dict], duration: float | None, is_video: bool, concat: bool, rep: int, tmp_dir: str) -> tuple[bool, str, str]:
     """
     Run all steps over rep repetitions.
     concat=True: each rep re-encodes from previous output, then segments are concatenated.
