@@ -350,6 +350,10 @@ def _ffmpeg_has_filter(name: str) -> bool:
 def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -> tuple[bool, str]:
     """Run ffmpeg using PRESET_FILTERS. Returns (ok, stderr-or-empty)."""
 
+    # allow tags to contain iscript entries: if preset matches a tag with iscript, treat as iscript
+    if preset in tags and isinstance(tags[preset], dict) and "iscript" in tags[preset]:
+        preset = f"iscript={tags[preset]['iscript']}"
+
     # Multipitch special handling (already implemented previously)
     if preset.startswith("multipitch"):
         parts = preset.split("=", 1)
@@ -400,7 +404,50 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
         except Exception as e:
             return False, str(e)
 
-    # hue2 experimental: try frei0r first, fallback to hue filter
+    # iscript / huehsv handling: support inline iscript or named tags
+    if preset.startswith("iscript=") or preset.startswith("huehsv=") or preset.startswith("huehsv"):
+        # normalize to script content
+        parts = preset.split("=", 1)
+        script_val = parts[1] if len(parts) > 1 else ""
+        # If script_val refers to a tag name with an iscript, expand
+        if script_val in tags and isinstance(tags[script_val], dict) and "iscript" in tags[script_val]:
+            script_content = tags[script_val]["iscript"]
+        else:
+            script_content = script_val
+        # handle legacy huehsv syntax; expect a number 0-2
+        if script_content.startswith("huehsv"):
+            # huehsv=0.5 or just a numeric value
+            if "=" in script_content:
+                val = script_content.split("=",1)[1]
+            elif parts[0] == "huehsv" and script_val:
+                val = script_val
+            else:
+                val = script_content.replace("huehsv", "")
+            try:
+                fval = float(val)
+            except Exception:
+                fval = 0.0
+            # map 0-2 -> degrees 0-360 by multiplying by 180
+            deg = fval * 180.0
+            vf = f"hue=h={deg}:s=1"
+        else:
+            # Simple handling: if the script contains the token 'bgr' we'll force a format conversion
+            vf = script_content
+            if "bgr" in script_content.lower():
+                vf = "format=bgr24," + vf
+        # run ffmpeg with constructed vf
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", output_path]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                return False, res.stderr[-2000:]
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "FFmpeg timed out (>120s)"
+        except Exception as e:
+            return False, str(e)
+
+    # hue2 experimental: try frei0r first, fallback to ffmpeg hue filter
     if preset == "hue2":
         # If frei0r is available, use a premultiplied frei0r hue (plugin name varies),
         # otherwise fall back to ffmpeg's hue filter.
@@ -499,7 +546,7 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
       g!ihtx [preset]  — attach a file. Presets: chaos, glitch, shake, rainbow, static, melt, corrupt
     """
     preset = preset.lower()
-    if preset not in VISUAL_PRESETS and not preset.startswith("multipitch") and preset != "hue2":
+    if preset not in VISUAL_PRESETS and not preset.startswith("multipitch") and preset != "hue2" and not preset.startswith("iscript=") and not preset.startswith("huehsv"):
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset. Available presets: {preset_list}\n"
