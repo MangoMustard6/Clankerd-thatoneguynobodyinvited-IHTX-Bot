@@ -569,6 +569,24 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
             displace_url = p[1] if len(p) > 1 else "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
             steps.append({"type": "tvsim", "hue_deg": hue_deg, "displace_url": displace_url})
 
+        elif key == "icfplus":
+            p = [x.strip() for x in val.split(";")]
+            exports = p[0] if len(p) > 0 else "1"
+            dur = p[1] if len(p) > 1 else "0.483"
+            no_trim = p[2] if len(p) > 2 else "-"
+            ext_fmt = p[3] if len(p) > 3 else "mp4"
+            out_fmt = p[4] if len(p) > 4 else "default"
+            ffmpeg_code = ";".join(p[5:]) if len(p) > 5 else ""
+            steps.append({
+                "type": "icfplus",
+                "exports": exports,
+                "dur": dur,
+                "no_trim": no_trim,
+                "ext_fmt": ext_fmt,
+                "out_fmt": out_fmt,
+                "ffmpeg_code": ffmpeg_code,
+            })
+
     return steps
 
 
@@ -1024,6 +1042,93 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
             cmd += ["-t", str(duration)]
         cmd += [dst]
         return await _run_ffmpeg(cmd)
+
+    elif t == "icfplus":
+        exports = step["exports"]
+        dur = step["dur"]
+        no_trim = step["no_trim"]
+        ext_fmt = step["ext_fmt"]
+        out_fmt = step["out_fmt"]
+        ffmpeg_code = step["ffmpeg_code"]
+
+        # Parse numeric args
+        try:
+            n_exports = int(exports)
+        except ValueError:
+            n_exports = 1
+        try:
+            dur_f = float(dur)
+        except ValueError:
+            dur_f = 0.483
+        trim = not (no_trim.lower() in ("true", "yes", "t", "y", "1", "on"))
+        if ext_fmt == "default":
+            ext_fmt = os.path.splitext(src)[1].lstrip(".") or "mp4"
+        if out_fmt == "default":
+            out_fmt = ext_fmt
+
+        # Build base trimmed video
+        base_mp4 = os.path.join(tmp_dir, "icf_base.mp4")
+        cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-preset", "ultrafast",
+               "-b:v", "16M", "-c:a", "flac", "-t", str(dur_f), "-movflags", "+faststart", base_mp4]
+        ok, err = await _run_ffmpeg(cmd)
+        if not ok:
+            return False, f"icfplus base failed: {err}"
+
+        # Render each export
+        abs_n = abs(n_exports)
+        export_files = []
+        for i in range(1, abs_n + 1):
+            out = os.path.join(tmp_dir, f"icf_{i}.{ext_fmt}")
+            if trim:
+                cmd = ["ffmpeg", "-y", "-stream_loop", "1", "-i", base_mp4,
+                       "-t", str(dur_f), "-movflags", "+faststart"]
+            else:
+                cmd = ["ffmpeg", "-y", "-i", base_mp4, "-movflags", "+faststart"]
+            if ffmpeg_code:
+                # Apply user's ffmpeg code as filter string
+                cmd += ["-vf", ffmpeg_code]
+            cmd += [out]
+            ok, err = await _run_ffmpeg(cmd)
+            if not ok:
+                return False, f"icfplus export {i} failed: {err}"
+            export_files.append(out)
+
+        # Build concat list (reverse if negative exports)
+        concat_file = os.path.join(tmp_dir, "icf_concat.txt")
+        with open(concat_file, "w") as f:
+            if n_exports < 0:
+                for ef in reversed(export_files):
+                    f.write(f"file '{ef}'\n")
+            else:
+                for ef in export_files:
+                    f.write(f"file '{ef}'\n")
+
+        # Concat with output format codec
+        output_path = os.path.join(tmp_dir, f"icf_output.{out_fmt}")
+        concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file]
+        if out_fmt == "mkv":
+            concat_cmd += ["-c:v", "mpeg2video", "-q:v", "1", "-c:a", "flac", "-pix_fmt", "yuv420p", "-bufsize", "64M", "-movflags", "+faststart"]
+        elif out_fmt == "mxf":
+            concat_cmd += ["-c:v", "mpeg2video", "-qscale", "1", "-qmin", "1", "-c:a", "pcm_s16le", "-ar", "48000", "-pix_fmt", "yuv420p", "-bufsize", "64M", "-movflags", "+faststart"]
+        elif out_fmt == "mov":
+            concat_cmd += ["-c:v", "libx264", "-profile:v", "high422", "-level:v", "5", "-tune", "zerolatency",
+                           "-q:v", "1", "-crf", "30", "-preset", "superfast", "-c:a", "aac", "-q:a", "10",
+                           "-b:a", "192K", "-aac_coder", "fast", "-pix_fmt", "yuv420p", "-bufsize", "64M", "-movflags", "+faststart"]
+        elif out_fmt == "mp4":
+            concat_cmd += ["-c:v", "libx264", "-profile:v", "high422", "-level:v", "5", "-tune", "zerolatency",
+                           "-q:v", "1", "-crf", "30", "-preset", "superfast", "-c:a", "flac", "-pix_fmt", "yuv420p",
+                           "-bufsize", "64M", "-movflags", "+faststart"]
+        elif out_fmt == "avi":
+            concat_cmd += ["-c:v", "mpeg2video", "-c:a", "flac", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        else:
+            concat_cmd += ["-pix_fmt", "yuv420p", "-bufsize", "64M", "-movflags", "+faststart"]
+        concat_cmd += [output_path]
+        ok, err = await _run_ffmpeg(concat_cmd)
+        if not ok:
+            return False, f"icfplus concat failed: {err}"
+        import shutil
+        shutil.copy2(output_path, dst)
+        return True, ""
 
     # Unknown step — pass through
     import shutil
