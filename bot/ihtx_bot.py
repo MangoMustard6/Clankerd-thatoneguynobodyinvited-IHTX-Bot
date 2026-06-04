@@ -1,19 +1,16 @@
 """
-IHTX Bot   I Hate The X FFmpeg Discord Bot
+IHTX Bot  I Hate The X FFmpeg Discord Bot
 
 This file restores the full implementation by merging the last working version
 with the newer top-level configuration (owners, limits, tags, presets).
 
 It keeps the 'g!' prefix and the newer PRESET_FILTERS/HELP_TEXT while restoring
-command handlers, ffmpeg integration, and helpers. Additional owner commands
-and more parameter parsing for g!ihtx have been added (split, lut, multipitch,
-flips, speed, etc.).
+the command handlers, ffmpeg integration, and helpers.
 
 Notes:
-- Some advanced audio operations (rubberband multipitch) require ffmpeg
-  compiled with the rubberband filter or the rubberband library available.
-- This implementation attempts to use ffmpeg audio filters where possible and
-  will return an FFmpeg error if the filter is not available.
+- Advanced experimental changes (multipitch external pipeline, iscript rewrites,
+  frei0r hue2, ICFPlus, preview1280 montage) are intentionally left for a follow-up
+  PR because they require additional scripts/dependencies and testing.
 
 Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp,
 ImageMagick/sox/etc. depending on advanced effects.
@@ -34,7 +31,6 @@ import urllib.parse
 import hashlib
 import datetime
 from pathlib import Path
-import math
 
 try:
     import yt_dlp
@@ -312,266 +308,65 @@ async def download_attachment(attachment: discord.Attachment, dest: str):
     os.replace(tmp, dest)
 
 
-async def download_url_to_path(url: str, dest: str):
-    """Download a URL to dest (used for LUT files)."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise ValueError(f"Failed to download {url} (HTTP {resp.status})")
-            data = await resp.read()
-    with open(dest + ".part", "wb") as f:
-        f.write(data)
-    os.replace(dest + ".part", dest)
-
-
-def run_ffmpeg(input_path: str, output_path: str, preset_key: str, is_video: bool) -> tuple[bool, str]:
+def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -> tuple[bool, str]:
     """Run ffmpeg using PRESET_FILTERS. Returns (ok, stderr-or-empty)."""
-    cfg = PRESET_FILTERS.get(preset_key)
+    cfg = PRESET_FILTERS.get(preset)
     if cfg is None:
         cfg = PRESET_FILTERS["chaos"]
 
-    # Build cmd
     if is_video:
-        if cfg.get("complex"):
+        if cfg["complex"]:
             cmd = [
                 "ffmpeg", "-y", "-i", input_path,
                 "-filter_complex", cfg["complex"],
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy",
+                "-t", "30",
+                output_path
             ]
         else:
             cmd = [
                 "ffmpeg", "-y", "-i", input_path,
-                "-vf", cfg.get("vf", ""),
+                "-vf", cfg["vf"],
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy",
+                "-t", "30",
+                output_path
             ]
-        # audio filters
-        if cfg.get("af"):
-            cmd += ["-af", cfg["af"]]
-        # encoding
-        cmd += [
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac",
-            "-t", str(cfg.get("t", 30)),
-            output_path
-        ]
     else:
-        # Images / animated GIF generation
-        if cfg.get("complex"):
+        # Image  animated GIF
+        if cfg["complex"]:
             fc = cfg["complex"] + ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
             cmd = [
                 "ffmpeg", "-y",
                 "-loop", "1", "-i", input_path,
                 "-filter_complex", fc,
-                "-t", str(cfg.get("t", 3)),
+                "-t", "3",
                 output_path
             ]
         else:
-            vf = (cfg.get("vf") or "") + ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+            vf = cfg["vf"] + ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
             cmd = [
                 "ffmpeg", "-y",
                 "-loop", "1", "-i", input_path,
                 "-vf", vf,
-                "-t", str(cfg.get("t", 3)),
+                "-t", "3",
                 output_path
             ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             return False, result.stderr[-2000:]
         return True, ""
     except subprocess.TimeoutExpired:
-        return False, "FFmpeg timed out (>180s)"
+        return False, "FFmpeg timed out (>120s)"
     except Exception as e:
         return False, str(e)
 
 
 def get_output_ext(input_ext: str, is_video: bool) -> str:
     return ".mp4" if is_video else ".gif"
-
-
-# ---------- Parameter parsing & filter building helpers ----------
-
-
-def parse_param_string(s: str) -> dict:
-    """Parse a pipe-style parameter string into a dict.
-    Example: "glitch=true,speed=2,split=left,lut=https://.../film.cube"
-    Returns: {"glitch":"true", "speed":"2", ...}
-    """
-    params = {}
-    # Accept both comma-separated and space-separated
-    parts = re.split(r"[,\n]+", s)
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        if "=" in p:
-            k, v = p.split("=", 1)
-            params[k.strip().lower()] = v.strip()
-        else:
-            # flags like "chaos" or "glitch"
-            params[p.strip().lower()] = "true"
-    return params
-
-
-def build_filters_for_params(base_preset: str, params: dict, is_video: bool, tmpdir: str) -> str:
-    """Build a video vf (or complex) and audio af (if needed) from params.
-    This function modifies PRESET_FILTERS["__tmp__"] and returns the key to use.
-    It may download LUT files into tmpdir (caller must cleanup tmpdir).
-    """
-    vf_parts = []
-    af_part = None
-    complex_part = None
-    tval = None
-
-    # Start from base preset VF/complex if any
-    base = PRESET_FILTERS.get(base_preset, {})
-    if base.get("complex"):
-        complex_part = base["complex"]
-    elif base.get("vf"):
-        vf_parts.append(base["vf"])
-
-    # Handle split/crop
-    split = params.get("split") or params.get("vsplit")
-    if split:
-        s = split.lower()
-        if s in ("left", "right"):
-            # crop half horizontally then scale back to original size
-            if s == "left":
-                vf_parts.insert(0, "crop=iw/2:ih:0:0,scale=iw:ih")
-            else:
-                vf_parts.insert(0, "crop=iw/2:ih:iw/2:0,scale=iw:ih")
-        elif s in ("top", "bottom"):
-            if s == "top":
-                vf_parts.insert(0, "crop=iw:ih/2:0:0,scale=iw:ih")
-            else:
-                vf_parts.insert(0, "crop=iw:ih/2:0:ih/2,scale=iw:ih")
-
-    # LUT
-    lut = params.get("lut")
-    if lut:
-        # download LUT to tmpdir
-        try:
-            parsed = urllib.parse.urlparse(lut)
-            if parsed.scheme.startswith("http"):
-                fname = hashlib.sha1(lut.encode()).hexdigest() + ".cube"
-                dest = os.path.join(tmpdir, fname)
-                # synchronous run of aio download in event loop not possible here; caller downloads before
-                # so we expect params to contain key "_lut_path" if downloaded. We'll check for that.
-                lut_path = params.get("_lut_path")
-                if lut_path:
-                    vf_parts.append(f"lut3d=file='{lut_path}'")
-                else:
-                    # fallback: try to use URL directly (ffmpeg supports lut3d=file=filename only)
-                    pass
-            else:
-                # local path
-                vf_parts.append(f"lut3d=file='{lut}'")
-        except Exception:
-            pass
-
-    # flips
-    if params.get("hflip") in ("1", "true", "True") or params.get("hflip") == "true":
-        vf_parts.append("hflip")
-    if params.get("vflip") in ("1", "true", "True") or params.get("vflip") == "true":
-        vf_parts.append("vflip")
-
-    # mirror (simple implementation: use crop+hflip overlay)
-    hmirror = params.get("hmirror")
-    if hmirror in ("1", "2", "'1'", "'2'"):
-        # 1 = left mirrored to right (keep left area), 2 = right mirrored to left
-        if hmirror.startswith("1"):
-            vf_parts.append("crop=iw/2:ih:0:0,scale=iw:ih")
-        else:
-            vf_parts.append("crop=iw/2:ih:iw/2:0,scale=iw:ih")
-    vmirror = params.get("vmirror")
-    if vmirror in ("1", "2"):
-        if vmirror.startswith("1"):
-            vf_parts.append("crop=iw:ih/2:0:0,scale=iw:ih")
-        else:
-            vf_parts.append("crop=iw:ih/2:0:ih/2,scale=iw:ih")
-
-    # hue2 (secondary hue rotation)
-    hue2 = params.get("hue2")
-    if hue2:
-        try:
-            v = float(hue2)
-            vf_parts.append(f"hue=h={v}")
-        except Exception:
-            pass
-
-    # speed (video tempo)
-    speed = params.get("speed")
-    if speed:
-        try:
-            s = float(speed)
-            # set both setpts for video and atempo for audio (if audio present). atempo supports up to 2.0 repeatedly.
-            vf_parts.append(f"setpts=PTS/{s}")
-            if s != 1.0:
-                # audio scaling handled via af below if multipitch not used
-                af_part = af_part or ""
-                # Use a simple atempo chain for speeds outside 0.5..2.0
-                if s <= 0:
-                    pass
-                else:
-                    # decompose speed into factors between 0.5 and 2 for atempo
-                    factors = []
-                    remaining = s
-                    # if speeding up (>1), we need atempo=remaining, else atempo=1/remaining? atempo changes tempo (time)
-                    # ffmpeg atempo modifies tempo (1.0 = original). setpts already adjusts video.
-                    # For simplicity: apply atempo if within 0.5..2
-                    if 0.5 <= s <= 2.0:
-                        af_part = (af_part + "," if af_part else "") + f"atempo={s}"
-                    else:
-                        # chain multiple atempo filters (approx)
-                        val = s
-                        chain = []
-                        while val > 2.0:
-                            chain.append("2.0")
-                            val /= 2.0
-                        while val < 0.5:
-                            chain.append("0.5")
-                            val /= 0.5
-                        if val != 1.0:
-                            chain.append(str(val))
-                        af_part = (af_part + "," if af_part else "") + ",".join(f"atempo={c}" for c in chain)
-        except Exception:
-            pass
-
-    # multipitch audio
-    multipitch = params.get("multipitch")
-    if multipitch:
-        try:
-            semis = [int(x) for x in re.split(r"[;,:]+", multipitch) if x.strip()]
-            # Build audio complex using rubberband filter for each semitone, then amix
-            # e.g. [0:a]rubberband=pitch=2^{s/12}[a0];[0:a]rubberband=pitch=2^{s2/12}[a1];[a0][a1]amix=inputs=2:normalize=0, bass=g=2.5,highpass=f=10
-            parts = []
-            labels = []
-            for i, s in enumerate(semis):
-                ratio = math.pow(2.0, s / 12.0)
-                lbl = f"ap{i}"
-                labels.append(lbl)
-                parts.append(f"[0:a]rubberband=pitch={ratio:.6f}[{lbl}]")
-            amix_inputs = ";".join([f"[{l}]" for l in labels])
-            # build amix filter; ffmpeg expects [a0][a1]amix=inputs=2
-            amix = "".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:normalize=0,bass=g=2.5,highpass=f=10"
-            af_full = ";".join(parts) + ";" + amix
-            af_part = af_full
-        except Exception:
-            pass
-
-    # wave, swirl, pinch, reverse, etc. — skipped for brevity but could be added similarly
-
-    # assemble into a temporary preset
-    tmp_key = "__tmp__"
-    PRESET_FILTERS[tmp_key] = {
-        "vf": ",".join([p for p in vf_parts if p]),
-        "complex": complex_part,
-    }
-    if af_part:
-        PRESET_FILTERS[tmp_key]["af"] = af_part
-    if tval:
-        PRESET_FILTERS[tmp_key]["t"] = tval
-
-    return tmp_key
 
 # ---------- Bot events & commands (restored functionality) ----------
 
@@ -586,44 +381,20 @@ async def on_ready():
 
 
 @bot.command(name="ihtx", aliases=["effect", "destroy"])
-async def ihtx_command(ctx: commands.Context, *preset_args: str):
+async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
     """Apply an IHTX FFmpeg effect to an attached video or image.
 
     Usage:
-      g!ihtx [preset-or-params]   attach a file.
-    Examples:
-      g!ihtx glitch
-      g!ihtx glitch=true,speed=2,split=left
-      g!ihtx multipitch=12
+      g!ihtx [preset]   attach a file. Presets: chaos, glitch, shake, rainbow, static, melt, corrupt
     """
-    # Combine args into one string
-    preset_raw = " ".join(preset_args).strip() if preset_args else ""
-    if not preset_raw:
-        preset_raw = "chaos"
-
-    # detect param-style usage: presence of = or ,
-    if "=" in preset_raw or "," in preset_raw:
-        params = parse_param_string(preset_raw)
-        # If a named visual preset is present, pick it, else default to chaos
-        chosen_visual = None
-        for v in VISUAL_PRESETS:
-            if params.get(v) in ("1", "true", "True", "yes"):
-                chosen_visual = v
-                break
-        if not chosen_visual:
-            # if first token matches a preset name, use it
-            first = preset_raw.split(",")[0].split("=", 1)[0].strip().lower()
-            if first in VISUAL_PRESETS:
-                chosen_visual = first
-        if not chosen_visual:
-            chosen_visual = "chaos"
-    else:
-        # simple preset name
-        chosen_visual = preset_raw.lower()
-        params = {chosen_visual: "true"}
-        if chosen_visual not in VISUAL_PRESETS:
-            await ctx.reply(f"Unknown preset `{chosen_visual}`. Use `g!presets` to list available presets.")
-            return
+    preset = preset.lower()
+    if preset not in VISUAL_PRESETS:
+        preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
+        await ctx.reply(
+            f"Unknown preset. Available presets: {preset_list}\n"
+            f"Example: `g!ihtx glitch` (attach a video or image)"
+        )
+        return
 
     # Look for attachments (or referenced message attachments)
     attachment = None
@@ -640,7 +411,7 @@ async def ihtx_command(ctx: commands.Context, *preset_args: str):
     if not attachment:
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
-            f"**I HATE THE X   IHTX Bot**\n"
+            f"**I HATE THE X  IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]`.\n\n"
             f"**Presets:** {preset_list}\n\n"
             f"Examples:\n"
@@ -662,7 +433,7 @@ async def ihtx_command(ctx: commands.Context, *preset_args: str):
     out_ext = get_output_ext(suffix, is_video)
 
     status_msg = await ctx.reply(
-        f"⚙️ Applying **{chosen_visual}** effect... this may take a moment."
+        f"⚙️ Applying **{preset}** effect... this may take a moment."
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -675,29 +446,8 @@ async def ihtx_command(ctx: commands.Context, *preset_args: str):
             await status_msg.edit(content=f"❌ Failed to download your file: {e}")
             return
 
-        # If LUT provided as URL, download it now and place path into params
-        lut_url = params.get("lut")
-        if lut_url and urllib.parse.urlparse(lut_url).scheme.startswith("http"):
-            try:
-                lut_fname = hashlib.sha1(lut_url.encode()).hexdigest() + ".cube"
-                lut_path = os.path.join(tmpdir, lut_fname)
-                await download_url_to_path(lut_url, lut_path)
-                params["_lut_path"] = lut_path
-            except Exception as e:
-                await status_msg.edit(content=f"❌ Failed to download LUT: {e}")
-                return
-
-        # Build temporary preset based on chosen_visual + params
-        tmp_key = build_filters_for_params(chosen_visual, params, is_video, tmpdir)
-
         loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(None, run_ffmpeg, input_path, output_path, tmp_key, is_video)
-
-        # cleanup temporary preset
-        try:
-            del PRESET_FILTERS[tmp_key]
-        except Exception:
-            pass
+        ok, err = await loop.run_in_executor(None, run_ffmpeg, input_path, output_path, preset, is_video)
 
         if not ok:
             await status_msg.edit(content=f"❌ FFmpeg failed:\n```\n{err[-1500:]}\n```")
@@ -708,10 +458,10 @@ async def ihtx_command(ctx: commands.Context, *preset_args: str):
             await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
             return
 
-        out_filename = f"ihtx_{chosen_visual}_{Path(attachment.filename).stem}{out_ext}"
+        out_filename = f"ihtx_{preset}_{Path(attachment.filename).stem}{out_ext}"
         try:
             await ctx.reply(
-                content=f"✅ **IHTX `{chosen_visual}`** applied!",
+                content=f"✅ **IHTX `{preset}`** applied!",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -722,9 +472,9 @@ async def ihtx_command(ctx: commands.Context, *preset_args: str):
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
-    lines = [f"`{name}`  ȵ {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS) if not name.startswith("__tmp__")]
+    lines = [f"`{name}`  {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS)]
     embed = discord.Embed(
-        title="IHTX Bot  ȵ Available Presets",
+        title="IHTX Bot  Available Presets",
         description="\n".join(lines),
         color=discord.Color.red(),
     )
@@ -733,14 +483,14 @@ async def presets_command(ctx: commands.Context):
         value="Attach a video or image and run:\n`g!ihtx [preset]`\n\nDefault preset: `chaos`",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X  ȵ FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X  FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
 @bot.command(name="ihtxhelp", aliases=["bothelp"])
 async def help_command(ctx: commands.Context):
     embed = discord.Embed(
-        title="IHTX Bot  ȵ Help",
+        title="IHTX Bot  Help",
         color=discord.Color.dark_red(),
     )
     embed.add_field(
@@ -763,70 +513,133 @@ async def help_command(ctx: commands.Context):
         value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X  ȵ FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X  FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
-# ---------- Owner-only admin commands (block/unblock/say) ----------
+# ---------- Owner-only moderation / utility commands ----------
+
+def _parse_digits(s: str) -> int:
+    """Extract numeric ID from mention or plain id string."""
+    if not s:
+        raise ValueError("No id provided")
+    m = re.search(r"(\d{6,20})", s)
+    if m:
+        return int(m.group(1))
+    try:
+        return int(s)
+    except Exception:
+        raise ValueError("Could not parse id")
+
 
 @bot.command(name="blockuser")
 @commands.check(_is_owner)
-async def block_user(ctx: commands.Context, user: discord.User):
-    """Owner-only: add a user ID to the blocklist."""
-    blocklist.add(user.id)
+async def blockuser(ctx: commands.Context, user: str):
+    """Owner-only: add a user ID or mention to the user blocklist."""
+    try:
+        user_id = _parse_digits(user)
+    except ValueError:
+        await ctx.reply("❌ Invalid user. Provide a mention or numeric ID.")
+        return
+    if user_id in blocklist:
+        await ctx.reply(f"User `{user_id}` is already blocked.")
+        return
+    blocklist.add(user_id)
     _save_blocklist()
-    await ctx.reply(f"✅ Blocked user {user} ({user.id}).")
+    await ctx.reply(f"✅ Blocked user `{user_id}`.")
 
 
 @bot.command(name="unblockuser")
 @commands.check(_is_owner)
-async def unblock_user(ctx: commands.Context, user: discord.User):
-    """Owner-only: remove a user ID from the blocklist."""
-    if user.id in blocklist:
-        blocklist.remove(user.id)
-        _save_blocklist()
-        await ctx.reply(f"✅ Unblocked user {user} ({user.id}).")
-    else:
-        await ctx.reply(f"User {user} was not blocked.")
+async def unblockuser(ctx: commands.Context, user: str):
+    """Owner-only: remove a user ID or mention from the user blocklist."""
+    try:
+        user_id = _parse_digits(user)
+    except ValueError:
+        await ctx.reply("❌ Invalid user. Provide a mention or numeric ID.")
+        return
+    if user_id not in blocklist:
+        await ctx.reply(f"User `{user_id}` is not blocked.")
+        return
+    blocklist.discard(user_id)
+    _save_blocklist()
+    await ctx.reply(f"✅ Unblocked user `{user_id}`.")
 
 
 @bot.command(name="blockchannel")
 @commands.check(_is_owner)
-async def block_channel(ctx: commands.Context, channel: discord.TextChannel):
-    """Owner-only: block a channel from using commands."""
-    channel_blocks.add(channel.id)
+async def blockchannel(ctx: commands.Context, channel: str = None):
+    """Owner-only: add a channel to the channel blocklist. If omitted, blocks current channel."""
+    if channel is None:
+        channel_id = ctx.channel.id
+    else:
+        try:
+            channel_id = _parse_digits(channel)
+        except ValueError:
+            await ctx.reply("❌ Invalid channel. Provide a channel mention or numeric ID.")
+            return
+    if channel_id in channel_blocks:
+        await ctx.reply(f"Channel `{channel_id}` is already blocked.")
+        return
+    channel_blocks.add(channel_id)
     _save_channel_blocks()
-    await ctx.reply(f"✅ Blocked channel {channel.mention} ({channel.id}).")
+    await ctx.reply(f"✅ Blocked channel `{channel_id}`.")
 
 
 @bot.command(name="unblockchannel")
 @commands.check(_is_owner)
-async def unblock_channel(ctx: commands.Context, channel: discord.TextChannel):
-    """Owner-only: unblock a previously blocked channel."""
-    if channel.id in channel_blocks:
-        channel_blocks.remove(channel.id)
-        _save_channel_blocks()
-        await ctx.reply(f"✅ Unblocked channel {channel.mention} ({channel.id}).")
+async def unblockchannel(ctx: commands.Context, channel: str = None):
+    """Owner-only: remove a channel from the channel blocklist. If omitted, unblocks current channel."""
+    if channel is None:
+        channel_id = ctx.channel.id
     else:
-        await ctx.reply("That channel was not blocked.")
+        try:
+            channel_id = _parse_digits(channel)
+        except ValueError:
+            await ctx.reply("❌ Invalid channel. Provide a channel mention or numeric ID.")
+            return
+    if channel_id not in channel_blocks:
+        await ctx.reply(f"Channel `{channel_id}` is not blocked.")
+        return
+    channel_blocks.discard(channel_id)
+    _save_channel_blocks()
+    await ctx.reply(f"✅ Unblocked channel `{channel_id}`.")
 
 
 @bot.command(name="say")
 @commands.check(_is_owner)
-async def say(ctx: commands.Context, *, content: str):
-    """Owner-only: make the bot say a message."""
-    await ctx.message.delete()
-    await ctx.send(content)
+async def say(ctx: commands.Context, *, message: str):
+    """Owner-only: make the bot send a plain message in the current channel."""
+    try:
+        await ctx.send(message)
+        await ctx.message.add_reaction("✅")
+    except Exception as e:
+        await ctx.reply(f"❌ Failed to send message: {e}")
 
 
 @bot.command(name="sayembed")
 @commands.check(_is_owner)
-async def say_embed(ctx: commands.Context, title: str, *, description: str):
-    """Owner-only: send an embed. Usage: g!sayembed "Title" description text..."""
-    await ctx.message.delete()
-    emb = discord.Embed(title=title, description=description, color=discord.Color.red())
-    await ctx.send(embed=emb)
+async def sayembed(ctx: commands.Context, *, content: str):
+    """
+    Owner-only: send an embed.
+    If `content` contains a '|' it will split into title|description, otherwise content is used as description.
+    Example:
+      g!sayembed Title | This is the embed body
+    """
+    try:
+        if "|" in content:
+            title, desc = [p.strip() for p in content.split("|", 1)]
+        else:
+            title = ""
+            desc = content
+        emb = discord.Embed(title=title or None, description=desc or None, color=discord.Color.dark_red())
+        await ctx.send(embed=emb)
+        await ctx.message.add_reaction("✅")
+    except Exception as e:
+        await ctx.reply(f"❌ Failed to send embed: {e}")
 
+
+# ---------- Error handling & run ----------
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
@@ -835,8 +648,9 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.reply(f"Missing argument: `{error.param.name}`. Use `g!ihtxhelp` for usage.")
         return
+    # Permission errors from owner-only commands
     if isinstance(error, commands.CheckFailure):
-        await ctx.reply("❌ You do not have permission to run this command.")
+        # If check failed for owner-only commands, be quiet (or you could notify)
         return
     raise error
 
