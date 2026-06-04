@@ -542,7 +542,7 @@ def build_filters_for_params(base_preset: str, params: dict, is_video: bool, tmp
         try:
             semis = [int(x) for x in re.split(r"[;,:]+", multipitch) if x.strip()]
             # Build audio complex using rubberband filter for each semitone, then amix
-            # e.g. [0:a]rubberband=pitch=2^{s/12}[a0];[0:a]rubberband=pitch=2^{s2/12}[a1];[a0][a1]amix=inputs=2:normalize=0, bass=g=2.5, highpass=f=10
+            # e.g. [0:a]rubberband=pitch=2^{s/12}[a0];[0:a]rubberband=pitch=2^{s2/12}[a1];[a0][a1]amix=inputs=2:normalize=0, bass=g=2.5,highpass=f=10
             parts = []
             labels = []
             for i, s in enumerate(semis):
@@ -722,9 +722,9 @@ async def ihtx_command(ctx: commands.Context, *preset_args: str):
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
-    lines = [f"`{name}`   {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS) if not name.startswith("__tmp__")]
+    lines = [f"`{name}`  ȵ {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS) if not name.startswith("__tmp__")]
     embed = discord.Embed(
-        title="IHTX Bot   Available Presets",
+        title="IHTX Bot  ȵ Available Presets",
         description="\n".join(lines),
         color=discord.Color.red(),
     )
@@ -733,14 +733,14 @@ async def presets_command(ctx: commands.Context):
         value="Attach a video or image and run:\n`g!ihtx [preset]`\n\nDefault preset: `chaos`",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X   FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X  ȵ FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
 @bot.command(name="ihtxhelp", aliases=["bothelp"])
 async def help_command(ctx: commands.Context):
     embed = discord.Embed(
-        title="IHTX Bot   Help",
+        title="IHTX Bot  ȵ Help",
         color=discord.Color.dark_red(),
     )
     embed.add_field(
@@ -763,7 +763,7 @@ async def help_command(ctx: commands.Context):
         value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X   FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X  ȵ FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
