@@ -1454,74 +1454,71 @@ async def _preview1280_render(src: str, s: float, e: float, tmp_dir: str) -> tup
         pass
 
     # 7. Build the 12 segment clips
-    # Helper to build a single segment
-    async def build_seg(idx: int, hald_key: str | None, hflip: bool, audio_pitch: str, dur: float, extra_vf: str = "") -> tuple[bool, str, str]:
+    async def build_seg(idx: int, hald_key: str | None, hflip: bool, audio_pitch: str, dur: float) -> tuple[bool, str, str]:
         out = os.path.join(work_dir, f"{idx}.avi")
-        vf_parts = []
-        if hald_key:
-            hald = hald_files[hald_key]
-            vf_parts.append(f"movie={hald},[in]haldclut")
-        if hflip:
-            vf_parts.append("hflip")
-        vf_parts.append("format=yuv420p")
-        if extra_vf:
-            vf_parts.append(extra_vf)
-        vf = ",".join(vf_parts) if vf_parts else "copy"
-        cmd = ["ffmpeg", "-y", "-i", base_avi]
-        if vf != "copy":
-            cmd += ["-vf", vf]
-        # Audio pitch with sox (rubberband not available in this ffmpeg)
-        # Use atempo chain for simple pitch approximation
         af = ""
         if audio_pitch:
-            # Map pitch ratios to atempo
             ratio = float(audio_pitch)
             af = f"atempo={ratio:.4f}"
+        if hald_key:
+            hald = hald_files[hald_key]
+            hflip_str = ",hflip" if hflip else ""
+            fc = f"[0:v][1:v]haldclut{hflip_str},format=yuv420p[v]"
+            cmd = ["ffmpeg", "-y", "-i", base_avi, "-i", hald,
+                   "-filter_complex", fc, "-map", "[v]", "-map", "0:a?", "-c:a", "copy"]
+            if dur:
+                cmd += ["-t", str(dur)]
+            cmd += ["-c:v", "ffv1", out]
+        else:
+            cmd = ["ffmpeg", "-y", "-i", base_avi]
+            vf = "hflip,format=yuv420p" if hflip else "format=yuv420p"
+            cmd += ["-vf", vf]
+            if dur:
+                cmd += ["-t", str(dur)]
+            cmd += ["-c:v", "ffv1", "-c:a", "copy", out]
         if af:
             cmd += ["-af", af]
-        cmd += ["-t", str(dur), "-c:v", "ffv1", "-c:a", "pcm_s16le", out]
         ok, err = await _run_ffmpeg(cmd)
         return ok, out, err
 
     # Build 12 segments
     segs = []
     seg_defs = [
-        (1,  None,    False, "1.0",     t),   # normal
-        (2,  "54",    False, "1.0595",  t),   # +1 semitone
-        (3,  "180",   False, "0.8909",  t),   # -2 semitones  (displace version)
-        (4,  "54",    False, "1.0595",  t),   # +1 semitone
-        (5,  None,    False, "1.0",     t2),  # normal half
-        (6,  "22",    True,  "1.1225",  t2),  # +2 semitones, hflip
-        (7,  "54",    False, "1.0595",  t2),  # +1 semitone
-        (8,  "108_25", True, "1.1892",  t2),  # +3 semitones, hflip
-        (9,  "180",   False, "0.8909",  t2),  # -2 semitones
-        (10, None,    True,  "1.0",     t2),  # hflip only
-        (11, "54",    False, "1.0595",  t2),  # +1 semitone
-        (12, "108_25", True,  "1.1892",  t2),  # +3 semitones, hflip
+        (1,  None,    False, "1.0",     t),
+        (2,  "54",    False, "1.0595",  t),
+        (3,  "180",   False, "0.8909",  t),
+        (4,  "54",    False, "1.0595",  t),
+        (5,  None,    False, "1.0",     t2),
+        (6,  "22",    True,  "1.1225",  t2),
+        (7,  "54",    False, "1.0595",  t2),
+        (8,  "108_25", True, "1.1892",  t2),
+        (9,  "180",   False, "0.8909",  t2),
+        (10, None,    True,  "1.0",     t2),
+        (11, "54",    False, "1.0595",  t2),
+        (12, "108_25", True,  "1.1892",  t2),
     ]
 
-    # Segment 3 is the special displacement segment
-    for idx, hald, hflip, pitch, dur in seg_defs:
-        if idx == 3:
-            # Complex displacement segment (from tagscript)
+    for seg_idx, hald, hflip, pitch, dur in seg_defs:
+        if seg_idx == 3:
+            # Segment 3 = displacement segment (hald + hflip/crop/hstack + displace)
             out = os.path.join(work_dir, "3.avi")
             hald = hald_files["180"]
             disp_fc = (
-                f"movie={hald}[h];[0:v][h]haldclut,hflip,crop=iw/2:ih:0:0,"
+                f"[0:v][1:v]haldclut,hflip,crop=iw/2:ih:0:0,"
                 f"split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p,format=bgr32[00];"
             )
             if os.path.exists(disp_path):
                 disp_fc += (
-                    f"[1:v]crop=iw:ih/1:0:0,scale={w}:{h},eq=contrast=0.375,format=bgr32,hue=b=-0.033[x];"
+                    f"[2:v]crop=iw:ih/1:0:0,scale={w}:{h},eq=contrast=0.375,format=bgr32,hue=b=-0.033[x];"
                     f"nullsrc=1x1,geq=r=128:g=128:b=128,scale={w}:{h},format=bgr32[y];"
                     f"[00][x][y]displace=edge=wrap[v]"
                 )
-                cmd = ["ffmpeg", "-y", "-i", base_avi, "-i", disp_path,
+                cmd = ["ffmpeg", "-y", "-i", base_avi, "-i", hald, "-i", disp_path,
                        "-filter_complex", disp_fc, "-map", "[v]", "-map", "0:a?",
                        "-c:a", "copy", "-t", str(dur), "-c:v", "ffv1", out]
             else:
                 disp_fc += f"[00]format=yuv420p[v]"
-                cmd = ["ffmpeg", "-y", "-i", base_avi,
+                cmd = ["ffmpeg", "-y", "-i", base_avi, "-i", hald,
                        "-filter_complex", disp_fc, "-map", "[v]", "-map", "0:a?",
                        "-c:a", "copy", "-t", str(dur), "-c:v", "ffv1", out]
             ok, err = await _run_ffmpeg(cmd)
@@ -1529,9 +1526,9 @@ async def _preview1280_render(src: str, s: float, e: float, tmp_dir: str) -> tup
                 return False, "", f"seg3 failed: {err}"
             segs.append(out)
         else:
-            ok, out, err = await build_seg(idx, hald, hflip, pitch, dur)
+            ok, out, err = await build_seg(seg_idx, hald, hflip, pitch, dur)
             if not ok:
-                return False, "", f"seg{idx} failed: {err}"
+                return False, "", f"seg{seg_idx} failed: {err}"
             segs.append(out)
 
     # 8. Concatenate all segments
