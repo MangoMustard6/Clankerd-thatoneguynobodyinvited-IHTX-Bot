@@ -420,11 +420,16 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
             steps.append({"type": "preset", "name": key, "passes": passes})
 
         elif key == "huehsv":
+            parts = [p.strip() for p in val.split(";")]
             try:
-                amount = max(0.0, min(2.0, float(val)))
-            except ValueError:
-                amount = 0.5
-            steps.append({"type": "huehsv", "amount": amount})
+                hue = max(0.0, min(1.0, float(parts[0])))
+            except (ValueError, IndexError):
+                hue = 0.5
+            try:
+                sat = max(0.0, min(2.0, float(parts[1])))
+            except (ValueError, IndexError):
+                sat = 1.0
+            steps.append({"type": "huehsv", "hue": hue, "sat": sat})
 
         elif key == "pinch":
             parts = [p.strip() for p in val.split(";")]
@@ -554,6 +559,15 @@ def build_steps(entries: list[tuple[str, str]]) -> list[dict]:
                 "fallout":   _fall,
                 "lock":      _lock,
             })
+
+        elif key == "tvsim":
+            p = [x.strip() for x in val.split(";")]
+            try:
+                hue_deg = float(p[0]) if len(p) > 0 else 180.0
+            except ValueError:
+                hue_deg = 180.0
+            displace_url = p[1] if len(p) > 1 else "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
+            steps.append({"type": "tvsim", "hue_deg": hue_deg, "displace_url": displace_url})
 
     return steps
 
@@ -766,9 +780,31 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         return True, ""
 
     elif t == "huehsv":
-        amount = step["amount"]
-        vf = f"hue=h={amount * 180}:s={1 + amount}"
-        return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
+        hue = step["hue"]
+        sat = step["sat"]
+        # Generate a Hald CLUT via ImageMagick and apply with ffmpeg haldclut
+        hald_path = os.path.join(tmp_dir, "huehsv_clut.ppm")
+        # hue_percent = 100 + hue*200  (100=no shift, 200=+180deg)
+        hue_pct = int(100 + hue * 200)
+        sat_pct = int(sat * 100)
+        proc = await asyncio.create_subprocess_exec(
+            "magick", "hald:4", "-modulate", "100", f"{sat_pct}", f"{hue_pct}",
+            hald_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            return False, "magick haldclut generation failed"
+        # Build filter_complex using movie to load the Hald CLUT
+        fc = (
+            f"movie='{hald_path}'[h];[0:v][h]haldclut,format=yuv420p[outv]"
+        )
+        cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", fc,
+               "-map", "[outv]", "-map", "0:a?", "-c:a", "copy"]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += [dst]
+        return await _run_ffmpeg(cmd)
 
     elif t == "pinch":
         vf = _build_pinch_vf(step["strength"], step["radius"], step["cx"], step["cy"])
@@ -919,17 +955,75 @@ async def _apply_step(step: dict, src: str, dst: str, is_video: bool, duration: 
         fallout  = step["fallout"]
         lock     = step["lock"]
         w, h = _get_video_dims(src)
-        size = min(w, h) if lock else max(w, h)
-        r_px = radius * size
+        _cx = cx
+        _cy = cy
+        _strength = strength
+        _radius = radius
+        # Tagscript-based swirl using atan2 + hypot rotation
+        dist  = f"hypot(X-W*{_cx},Y-H*{_cy})+1e-6"
+        angle = f"atan2(Y-H*{_cy},X-W*{_cx})"
+        max_r = f"min(W,H)*{_radius}"
         if fallout == "linear":
-            weight = f"clip(1-hypot((X-W*{cx})/({r_px}),(Y-H*{cy})/({r_px})),0,1)"
+            weight = f"if(lt({dist},{max_r}),1-({dist})/({max_r}),0)"
         else:
-            weight = f"clip(1-pow(hypot((X-W*{cx})/({r_px}),(Y-H*{cy})/({r_px})),2),0,1)"
-        angle_expr = f"{strength}*PI/180*{weight}"
-        px = f"W*{cx}+cos({angle_expr})*(X-W*{cx})-sin({angle_expr})*(Y-H*{cy})"
-        py = f"H*{cy}+sin({angle_expr})*(X-W*{cx})+cos({angle_expr})*(Y-H*{cy})"
-        vf = f"format=yuv444p,geq='p({px},{py})',scale=iw:ih,format=yuv420p"
+            weight = f"pow(if(lt({dist},{max_r}),1-({dist})/({max_r}),0),2)"
+        rot = f"({_strength})/180*PI*({weight})"
+        px = f"W*{_cx}+({dist})*cos(({angle})+({rot}))"
+        py = f"H*{_cy}+({dist})*sin(({angle})+({rot}))"
+        if lock:
+            vf = f"format=yuv444p,scale={h}:{h},geq='p({px},{py})',scale={w}:{h},setsar=1:1,format=yuv420p"
+        else:
+            vf = f"format=yuv444p,geq='p({px},{py})',format=yuv420p"
         return await _run_ffmpeg(_ffmpeg_cmd(src, dst, duration, vf=vf))
+
+    elif t == "tvsim":
+        hue_deg = step["hue_deg"]
+        displace_url = step["displace_url"]
+        # 1. Download displacement map once, cache locally
+        disp_cache = os.path.join(os.path.dirname(__file__), "displacemaps")
+        os.makedirs(disp_cache, exist_ok=True)
+        disp_path = os.path.join(disp_cache, "tvsimulator.mov")
+        if not os.path.exists(disp_path):
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(displace_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        if r.status == 200:
+                            with open(disp_path, "wb") as f:
+                                f.write(await r.read())
+            except Exception:
+                pass
+        # 2. Build Hald CLUT
+        hald_path = os.path.join(tmp_dir, "tvsim_hald.ppm")
+        hue_pct = int(hue_deg / 1.8 + 100)
+        proc = await asyncio.create_subprocess_exec(
+            "magick", "hald:4", "-modulate", "100", "100", str(hue_pct), hald_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        # 3. Build filter_complex
+        w, h = _get_video_dims(src)
+        if os.path.exists(disp_path):
+            fc = (
+                f"movie='{hald_path}'[h];[0:v][h]haldclut,hflip,crop=iw/2:ih:0:0,"
+                f"split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=bgr32[00];"
+                f"[1:v]crop=iw:ih/1:0:0,scale={w}:{h},eq=contrast=0.375,format=bgr32,hue=b=-0.033[x];"
+                f"nullsrc=1x1,geq=r=128:g=128:b=128,scale={w}:{h},format=bgr32[y];"
+                f"[00][x][y]displace=edge=wrap[v]"
+            )
+            cmd = ["ffmpeg", "-y", "-i", src, "-i", disp_path, "-filter_complex", fc,
+                   "-map", "[v]", "-map", "0:a?", "-c:a", "copy"]
+        else:
+            # Fallback without displacement map
+            fc = (
+                f"movie='{hald_path}'[h];[0:v][h]haldclut,hflip,crop=iw/2:ih:0:0,"
+                f"split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p[v]"
+            )
+            cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", fc,
+                   "-map", "[v]", "-map", "0:a?", "-c:a", "copy"]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += [dst]
+        return await _run_ffmpeg(cmd)
 
     # Unknown step — pass through
     import shutil
@@ -1267,6 +1361,236 @@ async def cmd_tagdelete(ctx: commands.Context, name: str = ""):
     tags.pop(name, None)
     _save_tags()
     await ctx.reply(f"✅ Tag `{name}` deleted.")
+
+
+# ─── Preview1280 command ───────────────────────────────────────────────────────
+
+async def _preview1280_render(src: str, s: float, e: float, tmp_dir: str) -> tuple[bool, str, str]:
+    """
+    Generate a Preview1280 output from a video.
+    Uses the multi-pass Hald CLUT + displacement-map pipeline from the
+    tagscript reference, simplified for the ffmpeg/magick/sox toolchain.
+    """
+    # 1. Get video duration and clamp
+    probe = subprocess.run(
+        ["ffprobe", "-i", src, "-show_entries", "format=duration",
+         "-v", "quiet", "-of", "csv=p=0"],
+        capture_output=True, text=True, timeout=30
+    )
+    try:
+        vidlen = float(probe.stdout.strip())
+    except ValueError:
+        vidlen = 0
+    s = max(0, min(vidlen - 1, s))
+    e = max(0.1, min(vidlen - s, e))
+    t = e
+    t2 = e / 2
+    t3 = s + e
+
+    # 2. Create working directory for intermediate files
+    work_dir = os.path.join(tmp_dir, "p1280")
+    os.makedirs(work_dir, exist_ok=True)
+
+    # 3. Generate Hald CLUTs with ImageMagick
+    hald_dir = os.path.join(os.path.dirname(__file__), "haldcluts")
+    os.makedirs(hald_dir, exist_ok=True)
+    hald_files = {
+        "54":    os.path.join(hald_dir, "hslhue_54.ppm"),
+        "180":   os.path.join(hald_dir, "hslhue_180.ppm"),
+        "22":    os.path.join(hald_dir, "hslhue_22.ppm"),
+        "108_25": os.path.join(hald_dir, "hslhue_108_25.ppm"),
+    }
+    # Generate missing Hald CLUTs
+    for deg, pct in [(54, 100 + 54/1.8), (180, 100 + 180/1.8), (22, 100 + 22/1.8), (108, 100 + 108/1.8)]:
+        key = str(deg) if deg != 108 else "108_25"
+        path = hald_files[key]
+        if not os.path.exists(path):
+            sat = "125" if deg == 108 else "100"
+            proc = await asyncio.create_subprocess_exec(
+                "magick", "hald:4", "-modulate", "100", sat, str(int(pct)),
+                path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+
+    # 4. Download displacement map if not cached
+    disp_cache = os.path.join(os.path.dirname(__file__), "displacemaps")
+    os.makedirs(disp_cache, exist_ok=True)
+    disp_path = os.path.join(disp_cache, "tvsimulator.mov")
+    if not os.path.exists(disp_path):
+        try:
+            async with aiohttp.ClientSession() as sess:
+                url = "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status == 200:
+                        with open(disp_path, "wb") as f:
+                            f.write(await r.read())
+        except Exception:
+            pass
+
+    # 5. Build base video (scaled + trimmed)
+    base_avi = os.path.join(work_dir, "0.avi")
+    cmd = [
+        "ffmpeg", "-y", "-stream_loop", "-1", "-i", src,
+        "-vf", "scale=640:360,setsar=1:1", "-ss", str(s), "-to", str(t3),
+        "-c:v", "ffv1", "-c:a", "pcm_s16le", base_avi,
+    ]
+    ok, err = await _run_ffmpeg(cmd)
+    if not ok:
+        return False, "", f"p1280 base failed: {err}"
+
+    # 6. Get dimensions of base
+    w = 640
+    h = 360
+    try:
+        w = int(subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width", "-of", "default=nw=1:nk=1", base_avi],
+            capture_output=True, text=True, timeout=15).stdout.strip())
+        h = int(subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=height", "-of", "default=nw=1:nk=1", base_avi],
+            capture_output=True, text=True, timeout=15).stdout.strip())
+    except ValueError:
+        pass
+
+    # 7. Build the 12 segment clips
+    # Helper to build a single segment
+    async def build_seg(idx: int, hald_key: str | None, hflip: bool, audio_pitch: str, dur: float, extra_vf: str = "") -> tuple[bool, str, str]:
+        out = os.path.join(work_dir, f"{idx}.avi")
+        vf_parts = []
+        if hald_key:
+            hald = hald_files[hald_key]
+            vf_parts.append(f"movie={hald},[in]haldclut")
+        if hflip:
+            vf_parts.append("hflip")
+        vf_parts.append("format=yuv420p")
+        if extra_vf:
+            vf_parts.append(extra_vf)
+        vf = ",".join(vf_parts) if vf_parts else "copy"
+        cmd = ["ffmpeg", "-y", "-i", base_avi]
+        if vf != "copy":
+            cmd += ["-vf", vf]
+        # Audio pitch with sox (rubberband not available in this ffmpeg)
+        # Use atempo chain for simple pitch approximation
+        af = ""
+        if audio_pitch:
+            # Map pitch ratios to atempo
+            ratio = float(audio_pitch)
+            af = f"atempo={ratio:.4f}"
+        if af:
+            cmd += ["-af", af]
+        cmd += ["-t", str(dur), "-c:v", "ffv1", "-c:a", "pcm_s16le", out]
+        ok, err = await _run_ffmpeg(cmd)
+        return ok, out, err
+
+    # Build 12 segments
+    segs = []
+    seg_defs = [
+        (1,  None,    False, "1.0",     t),   # normal
+        (2,  "54",    False, "1.0595",  t),   # +1 semitone
+        (3,  "180",   False, "0.8909",  t),   # -2 semitones  (displace version)
+        (4,  "54",    False, "1.0595",  t),   # +1 semitone
+        (5,  None,    False, "1.0",     t2),  # normal half
+        (6,  "22",    True,  "1.1225",  t2),  # +2 semitones, hflip
+        (7,  "54",    False, "1.0595",  t2),  # +1 semitone
+        (8,  "108_25", True, "1.1892",  t2),  # +3 semitones, hflip
+        (9,  "180",   False, "0.8909",  t2),  # -2 semitones
+        (10, None,    True,  "1.0",     t2),  # hflip only
+        (11, "54",    False, "1.0595",  t2),  # +1 semitone
+        (12, "108_25", True,  "1.1892",  t2),  # +3 semitones, hflip
+    ]
+
+    # Segment 3 is the special displacement segment
+    for idx, hald, hflip, pitch, dur in seg_defs:
+        if idx == 3:
+            # Complex displacement segment (from tagscript)
+            out = os.path.join(work_dir, "3.avi")
+            hald = hald_files["180"]
+            disp_fc = (
+                f"movie={hald}[h];[0:v][h]haldclut,hflip,crop=iw/2:ih:0:0,"
+                f"split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p,format=bgr32[00];"
+            )
+            if os.path.exists(disp_path):
+                disp_fc += (
+                    f"[1:v]crop=iw:ih/1:0:0,scale={w}:{h},eq=contrast=0.375,format=bgr32,hue=b=-0.033[x];"
+                    f"nullsrc=1x1,geq=r=128:g=128:b=128,scale={w}:{h},format=bgr32[y];"
+                    f"[00][x][y]displace=edge=wrap[v]"
+                )
+                cmd = ["ffmpeg", "-y", "-i", base_avi, "-i", disp_path,
+                       "-filter_complex", disp_fc, "-map", "[v]", "-map", "0:a?",
+                       "-c:a", "copy", "-t", str(dur), "-c:v", "ffv1", out]
+            else:
+                disp_fc += f"[00]format=yuv420p[v]"
+                cmd = ["ffmpeg", "-y", "-i", base_avi,
+                       "-filter_complex", disp_fc, "-map", "[v]", "-map", "0:a?",
+                       "-c:a", "copy", "-t", str(dur), "-c:v", "ffv1", out]
+            ok, err = await _run_ffmpeg(cmd)
+            if not ok:
+                return False, "", f"seg3 failed: {err}"
+            segs.append(out)
+        else:
+            ok, out, err = await build_seg(idx, hald, hflip, pitch, dur)
+            if not ok:
+                return False, "", f"seg{idx} failed: {err}"
+            segs.append(out)
+
+    # 8. Concatenate all segments
+    concat_file = os.path.join(work_dir, "concat.txt")
+    with open(concat_file, "w") as f:
+        for seg in segs:
+            f.write(f"file '{seg}'\n")
+    out_mp4 = os.path.join(tmp_dir, "p1280.mp4")
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+           "-c", "copy", out_mp4]
+    ok, err = await _run_ffmpeg(cmd)
+    if not ok:
+        return False, "", f"p1280 concat failed: {err}"
+    return True, out_mp4, ""
+
+
+@bot.command(name="preview1280", aliases=["p1280", "pv1280"])
+async def cmd_preview1280(ctx: commands.Context, s: float = 56/29.97, e: float = 26/29.97):
+    """
+    g!preview1280 [start_seconds] [end_seconds]
+    Generates a Preview1280-style montage from the attached video.
+    Defaults: start=56/29.97 (~1.87s), end=26/29.97 (~0.87s)
+    """
+    att = _get_attachment(ctx)
+    if not att:
+        await ctx.reply("❌ Attach or reply to a video file.")
+        return
+    ext = Path(att.filename).suffix.lower()
+    if ext not in VIDEO_EXTENSIONS:
+        await ctx.reply("❌ Preview1280 requires a video file.")
+        return
+    if att.size > MAX_FILE_SIZE:
+        await ctx.reply(f"❌ File too large (max {MAX_FILE_SIZE // 1024 // 1024} MB).")
+        return
+
+    status_msg = await ctx.reply("⚙️ Preview1280 processing…")
+    _renders_in_progress += 1
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ok, src, err = await _download_attachment(att, tmp_dir)
+            if not ok:
+                await status_msg.edit(content=f"❌ Download failed: {err}")
+                return
+            ok, out_path, err = await _preview1280_render(src, s, e, tmp_dir)
+            if not ok:
+                await status_msg.edit(content=f"❌ Preview1280 failed: {err[:300]}")
+                return
+            out_size = os.path.getsize(out_path)
+            if out_size > MAX_FILE_SIZE:
+                await status_msg.edit(content=f"❌ Output too large ({out_size // 1024 // 1024} MB).")
+                return
+            out_name = f"preview1280_{Path(att.filename).stem}.mp4"
+            await status_msg.delete()
+            await ctx.reply(file=discord.File(out_path, filename=out_name))
+            _renders_completed += 1
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Unexpected error: {e}")
+    finally:
+        _renders_in_progress -= 1
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
