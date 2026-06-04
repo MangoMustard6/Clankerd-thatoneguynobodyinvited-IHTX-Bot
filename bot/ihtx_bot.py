@@ -355,4 +355,4 @@ One command, pipe-style syntax:
 `g!ihtx multipitch=-12;0;12` — multipitch (low + center + high octave mixed)
 """
 
-# ─── Pipe parser ──────────────────────────────────────────────────────────��[...]
+# ─── Pipe parser ─────────────────────────────────────────────────────────[...]
