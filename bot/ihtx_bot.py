@@ -308,8 +308,70 @@ async def download_attachment(attachment: discord.Attachment, dest: str):
     os.replace(tmp, dest)
 
 
+def _probe_has_audio(input_path: str) -> bool:
+    try:
+        p = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            input_path
+        ], capture_output=True, text=True, timeout=15)
+        return bool(p.stdout.strip())
+    except Exception:
+        return False
+
+
 def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -> tuple[bool, str]:
     """Run ffmpeg using PRESET_FILTERS. Returns (ok, stderr-or-empty)."""
+
+    # Multipitch special handling: preset can be like "multipitch=0;7;12"
+    if preset.startswith("multipitch"):
+        parts = preset.split("=", 1)
+        argstr = parts[1] if len(parts) > 1 else ""
+        semis = [s for s in argstr.split(";") if s != ""] if argstr else ["0"]
+        n = len(semis)
+        if n == 0:
+            semis = ["0"]
+            n = 1
+        if not _probe_has_audio(input_path):
+            return False, "Input file has no audio for multipitch processing."
+        # build asplit labels
+        asplit_labels = "".join(f"[s{i}]" for i in range(n))
+        asplit = f"[0:a]asplit={n}" + asplit_labels + ";"
+        # build rubberband chains
+        rb_parts = []
+        for i, semi in enumerate(semis):
+            try:
+                semi_f = float(semi)
+            except Exception:
+                semi_f = 0.0
+            pitch_expr = f"2^({semi_f}/12)"
+            rb = f"[s{i}]rubberband=pitch={pitch_expr}:window=standard:transients=crisp:detector=2.14748e+09/4.9:phase=independent:channels=together[a{i}];"
+            rb_parts.append(rb)
+        amix_inputs = "".join(f"[a{i}]" for i in range(n))
+        amix = f"{amix_inputs}amix={n},volume={n}[outa]"
+        filter_complex = asplit + "".join(rb_parts) + amix
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-f", "avi",
+            "-filter_complex", filter_complex,
+            "-map", "0:v",
+            "-map", "[outa]",
+            "-c:v", "ffv1",
+            "-c:a", "pcm_s16le",
+            output_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                return False, result.stderr[-2000:]
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "FFmpeg timed out (>300s)"
+        except Exception as e:
+            return False, str(e)
+
     cfg = PRESET_FILTERS.get(preset)
     if cfg is None:
         cfg = PRESET_FILTERS["chaos"]
@@ -388,7 +450,7 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
       g!ihtx [preset]  — attach a file. Presets: chaos, glitch, shake, rainbow, static, melt, corrupt
     """
     preset = preset.lower()
-    if preset not in VISUAL_PRESETS:
+    if preset not in VISUAL_PRESETS and not preset.startswith("multipitch"):
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset. Available presets: {preset_list}\n"
@@ -513,7 +575,7 @@ async def help_command(ctx: commands.Context):
         value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot)")
     await ctx.reply(embed=embed)
 
 
