@@ -1,5 +1,5 @@
 """
-IHTX Bot — I Hate The X FFmpeg Discord Bot
+IHTX Bot  I Hate The X FFmpeg Discord Bot
 
 This file restores the full implementation by merging the last working version
 with the newer top-level configuration (owners, limits, tags, presets).
@@ -334,7 +334,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
                 output_path
             ]
     else:
-        # Image → animated GIF
+        # Image  animated GIF
         if cfg["complex"]:
             fc = cfg["complex"] + ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
             cmd = [
@@ -385,7 +385,7 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
     """Apply an IHTX FFmpeg effect to an attached video or image.
 
     Usage:
-      g!ihtx [preset]  — attach a file. Presets: chaos, glitch, shake, rainbow, static, melt, corrupt
+      g!ihtx [preset]   attach a file. Presets: chaos, glitch, shake, rainbow, static, melt, corrupt
     """
     preset = preset.lower()
     if preset not in VISUAL_PRESETS:
@@ -411,7 +411,7 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
     if not attachment:
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
-            f"**I HATE THE X — IHTX Bot**\n"
+            f"**I HATE THE X  IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]`.\n\n"
             f"**Presets:** {preset_list}\n\n"
             f"Examples:\n"
@@ -472,9 +472,9 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
-    lines = [f"`{name}` — {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS)]
+    lines = [f"`{name}`  {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS)]
     embed = discord.Embed(
-        title="IHTX Bot — Available Presets",
+        title="IHTX Bot  Available Presets",
         description="\n".join(lines),
         color=discord.Color.red(),
     )
@@ -483,14 +483,14 @@ async def presets_command(ctx: commands.Context):
         value="Attach a video or image and run:\n`g!ihtx [preset]`\n\nDefault preset: `chaos`",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X  FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
 @bot.command(name="ihtxhelp", aliases=["bothelp"])
 async def help_command(ctx: commands.Context):
     embed = discord.Embed(
-        title="IHTX Bot — Help",
+        title="IHTX Bot  Help",
         color=discord.Color.dark_red(),
     )
     embed.add_field(
@@ -513,7 +513,7 @@ async def help_command(ctx: commands.Context):
         value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
+    embed.set_footer(text="I Hate The X  FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
