@@ -9,8 +9,10 @@ the command handlers, ffmpeg integration, and helpers.
 
 Notes:
 - Advanced experimental changes (multipitch external pipeline, iscript rewrites,
-  frei0r hue2, ICFPlus, preview1280 montage) are intentionally left for a follow-up
-  PR because they require additional scripts/dependencies and testing.
+  frei0r hue2, ICFPlus, preview1280 montage) are applied incrementally. This
+  commit adds several experimental presets (tvsim, icfplus, hue2 fallback) and
+  a simple preview1280 command (scales to 1280 width). Further effects will
+  be added as separate commits.
 
 Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp,
 ImageMagick/sox/etc. depending on advanced effects.
@@ -262,6 +264,20 @@ PRESET_FILTERS: dict[str, dict] = {
         "vf": f"drawgrid=x=0:y=0:w=iw:h=5:t=1:color=white@0.1,{_BASE_NOISE},eq=gamma=1.5:saturation=0.3:contrast=2",
         "complex": None,
     },
+    # Experimental presets
+    "tvsim": {
+        "vf": f"{_BASE_NOISE},lutrgb='r=val:g=val*0.9:b=val*0.8',drawgrid=x=0:y=0:w=iw:h=4:t=1:color=black@0.15,eq=contrast=1.1",
+        "complex": None,
+    },
+    "icfplus": {
+        "vf": f"unsharp=5:5:1.0,edgedetect=low,geq='lum=128+5*sin(2*PI*Y/H*t)':128:128,{_BASE_NOISE}",
+        "complex": None,
+    },
+    # hue2 will try to use frei0r if available; fallback to ffmpeg hue filter
+    "hue2": {
+        "vf": None,
+        "complex": None,
+    },
 }
 
 VISUAL_PRESETS = set(PRESET_FILTERS.keys())
@@ -322,10 +338,19 @@ def _probe_has_audio(input_path: str) -> bool:
         return False
 
 
+def _ffmpeg_has_filter(name: str) -> bool:
+    """Return True if ffmpeg reports a filter/plugin containing `name`."""
+    try:
+        p = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, timeout=10)
+        return name.lower() in p.stdout.lower()
+    except Exception:
+        return False
+
+
 def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -> tuple[bool, str]:
     """Run ffmpeg using PRESET_FILTERS. Returns (ok, stderr-or-empty)."""
 
-    # Multipitch special handling: preset can be like "multipitch=0;7;12"
+    # Multipitch special handling (already implemented previously)
     if preset.startswith("multipitch"):
         parts = preset.split("=", 1)
         argstr = parts[1] if len(parts) > 1 else ""
@@ -352,6 +377,9 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
         amix_inputs = "".join(f"[a{i}]" for i in range(n))
         amix = f"{amix_inputs}amix={n},volume={n}[outa]"
         filter_complex = asplit + "".join(rb_parts) + amix
+        # Use MKV for ffv1/pcm output to be safe
+        if not output_path.lower().endswith('.mkv'):
+            output_path = os.path.splitext(output_path)[0] + '.mkv'
         cmd = [
             "ffmpeg", "-y", "-i", input_path,
             "-f", "avi",
@@ -369,6 +397,27 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
             return True, ""
         except subprocess.TimeoutExpired:
             return False, "FFmpeg timed out (>300s)"
+        except Exception as e:
+            return False, str(e)
+
+    # hue2 experimental: try frei0r first, fallback to hue filter
+    if preset == "hue2":
+        # If frei0r is available, use a premultiplied frei0r hue (plugin name varies),
+        # otherwise fall back to ffmpeg's hue filter.
+        if _ffmpeg_has_filter("frei0r"):
+            # Use frei0r hue plugin with premultiply effect if available
+            vf = "frei0r='hue:0.0'"
+        else:
+            vf = "hue=h=90:s=1"
+        # treat as simple video vf
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", output_path]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                return False, res.stderr[-2000:]
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "FFmpeg timed out (>120s)"
         except Exception as e:
             return False, str(e)
 
@@ -450,7 +499,7 @@ async def ihtx_command(ctx: commands.Context, preset: str = "chaos"):
       g!ihtx [preset]  — attach a file. Presets: chaos, glitch, shake, rainbow, static, melt, corrupt
     """
     preset = preset.lower()
-    if preset not in VISUAL_PRESETS and not preset.startswith("multipitch"):
+    if preset not in VISUAL_PRESETS and not preset.startswith("multipitch") and preset != "hue2":
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset. Available presets: {preset_list}\n"
@@ -549,6 +598,68 @@ async def presets_command(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="preview1280", aliases=["p1280"])
+async def preview1280_command(ctx: commands.Context):
+    """Create a 1280px-wide preview of the attached video (simple scaling preview).
+
+    This is a lightweight preview implementation (not the full 12-segment montage).
+    """
+    # find attachment or referenced message
+    attachment = None
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply("Attach a video to create a 1280px preview.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply("Preview1280 works only with video inputs.")
+        return
+
+    status = await ctx.reply("🔧 Creating 1280px preview...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, f"in{suffix}")
+        out_path = os.path.join(tmpdir, "preview_1280.mp4")
+        try:
+            await download_attachment(attachment, in_path)
+        except Exception as e:
+            await status.edit(content=f"❌ Failed to download: {e}")
+            return
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-vf", "scale=1280:-2,setsar=1",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "copy",
+            "-t", "12",
+            out_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                await status.edit(content=f"❌ FFmpeg failed:\n```
+{result.stderr[-1500:]}
+```")
+                return
+        except subprocess.TimeoutExpired:
+            await status.edit(content="❌ FFmpeg timed out (>120s)")
+            return
+
+        try:
+            await ctx.reply(file=discord.File(out_path, filename=f"preview_{Path(attachment.filename).stem}.mp4"))
+            await status.delete()
+        except discord.HTTPException as e:
+            await status.edit(content=f"❌ Failed to upload preview: {e}")
+
+
 @bot.command(name="ihtxhelp", aliases=["bothelp"])
 async def help_command(ctx: commands.Context):
     embed = discord.Embed(
@@ -566,6 +677,11 @@ async def help_command(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
+        name="g!preview1280",
+        value="Create a quick 1280px-wide preview of an attached video.",
+        inline=False,
+    )
+    embed.add_field(
         name="Supported formats",
         value=", ".join(sorted(SUPPORTED_EXTENSIONS)),
         inline=False,
@@ -575,7 +691,7 @@ async def help_command(ctx: commands.Context):
         value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot)")
+    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
 
