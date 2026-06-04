@@ -14,7 +14,7 @@ WORKDIR /app
 
 # Copy requirements and install Python deps
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt || true
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy the repository
 COPY . /app
