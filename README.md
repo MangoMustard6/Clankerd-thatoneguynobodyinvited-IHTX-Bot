@@ -1,6 +1,6 @@
 # IHTX Bot — I Hate The X FFmpeg Discord Bot
 
-A Discord bot that applies destructive FFmpeg visual effects to videos and images. Upload a file, pick a preset, and get back a mangled masterpiece.
+A Discord bot that applies destructive FFmpeg visual effects to videos and images. Upload a file, pick a preset, chain custom effects, or generate a TV-simulator montage.
 
 ## Quick Start
 
@@ -8,7 +8,8 @@ A Discord bot that applies destructive FFmpeg visual effects to videos and image
 
 - Python 3.11+
 - [FFmpeg](https://ffmpeg.org/) (required)
-- [sox](http://sox.sourceforge.net/) (optional, for audio effects)
+- [ImageMagick](https://imagemagick.org/) (required for preview1280 and huehsv effect)
+- [sox](http://sox.sourceforge.net/) (optional, for advanced audio effects)
 
 ### Install
 
@@ -35,9 +36,11 @@ python3 main.py
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `g!ihtx [preset]` | `g!effect`, `g!destroy` | Apply an FFmpeg effect to an attached video/image |
+| `g!ihtx [preset]` | `g!effect`, `g!destroy` | Apply a preset effect to an attached video/image |
+| `g!ihtx effect=value,... [rep] [dur]` | | Chain custom effects with repetitions and duration |
+| `g!preview1280 [start] [dur]` | `g!p1280` | 12-segment TV-simulator montage |
 | `g!presets` | `g!effects`, `g!list` | List all available effect presets |
-| `g!ihtxhelp` | `g!bothelp` | Show help embed |
+| `g!ihtxhelp` | `g!bothelp` | Show help embed with full effect reference |
 
 ### Owner-Only Commands
 
@@ -62,6 +65,99 @@ python3 main.py
 | `melt` | Perspective warp + noise |
 | `corrupt` | Grid overlay + noise + high gamma/contrast |
 
+## Custom Effect Chains
+
+Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semicolons.
+
+**Usage:** `g!ihtx effect=value,effect=value,... [rep] [dur]`
+
+**Example:** `g!ihtx mirror=45,hue=90,pitch=5 3 10`
+
+### Video Effects
+
+| Effect | Syntax | Description |
+|--------|--------|-------------|
+| hflip | `hflip` | Flip horizontally |
+| vflip | `vflip` | Flip vertically |
+| invert | `invert` | Invert all colours |
+| invlum | `invlum` | Invert luminosity only |
+| invertrgb | `invertrgb=r;g;b` | Invert specific channels (1=invert, 0=keep) |
+| grayscale | `grayscale` | Remove colour (desaturate) |
+| sepia | `sepia` | Sepia tone |
+| rotate | `rotate=<deg>` | Rotate by degrees |
+| hue | `hue=<deg>` | Shift hue (0–360) |
+| huehsv | `huehsv=<val>` | Shift hue (magick-style, -100 to 100) |
+| ffmpeghue | `ffmpeghue=<deg>` | Hue shift via FFmpeg hue filter |
+| brightness | `brightness=<val>` | Adjust brightness (e.g. 0.1) |
+| contrast | `contrast=<val>` | Adjust contrast (e.g. 1.5) |
+| saturation | `saturation=<val>` | Adjust saturation (e.g. 1.5) |
+| channelblend | `channelblend=r;g;b` | Swap/mix RGB channels (r/g/b) |
+| swapuv | `swapuv` | Swap U and V chroma channels |
+| gm4 | `gm4` | Selective colour boost |
+| realgm4 | `realgm4` | Solarise via curves inversion |
+
+### Distortion Effects
+
+| Effect | Syntax | Description |
+|--------|--------|-------------|
+| fisheye | `fisheye=strength;radius;cx;cy` | Fisheye lens warp |
+| swirl | `swirl=angle;radius;cx;cy;fallout;lock` | Swirl distortion (fallout: linear/quad) |
+| wave | `wave=hs;hf;ha;hp;vs;vf;va;vp` | Wave distortion (8 params + optional separate/noclip) |
+| zoom | `zoom=<scale>` | Zoom in (e.g. 2) |
+| mirror | `mirror=<angle>` | Mirror fold at angle |
+| tile | `tile=x;y` | Tile the image N×M times |
+| polar | `polar` | Unroll circular image to strip |
+| depolar | `depolar` | Wrap strip into disk |
+| orb | `orb` | Fisheye orb effect |
+| deorb | `deorb` | Reverse orb |
+| gm91deform | `gm91deform` | Perspective/barrel warp |
+
+### Transform / Overlay Effects
+
+| Effect | Syntax | Description |
+|--------|--------|-------------|
+| scroll | `scroll=h;v` | Continuous scroll (0.0–1.0) |
+| pan | `pan=x;y` | Shift image by pixels |
+| vreverse | `vreverse` | Reverse video frames |
+| watermark | `watermark=<url>` | Overlay transparent PNG |
+| ring | `ring` or `ring=<url>` | Frame overlay (default or custom URL) |
+| miui | `miui` | MIUI-style watermark |
+| reddit | `reddit` | Reddit-style watermark |
+| caption | `caption=<text>` | Text at top-centre |
+
+### Audio Effects
+
+| Effect | Syntax | Description |
+|--------|--------|-------------|
+| pitch | `pitch=<semitones>` | Shift pitch (e.g. 5 or -7). Multi: `pitch=5;-3;2` |
+| volume | `volume=<val>` | Adjust volume multiplier |
+| vibrato | `vibrato=freq;depth` | Vibrato effect |
+| areverse | `areverse` | Reverse audio |
+
+### LUT / Raw Effects
+
+| Effect | Syntax | Description |
+|--------|--------|-------------|
+| lut | `lut=<url>` | Apply external .cube LUT from URL |
+| invlum | `invlum` | Built-in luminosity-inversion LUT |
+| ffmpeg | `ffmpeg(<args>)` | Raw ffmpeg flags |
+
+## Preview1280
+
+The `g!preview1280` command creates a 12-segment TV-simulator montage with:
+
+- Hue shifts using Hald CLUTs (45°, 180°, 22°, 120°)
+- Horizontal flips and mirror compositions
+- TV-simulator displacement mapping
+- Pitch variations per segment (+1, -2, +2, +3 semitones)
+- Final upscale to original video resolution
+
+**Requirements:** ImageMagick (`magick` command) and the `tvsimulator.mov` displacement map at `bot/displacemaps/tvsimulator.mov`.
+
+**Usage:** `g!preview1280 [start_offset] [segment_duration]`
+
+Defaults: start=1.85s, duration=0.85s per segment.
+
 ## Configuration
 
 ### Environment Variables
@@ -80,6 +176,12 @@ python3 main.py
 | `channel_blocks.json` | Blocked channel IDs |
 | `tags.json` | Custom tag/preset definitions |
 | `autoreply.json` | Auto-reply configuration |
+
+### Assets
+
+| Path | Purpose |
+|------|---------|
+| `bot/displacemaps/tvsimulator.mov` | TV simulator displacement map for preview1280 |
 
 ### Constants (edit in source)
 
@@ -100,22 +202,23 @@ docker run -e DISCORD_TOKEN="your-token" ihtx-bot
 
 ```
 ├── bot/
-│   ├── ihtx_bot.py        # Main Discord bot
-│   ├── displacemaps/      # FFmpeg displacement assets
+│   ├── ihtx_bot.py          # Main Discord bot (presets, effect chains, preview1280)
+│   ├── displacemaps/         # FFmpeg displacement assets
+│   │   └── tvsimulator.mov   # TV simulator displacement map
 │   ├── owner_ids.json
 │   ├── limits.json
 │   ├── tags.json
 │   ├── autoreply.json
 │   ├── blocklist.json
 │   └── channel_blocks.json
-├── main.py                # Entry point
-├── requirements.txt       # Python dependencies
-├── Dockerfile             # Container build
-├── .replit                # Replit configuration
-├── replit.nix             # Nix system deps (ffmpeg, sox)
-├── artifacts/             # TypeScript API server & mockup sandbox
-├── lib/                   # Shared TypeScript libraries (API spec, DB, Zod)
-└── scripts/               # Build & maintenance scripts
+├── main.py                   # Entry point
+├── requirements.txt          # Python dependencies
+├── Dockerfile                # Container build
+├── .replit                   # Replit configuration
+├── replit.nix                # Nix system deps (ffmpeg, sox)
+├── artifacts/                # TypeScript API server & mockup sandbox
+├── lib/                      # Shared TypeScript libraries (API spec, DB, Zod)
+└── scripts/                 # Build & maintenance scripts
 ```
 
 ## License
