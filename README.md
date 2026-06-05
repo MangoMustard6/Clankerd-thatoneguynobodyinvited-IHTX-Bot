@@ -10,6 +10,7 @@ A Discord bot that applies destructive FFmpeg visual effects to videos and image
 - [FFmpeg](https://ffmpeg.org/) (required)
 - [ImageMagick](https://imagemagick.org/) (required for preview1280 and huehsv effect)
 - [sox](http://sox.sourceforge.net/) (optional, for advanced audio effects)
+- FFmpeg with rubberband filter support (required for preview1280 pitch shifting)
 
 ### Install
 
@@ -147,13 +148,13 @@ Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semic
 
 The `g!preview1280` command creates a 12-segment TV-simulator montage with:
 
-- Hue shifts using Hald CLUTs (45°, 180°, 22°, 120°)
+- Hue shifts using Hald CLUTs (54°, 180°, 22°, 108°+saturation boost)
 - Horizontal flips and mirror compositions
-- TV-simulator displacement mapping
-- Pitch variations per segment (+1, -2, +2, +3 semitones)
+- TV-simulator displacement mapping with contrast and hue adjustments
+- Pitch variations per segment via rubberband filter (+1, -2, +2, +3 semitones)
 - Final upscale to original video resolution
 
-**Requirements:** ImageMagick (`magick` command) and the `tvsimulator.mov` displacement map at `bot/displacemaps/tvsimulator.mov`.
+**Requirements:** ImageMagick (`magick` command), FFmpeg with `rubberband` filter support, and the `tvsimulator.mov` displacement map at `bot/displacemaps/tvsimulator.mov`.
 
 **Usage:** `g!preview1280 [start_offset] [segment_duration]`
 
@@ -161,22 +162,24 @@ Defaults: start=1.85s, duration=0.85s per segment.
 
 ## Multipitch
 
-The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using an external `pitch_multi_shifter` binary. Each slash-separated semitone value creates a separate pitch-shifted segment, then all segments are concatenated.
+The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using FFmpeg\'s `rubberband` audio filter with `filter_complex` + `amix`. Each slash-separated semitone value creates a separate pitch-shifted copy of the audio, and all copies are mixed together simultaneously.
 
-**Pipeline per pitch value:**
-1. Extract audio at half sample rate via FFmpeg
-2. Pitch shift with the external binary (`--backend signalsmith --no-normalize`)
-3. Re-merge with video + bass boost (`asetrate=$sr,bass=g=2.5`)
+**Pipeline:**
+```
+[0:a]rubberband=pitch=2^(1/12):window=standard:transients=crisp:detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
+[0:a]rubberband=pitch=2^(4/12):...[a1];
+[0:a]rubberband=pitch=2^(7/12):...[a2];
+[a0][a1][a2]amix=3,volume=3[outa]
+-map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
+```
 
 **Usage:** `g!multipitch <semitones/separated/by/slash>`
 
-**Example:** `g!multipitch 1/4/7` — creates three segments with +1, +4, +7 semitone shifts, then concatenates them.
+**Example:** `g!multipitch 1/4/7` — all three pitches play simultaneously, mixed together.
 
 Negative values are supported: `g!multipitch -3/0/5`
 
-The binary is automatically downloaded from `https://file.garden/aTXso15ukD3mnuPI/multipitch` on first use and cached for subsequent runs.
-
-**In effect chains:** `multipitch=1/4/7` uses a simplified asetrate-based pitch shift (sum of all values). For full multi-voice processing, use the standalone `g!multipitch` command.
+**In effect chains:** `multipitch=1/4/7` uses rubberband with summed pitch values for a single-pass shift (full amix requires `filter_complex` which is only in the standalone command).
 
 ## Configuration
 
@@ -225,7 +228,6 @@ docker run -e DISCORD_TOKEN="your-token" ihtx-bot
 │   ├── ihtx_bot.py          # Main Discord bot (presets, effect chains, preview1280)
 │   ├── displacemaps/         # FFmpeg displacement assets
 │   │   └── tvsimulator.mov   # TV simulator displacement map
-│   └── program              # pitch_multi_shifter binary (auto-downloaded)
 │   ├── owner_ids.json
 │   ├── limits.json
 │   ├── tags.json

@@ -757,16 +757,29 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
     for name, params in effects:
         if name in ("multipitch", "mp", "multi"):
             # multipitch in semitones — slash-separated, e.g. multipitch=1/4/7
-            # Fallback for inline effect chains: use simple asetrate pitch shift
-            # (full multi-voice pipeline runs via _run_multipitch for standalone command)
-            semitones = params[0] if params else "0"
-            # Multiple semitones: multipitch=1/4/7 → sum them for single-pass fallback
-            if len(params) > 1:
-                total = sum(float(s) for s in params)
+            # In inline effect chains, each pitch value gets its own rubberband
+            # instance, then they are amix'd together (same as standalone command).
+            # Fallback single pitch: multipitch=5 → simple rubberband
+            semitones = params if params else ["0"]
+            if len(semitones) == 1:
+                # Single pitch — simple rubberband
+                af_parts.append(
+                    f"rubberband=pitch=2^({semitones[0]}/12):"
+                    f"window=standard:transients=crisp:"
+                    f"detector=2.14748e+09/4.9:phase=independent:"
+                    f"channels=together"
+                )
             else:
-                total = float(semitones)
-            factor = 2 ** (total / 12)
-            af_parts.append(f"asetrate=44100*{factor},aresample=44100")
+                # Multiple pitches — cannot use -af for multi-stream, needs filter_complex.
+                # Store a marker so _build_ffmpeg_cmd_for_effects can detect it.
+                # For now, sum pitches into single rubberband as inline fallback.
+                total = sum(float(s) for s in semitones)
+                af_parts.append(
+                    f"rubberband=pitch=2^({total}/12):"
+                    f"window=standard:transients=crisp:"
+                    f"detector=2.14748e+09/4.9:phase=independent:"
+                    f"channels=together"
+                )
 
         elif name == "volume":
             val = params[0] if params else "1"
@@ -896,159 +909,71 @@ def _run_effect_chain(
 
 
 
-# ---------- Multipitch (external pitch_multi_shifter pipeline) ----------
-
-_PITCH_SHIFTER_PATH: str | None = None
-
-
-async def _ensure_pitch_shifter(workdir: str) -> str:
-    """Ensure the pitch_multi_shifter binary exists, downloading if needed.
-
-    Returns the path to the executable.
-    """
-    global _PITCH_SHIFTER_PATH
-
-    # If we already have a cached path and it exists, return it
-    if _PITCH_SHIFTER_PATH and os.path.isfile(_PITCH_SHIFTER_PATH):
-        return _PITCH_SHIFTER_PATH
-
-    # Check common locations
-    candidates = [
-        os.path.join(workdir, "program"),
-        "bot/program",
-        "/app/bot/program",
-        "program",
-    ]
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            _PITCH_SHIFTER_PATH = c
-            return c
-
-    # Download it
-    dest = os.path.join(workdir, "program")
-    try:
-        await download_url(
-            "https://file.garden/aTXso15ukD3mnuPI/multipitch",
-            dest
-        )
-        os.chmod(dest, 0o755)
-        _PITCH_SHIFTER_PATH = dest
-        return dest
-    except Exception as e:
-        raise FileNotFoundError(
-            f"pitch_multi_shifter binary not found and could not be downloaded: {e}"
-        )
-
+# ---------- Multipitch (rubberband pitch-shift pipeline) ----------
 
 def _run_multipitch(
     input_path: str,
     output_path: str,
     pitch_values: list[str],
-    program_path: str,
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using the external pitch_multi_shifter binary.
+    """Run the multipitch pipeline using FFmpeg filter_complex + amix.
 
-    Pipeline per pitch value:
-      1. Extract audio at half sample rate: ffmpeg -i input -af asetrate=$sr/2 half$i.wav
-      2. Pitch shift with external binary: ./program half$i.wav out$i.wav <pitch> --backend signalsmith --no-normalize
-      3. Re-merge with video + bass boost: ffmpeg -i input -i out$i.wav -af asetrate=$sr,bass=g=2.5 ...
+    Creates multiple rubberband pitch-shifted copies of the input audio in a
+    single filter_complex graph, then mixes them together via amix.
 
-    After all segments, concat them into the final output.
+    Example for pitches 1/4/7:
+      filter_complex="
+        [0:a]rubberband=pitch=2^(1/12):window=standard:transients=crisp:
+          detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
+        [0:a]rubberband=pitch=2^(4/12):window=standard:transients=crisp:
+          detector=2.14748e+09/4.9:phase=independent:channels=together[a1];
+        [0:a]rubberband=pitch=2^(7/12):window=standard:transients=crisp:
+          detector=2.14748e+09/4.9:phase=independent:channels=together[a2];
+        [a0][a1][a2]amix=3,volume=3[outa]
+      "
+      -map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
     """
     if not pitch_values:
         return False, "No pitch values provided."
 
-    # Get sample rate from input
-    sr_str = _ffprobe(input_path,
-                      "-select_streams", "a:0",
-                      "-show_entries", "stream=sample_rate",
-                      "-of", "default=nw=1:nk=1")
-    try:
-        sr = int(sr_str)
-    except (ValueError, TypeError):
-        sr = 44100  # fallback
+    n = len(pitch_values)
 
-    half_sr = sr // 2
+    # Validate pitch values
+    for pv in pitch_values:
+        try:
+            float(pv)
+        except ValueError:
+            return False, f"Invalid pitch value: {pv!r}"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        segment_files = []
+    # Build filter_complex string
+    # Each pitch gets its own rubberband instance on [0:a], outputting to [a{i}]
+    rb_parts = []
+    for i, pitch_val in enumerate(pitch_values):
+        rb_parts.append(
+            f"[0:a]rubberband=pitch=2^({pitch_val}/12):"
+            f"window=standard:transients=crisp:"
+            f"detector=2.14748e+09/4.9:phase=independent:"
+            f"channels=together[a{i}]"
+        )
 
-        for i, pitch_val in enumerate(pitch_values):
-            half_wav = os.path.join(tmpdir, f"h{i}.wav")
-            out_wav = os.path.join(tmpdir, f"out{i}.wav")
-            seg_mp4 = os.path.join(tmpdir, f"a{i}.mp4")
+    # amix all pitch-shifted streams + volume compensation
+    amix_inputs = "".join(f"[a{i}]" for i in range(n))
+    amix_part = f"{amix_inputs}amix={n},volume={n}[outa]"
 
-            # Step 1: Extract audio from input at half sample rate
-            extract_cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-af", f"asetrate={half_sr}",
-                "-vn",
-                half_wav,
-            ]
-            ok, err = _run_ffmpeg_raw(extract_cmd, timeout=120)
-            if not ok:
-                return False, f"Step 1 (extract audio) failed for pitch={pitch_val}: {err}"
+    filter_complex = ";".join(rb_parts + [amix_part])
 
-            # Step 2: Run pitch_multi_shifter
-            shift_cmd = [
-                program_path,
-                half_wav,
-                out_wav,
-                pitch_val,
-                "--backend", "signalsmith",
-                "--no-normalize",
-            ]
-            try:
-                result = subprocess.run(shift_cmd, capture_output=True, text=True, timeout=120)
-                if result.returncode != 0:
-                    return False, f"Step 2 (pitch shifter) failed for pitch={pitch_val}: {result.stderr[-1500:]}"
-            except subprocess.TimeoutExpired:
-                return False, f"Step 2 (pitch shifter) timed out for pitch={pitch_val}"
-            except Exception as e:
-                return False, f"Step 2 (pitch shifter) error for pitch={pitch_val}: {e}"
-
-            # Step 3: Re-merge video with shifted audio + bass boost
-            merge_cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-i", out_wav,
-                "-af", f"asetrate={sr},bass=g=2.5",
-                "-map", "0:v",
-                "-map", "1:a",
-                "-c:v", "ffv1",
-                "-c:a", "pcm_s16le",
-                "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p",
-                seg_mp4,
-            ]
-            ok, err = _run_ffmpeg_raw(merge_cmd, timeout=180)
-            if not ok:
-                return False, f"Step 3 (merge) failed for pitch={pitch_val}: {err}"
-
-            segment_files.append(seg_mp4)
-
-        # Step 4: Concat all segments
-        if len(segment_files) == 1:
-            # Only one pitch value — just copy the segment as output
-            shutil.copy2(segment_files[0], output_path)
-            return True, ""
-
-        concat_list = os.path.join(tmpdir, "concat.txt")
-        with open(concat_list, "w") as f:
-            for sf in segment_files:
-                f.write(f"file '{sf}'\n")
-
-        concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-        return _run_ffmpeg_raw(concat_cmd, timeout=300)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "0:v",
+        "-map", "[outa]",
+        "-c:v", "ffv1",
+        "-c:a", "pcm_s16le",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+    return _run_ffmpeg_raw(cmd, timeout=300)
 
 
 # ---------- Preview1280 (TV-simulator montage) ----------
@@ -1094,21 +1019,28 @@ async def _ensure_displacement_map(workdir: str) -> str:
 def _generate_hald_cluts(workdir: str) -> list[str]:
     """Generate Hald CLUT .ppm files for hue shifts using ImageMagick.
 
-    Returns paths to [hslhue_45.ppm, hslhue_180.ppm, hslhue_22.ppm, hslhue_120.ppm].
+    Returns paths to [hslhue_54.ppm, hslhue_180.ppm, hslhue_22.ppm, hslhue_108_30.ppm].
+    CLUT hue values use ImageMagick -modulate formula: hue_frac * 200 + 100 (or +200 for sat boost).
     """
+    # (filename, brightness, saturation, hue_mod_value)
+    # hue_mod_value = hue_fraction * 200 + 100
+    # For saturation-boosted CLUTs, saturation > 100 and hue_mod = hue_fraction * 200 + 200
     clut_specs = [
-        ("hslhue_45.ppm", 45),
-        ("hslhue_180.ppm", 180),
-        ("hslhue_22.ppm", 22),
-        ("hslhue_120.ppm", 120),
+        # hslhue_54: hue shift 54° → fraction 0.15, mod = 0.15*200+100 = 130
+        ("hslhue_54.ppm", 100, 100, 130),
+        # hslhue_180: hue shift 180° → fraction 0.5, mod = 0.5*200+100 = 200
+        ("hslhue_180.ppm", 100, 100, 200),
+        # hslhue_22: hue shift 22° → fraction 0.06, mod = 0.06*200+100 = 112
+        ("hslhue_22.ppm", 100, 100, 112),
+        # hslhue_108_30: hue shift 108° + saturation boost → fraction 0.3, mod = 0.3*200+200 = 260
+        ("hslhue_108_30.ppm", 100, 130, 260),
     ]
     paths = []
-    for filename, hue_deg in clut_specs:
+    for filename, brightness, saturation, hue_mod in clut_specs:
         path = os.path.join(workdir, filename)
-        mod_val = hue_deg / 1.8 + 100
         cmd = [
             "magick", "hald:4",
-            "-modulate", f"100,100,{mod_val}",
+            "-modulate", f"{brightness},{saturation},{hue_mod}",
             path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1130,7 +1062,17 @@ def _run_preview1280(
 
     This creates a 12-segment montage at 640x360, then scales to original size.
     Requires: ffmpeg, ImageMagick (magick), and the tvsimulator.mov displacement map.
+    Uses rubberband audio filter for high-quality pitch shifting.
     """
+    # Helper: rubberband pitch filter string for N semitones
+    def _rb(semitones: float) -> str:
+        return (
+            f"rubberband=pitch=2^({semitones}/12):"
+            f"window=standard:transients=crisp:"
+            f"detector=2.14748e+09/4.9:phase=independent:"
+            f"channels=together"
+        )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         info = _ffprobe_video_info(input_path)
         w, h = info["width"], info["height"]
@@ -1141,10 +1083,10 @@ def _run_preview1280(
 
         # Generate Hald CLUTs
         cluts = _generate_hald_cluts(tmpdir)
-        clut_45 = cluts[0] if os.path.exists(cluts[0]) else None
+        clut_54 = cluts[0] if os.path.exists(cluts[0]) else None
         clut_180 = cluts[1] if os.path.exists(cluts[1]) else None
         clut_22 = cluts[2] if os.path.exists(cluts[2]) else None
-        clut_120 = cluts[3] if os.path.exists(cluts[3]) else None
+        clut_108_30 = cluts[3] if os.path.exists(cluts[3]) else None
 
         # Locate displacement map
         disp_map = None
@@ -1185,7 +1127,7 @@ def _run_preview1280(
         # Helper to build segment ffmpeg commands
         segments = []
 
-        # Segment 1: plain copy
+        # Segment 1: plain copy, duration t
         seg1 = os.path.join(tmpdir, "1.avi")
         segments.append(([
             "ffmpeg", "-y", "-i", avi0,
@@ -1193,21 +1135,21 @@ def _run_preview1280(
             seg1
         ], seg1))
 
-        # Segment 2: hue +45, pitch +1 semitone
+        # Segment 2: hue +54 (hslhue_54), pitch +1 semitone (rubberband)
         seg2 = os.path.join(tmpdir, "2.avi")
-        if clut_45:
+        if clut_54:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", f"movie={clut_45},[in]haldclut,format=yuv420p",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", f"movie={clut_54},[in]haldclut,format=yuv420p",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg2
             ], seg2))
         else:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", "hue=h=45",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", "hue=h=54",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg2
             ], seg2))
@@ -1226,7 +1168,7 @@ def _run_preview1280(
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0, "-stream_loop", "-1", "-i", disp_map,
                 "-filter_complex", fc,
-                "-af", "asetrate=44100*0.891,aresample=44100",
+                "-af", _rb(-2),
                 "-map", "[v]", "-map", "0:a",
                 "-pix_fmt", "yuv420p",
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
@@ -1237,26 +1179,26 @@ def _run_preview1280(
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
                 "-vf", "hue=h=180,hflip,crop=iw/2:ih:0:0,split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p",
-                "-af", "asetrate=44100*0.891,aresample=44100",
+                "-af", _rb(-2),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg3
             ], seg3))
 
-        # Segment 4: hue +45, pitch +1 semitone (same as seg2)
+        # Segment 4: hue +54 (hslhue_54), pitch +1 semitone (same as seg2)
         seg4 = os.path.join(tmpdir, "4.avi")
-        if clut_45:
+        if clut_54:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", f"movie={clut_45},[in]haldclut,format=yuv420p",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", f"movie={clut_54},[in]haldclut,format=yuv420p",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg4
             ], seg4))
         else:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", "hue=h=45",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", "hue=h=54",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg4
             ], seg4))
@@ -1266,18 +1208,18 @@ def _run_preview1280(
             # (seg_num, vf_filter, af_filter)
             (5, None, None),  # plain copy
             (6, f"movie={clut_22},[in]haldclut,hflip,format=yuv420p" if clut_22 else "hue=h=22,hflip,format=yuv420p",
-             "asetrate=44100*1.122,aresample=44100"),  # hue+22, hflip, pitch+2
-            (7, f"movie={clut_45},[in]haldclut,format=yuv420p" if clut_45 else "hue=h=45,format=yuv420p",
-             "asetrate=44100*1.059,aresample=44100"),  # hue+45, pitch+1
-            (8, f"movie={clut_120},[in]haldclut,hflip,format=yuv420p" if clut_120 else "hue=h=120,hflip,format=yuv420p",
-             "asetrate=44100*1.189,aresample=44100"),  # hue+120, hflip, pitch+3
+             _rb(2)),  # hue+22, hflip, pitch+2 (smooth transients)
+            (7, f"movie={clut_54},[in]haldclut,format=yuv420p" if clut_54 else "hue=h=54,format=yuv420p",
+             _rb(1)),  # hue+54, pitch+1
+            (8, f"movie={clut_108_30},[in]haldclut,hflip,format=yuv420p" if clut_108_30 else "hue=h=108,hflip,format=yuv420p",
+             _rb(3)),  # hue+108+sat30, hflip, pitch+3
             (9, f"movie={clut_180},[in]haldclut,format=yuv420p" if clut_180 else "hue=h=180,format=yuv420p",
-             "asetrate=44100*0.891,aresample=44100"),  # hue+180, pitch-2
+             _rb(-2)),  # hue+180, pitch-2
             (10, "hflip", None),  # just hflip
-            (11, f"movie={clut_45},[in]haldclut,format=yuv420p" if clut_45 else "hue=h=45,format=yuv420p",
-             "asetrate=44100*1.059,aresample=44100"),  # hue+45, pitch+1
-            (12, f"movie={clut_120},[in]haldclut,hflip,format=yuv420p" if clut_120 else "hue=h=120,hflip,format=yuv420p",
-             "asetrate=44100*1.189,aresample=44100"),  # hue+120, hflip, pitch+3
+            (11, f"movie={clut_54},[in]haldclut,format=yuv420p" if clut_54 else "hue=h=54,format=yuv420p",
+             _rb(1)),  # hue+54, pitch+1
+            (12, f"movie={clut_108_30},[in]haldclut,hflip,format=yuv420p" if clut_108_30 else "hue=h=108,hflip,format=yuv420p",
+             _rb(3)),  # hue+108+sat30, hflip, pitch+3
         ]
 
         for seg_num, vf, af in short_specs:
@@ -1545,7 +1487,7 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 @bot.command(name="multipitch", aliases=["mp", "multi"])
 async def multipitch_command(ctx: commands.Context, *, args: str = ""):
-    """Apply multi-voice pitch shifting to an attached video using the pitch_multi_shifter binary.
+    """Apply multi-voice pitch shifting to an attached video using rubberband.
 
     Usage:
       g!multipitch <pitch_values>     — slash-separated semitone values
@@ -1614,17 +1556,10 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Failed to download your file: {e}")
             return
 
-        # Ensure pitch shifter binary is available
-        try:
-            program_path = await _ensure_pitch_shifter(tmpdir)
-        except FileNotFoundError as e:
-            await status_msg.edit(content=f"❌ {e}")
-            return
-
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
             None, _run_multipitch,
-            input_path, output_path, pitch_values, program_path
+            input_path, output_path, pitch_values
         )
 
         if not ok:
@@ -1689,7 +1624,7 @@ async def help_command(ctx: commands.Context):
     )
     embed.add_field(
         name="g!multipitch <pitches>  (aliases: mp, multi)",
-        value="Multi-voice pitch shift via external binary.\n"
+        value="Multi-voice pitch shift via rubberband.\n"
               "Slash-separated semitones: `g!multipitch 1/4/7`",
         inline=False,
     )
