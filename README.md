@@ -162,12 +162,11 @@ Defaults: start=1.85s, duration=0.85s per segment.
 
 ## Multipitch
 
-The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using an external `pitch_multi_shifter` binary. Each slash-separated semitone value creates a separate pitch-shifted segment, then all segments are concatenated.
+The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using FFmpeg's `rubberband` audio filter. Each slash-separated semitone value creates a separate pitch-shifted segment (with `-map 0:v -map 0:a` to preserve video), then all segments are concatenated.
 
 **Pipeline per pitch value:**
-1. Extract audio at half sample rate via FFmpeg
-2. Pitch shift with the external binary (`--backend signalsmith --no-normalize`)
-3. Re-merge with video + bass boost (`asetrate=$sr,bass=g=2.5`)
+1. Apply rubberband pitch shift: `rubberband=pitch=2^(N/12):window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency`
+2. Map video from input stream 0 untouched, map pitch-shifted audio from stream 0
 
 **Usage:** `g!multipitch <semitones/separated/by/slash>`
 
@@ -175,9 +174,7 @@ The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitc
 
 Negative values are supported: `g!multipitch -3/0/5`
 
-The binary is automatically downloaded from `https://file.garden/aTXso15ukD3mnuPI/multipitch` on first use and cached for subsequent runs.
-
-**In effect chains:** `multipitch=1/4/7` uses a simplified asetrate-based pitch shift (sum of all values). For full multi-voice processing, use the standalone `g!multipitch` command.
+**In effect chains:** `multipitch=1/4/7` uses rubberband with summed pitch values for a single-pass shift. For full per-voice segmentation, use the standalone `g!multipitch` command.
 
 ## Configuration
 
@@ -226,7 +223,6 @@ docker run -e DISCORD_TOKEN="your-token" ihtx-bot
 │   ├── ihtx_bot.py          # Main Discord bot (presets, effect chains, preview1280)
 │   ├── displacemaps/         # FFmpeg displacement assets
 │   │   └── tvsimulator.mov   # TV simulator displacement map
-│   └── program              # pitch_multi_shifter binary (auto-downloaded)
 │   ├── owner_ids.json
 │   ├── limits.json
 │   ├── tags.json

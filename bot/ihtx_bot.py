@@ -756,17 +756,19 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
     af_parts = []
     for name, params in effects:
         if name in ("multipitch", "mp", "multi"):
-            # multipitch in semitones — slash-separated, e.g. multipitch=1/4/7
-            # Fallback for inline effect chains: use simple asetrate pitch shift
-            # (full multi-voice pipeline runs via _run_multipitch for standalone command)
+            # multipitch in semitones — slash-separated values are visual only,
+            # summed into a single rubberband pitch shift for inline effect chains.
+            # Full per-voice segmentation happens in the standalone g!multipitch command.
             semitones = params[0] if params else "0"
-            # Multiple semitones: multipitch=1/4/7 → sum them for single-pass fallback
             if len(params) > 1:
                 total = sum(float(s) for s in params)
             else:
                 total = float(semitones)
-            factor = 2 ** (total / 12)
-            af_parts.append(f"asetrate=44100*{factor},aresample=44100")
+            af_parts.append(
+                f"rubberband=pitch=2^({total}/12):"
+                f"window=short:transients=mixed:"
+                f"detector=soft:channels=together:pitchq=consistency"
+            )
 
         elif name == "volume":
             val = params[0] if params else "1"
@@ -896,141 +898,68 @@ def _run_effect_chain(
 
 
 
-# ---------- Multipitch (external pitch_multi_shifter pipeline) ----------
-
-_PITCH_SHIFTER_PATH: str | None = None
-
-
-async def _ensure_pitch_shifter(workdir: str) -> str:
-    """Ensure the pitch_multi_shifter binary exists, downloading if needed.
-
-    Returns the path to the executable.
-    """
-    global _PITCH_SHIFTER_PATH
-
-    # If we already have a cached path and it exists, return it
-    if _PITCH_SHIFTER_PATH and os.path.isfile(_PITCH_SHIFTER_PATH):
-        return _PITCH_SHIFTER_PATH
-
-    # Check common locations
-    candidates = [
-        os.path.join(workdir, "program"),
-        "bot/program",
-        "/app/bot/program",
-        "program",
-    ]
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            _PITCH_SHIFTER_PATH = c
-            return c
-
-    # Download it
-    dest = os.path.join(workdir, "program")
-    try:
-        await download_url(
-            "https://file.garden/aTXso15ukD3mnuPI/multipitch",
-            dest
-        )
-        os.chmod(dest, 0o755)
-        _PITCH_SHIFTER_PATH = dest
-        return dest
-    except Exception as e:
-        raise FileNotFoundError(
-            f"pitch_multi_shifter binary not found and could not be downloaded: {e}"
-        )
-
+# ---------- Multipitch (rubberband pitch-shift pipeline) ----------
 
 def _run_multipitch(
     input_path: str,
     output_path: str,
     pitch_values: list[str],
-    program_path: str,
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using the external pitch_multi_shifter binary.
+    """Run the multipitch pipeline using FFmpeg rubberband filter.
 
-    Pipeline per pitch value:
-      1. Extract audio at half sample rate: ffmpeg -i input -af asetrate=$sr/2 half$i.wav
-      2. Pitch shift with external binary: ./program half$i.wav out$i.wav <pitch> --backend signalsmith --no-normalize
-      3. Re-merge with video + bass boost: ffmpeg -i input -i out$i.wav -af asetrate=$sr,bass=g=2.5 ...
+    For each pitch value, creates a separate pitch-shifted segment using
+    rubberband with proper -map and filter_complex handling, then concatenates
+    all segments into the final output.
 
-    After all segments, concat them into the final output.
+    Per-segment pipeline:
+      ffmpeg -i input -af "rubberband=pitch=2^(N/12):..." -map 0:v -map 0:a
+             -c:v ffv1 -c:a pcm_s16le seg.avi
+
+    The rubberband filter modifies audio in-place on stream 0:a, so -map 0:v
+    picks up the untouched video and -map 0:a picks up the pitch-shifted audio.
     """
     if not pitch_values:
         return False, "No pitch values provided."
-
-    # Get sample rate from input
-    sr_str = _ffprobe(input_path,
-                      "-select_streams", "a:0",
-                      "-show_entries", "stream=sample_rate",
-                      "-of", "default=nw=1:nk=1")
-    try:
-        sr = int(sr_str)
-    except (ValueError, TypeError):
-        sr = 44100  # fallback
-
-    half_sr = sr // 2
 
     with tempfile.TemporaryDirectory() as tmpdir:
         segment_files = []
 
         for i, pitch_val in enumerate(pitch_values):
-            half_wav = os.path.join(tmpdir, f"h{i}.wav")
-            out_wav = os.path.join(tmpdir, f"out{i}.wav")
-            seg_mp4 = os.path.join(tmpdir, f"a{i}.mp4")
+            seg_path = os.path.join(tmpdir, f"seg_{i}.avi")
 
-            # Step 1: Extract audio from input at half sample rate
-            extract_cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-af", f"asetrate={half_sr}",
-                "-vn",
-                half_wav,
-            ]
-            ok, err = _run_ffmpeg_raw(extract_cmd, timeout=120)
-            if not ok:
-                return False, f"Step 1 (extract audio) failed for pitch={pitch_val}: {err}"
-
-            # Step 2: Run pitch_multi_shifter
-            shift_cmd = [
-                program_path,
-                half_wav,
-                out_wav,
-                pitch_val,
-                "--backend", "signalsmith",
-                "--no-normalize",
-            ]
+            # Build rubberband filter string for this pitch value
             try:
-                result = subprocess.run(shift_cmd, capture_output=True, text=True, timeout=120)
-                if result.returncode != 0:
-                    return False, f"Step 2 (pitch shifter) failed for pitch={pitch_val}: {result.stderr[-1500:]}"
-            except subprocess.TimeoutExpired:
-                return False, f"Step 2 (pitch shifter) timed out for pitch={pitch_val}"
-            except Exception as e:
-                return False, f"Step 2 (pitch shifter) error for pitch={pitch_val}: {e}"
+                semi = float(pitch_val)
+            except ValueError:
+                return False, f"Invalid pitch value: {pitch_val!r}"
 
-            # Step 3: Re-merge video with shifted audio + bass boost
-            merge_cmd = [
+            rb_filter = (
+                f"rubberband=pitch=2^({semi}/12):"
+                f"window=short:transients=mixed:"
+                f"detector=soft:channels=together:pitchq=consistency"
+            )
+
+            # Apply rubberband to audio, copy video untouched
+            cmd = [
                 "ffmpeg", "-y",
                 "-i", input_path,
-                "-i", out_wav,
-                "-af", f"asetrate={sr},bass=g=2.5",
+                "-af", rb_filter,
                 "-map", "0:v",
-                "-map", "1:a",
+                "-map", "0:a",
                 "-c:v", "ffv1",
                 "-c:a", "pcm_s16le",
-                "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p",
-                seg_mp4,
+                seg_path,
             ]
-            ok, err = _run_ffmpeg_raw(merge_cmd, timeout=180)
+            ok, err = _run_ffmpeg_raw(cmd, timeout=180)
             if not ok:
-                return False, f"Step 3 (merge) failed for pitch={pitch_val}: {err}"
+                return False, f"Segment {i+1}/{len(pitch_values)} (pitch={pitch_val}) failed: {err}"
 
-            segment_files.append(seg_mp4)
+            segment_files.append(seg_path)
 
-        # Step 4: Concat all segments
+        # Concat all segments
         if len(segment_files) == 1:
-            # Only one pitch value — just copy the segment as output
+            # Single pitch value — just copy the segment as output
             shutil.copy2(segment_files[0], output_path)
             return True, ""
 
@@ -1561,7 +1490,7 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 @bot.command(name="multipitch", aliases=["mp", "multi"])
 async def multipitch_command(ctx: commands.Context, *, args: str = ""):
-    """Apply multi-voice pitch shifting to an attached video using the pitch_multi_shifter binary.
+    """Apply multi-voice pitch shifting to an attached video using rubberband.
 
     Usage:
       g!multipitch <pitch_values>     — slash-separated semitone values
@@ -1630,17 +1559,10 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Failed to download your file: {e}")
             return
 
-        # Ensure pitch shifter binary is available
-        try:
-            program_path = await _ensure_pitch_shifter(tmpdir)
-        except FileNotFoundError as e:
-            await status_msg.edit(content=f"❌ {e}")
-            return
-
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
             None, _run_multipitch,
-            input_path, output_path, pitch_values, program_path
+            input_path, output_path, pitch_values
         )
 
         if not ok:
@@ -1705,7 +1627,7 @@ async def help_command(ctx: commands.Context):
     )
     embed.add_field(
         name="g!multipitch <pitches>  (aliases: mp, multi)",
-        value="Multi-voice pitch shift via external binary.\n"
+        value="Multi-voice pitch shift via rubberband.\n"
               "Slash-separated semitones: `g!multipitch 1/4/7`",
         inline=False,
     )
