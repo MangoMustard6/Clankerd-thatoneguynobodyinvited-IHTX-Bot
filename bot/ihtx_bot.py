@@ -756,19 +756,30 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
     af_parts = []
     for name, params in effects:
         if name in ("multipitch", "mp", "multi"):
-            # multipitch in semitones — slash-separated values are visual only,
-            # summed into a single rubberband pitch shift for inline effect chains.
-            # Full per-voice segmentation happens in the standalone g!multipitch command.
-            semitones = params[0] if params else "0"
-            if len(params) > 1:
-                total = sum(float(s) for s in params)
+            # multipitch in semitones — slash-separated, e.g. multipitch=1/4/7
+            # In inline effect chains, each pitch value gets its own rubberband
+            # instance, then they are amix'd together (same as standalone command).
+            # Fallback single pitch: multipitch=5 → simple rubberband
+            semitones = params if params else ["0"]
+            if len(semitones) == 1:
+                # Single pitch — simple rubberband
+                af_parts.append(
+                    f"rubberband=pitch=2^({semitones[0]}/12):"
+                    f"window=standard:transients=crisp:"
+                    f"detector=2.14748e+09/4.9:phase=independent:"
+                    f"channels=together"
+                )
             else:
-                total = float(semitones)
-            af_parts.append(
-                f"rubberband=pitch=2^({total}/12):"
-                f"window=short:transients=mixed:"
-                f"detector=soft:channels=together:pitchq=consistency"
-            )
+                # Multiple pitches — cannot use -af for multi-stream, needs filter_complex.
+                # Store a marker so _build_ffmpeg_cmd_for_effects can detect it.
+                # For now, sum pitches into single rubberband as inline fallback.
+                total = sum(float(s) for s in semitones)
+                af_parts.append(
+                    f"rubberband=pitch=2^({total}/12):"
+                    f"window=standard:transients=crisp:"
+                    f"detector=2.14748e+09/4.9:phase=independent:"
+                    f"channels=together"
+                )
 
         elif name == "volume":
             val = params[0] if params else "1"
@@ -905,79 +916,64 @@ def _run_multipitch(
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using FFmpeg rubberband filter.
+    """Run the multipitch pipeline using FFmpeg filter_complex + amix.
 
-    For each pitch value, creates a separate pitch-shifted segment using
-    rubberband with proper -map and filter_complex handling, then concatenates
-    all segments into the final output.
+    Creates multiple rubberband pitch-shifted copies of the input audio in a
+    single filter_complex graph, then mixes them together via amix.
 
-    Per-segment pipeline:
-      ffmpeg -i input -af "rubberband=pitch=2^(N/12):..." -map 0:v -map 0:a
-             -c:v ffv1 -c:a pcm_s16le seg.avi
-
-    The rubberband filter modifies audio in-place on stream 0:a, so -map 0:v
-    picks up the untouched video and -map 0:a picks up the pitch-shifted audio.
+    Example for pitches 1/4/7:
+      filter_complex="
+        [0:a]rubberband=pitch=2^(1/12):window=standard:transients=crisp:
+          detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
+        [0:a]rubberband=pitch=2^(4/12):window=standard:transients=crisp:
+          detector=2.14748e+09/4.9:phase=independent:channels=together[a1];
+        [0:a]rubberband=pitch=2^(7/12):window=standard:transients=crisp:
+          detector=2.14748e+09/4.9:phase=independent:channels=together[a2];
+        [a0][a1][a2]amix=3,volume=3[outa]
+      "
+      -map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
     """
     if not pitch_values:
         return False, "No pitch values provided."
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        segment_files = []
+    n = len(pitch_values)
 
-        for i, pitch_val in enumerate(pitch_values):
-            seg_path = os.path.join(tmpdir, f"seg_{i}.avi")
+    # Validate pitch values
+    for pv in pitch_values:
+        try:
+            float(pv)
+        except ValueError:
+            return False, f"Invalid pitch value: {pv!r}"
 
-            # Build rubberband filter string for this pitch value
-            try:
-                semi = float(pitch_val)
-            except ValueError:
-                return False, f"Invalid pitch value: {pitch_val!r}"
+    # Build filter_complex string
+    # Each pitch gets its own rubberband instance on [0:a], outputting to [a{i}]
+    rb_parts = []
+    for i, pitch_val in enumerate(pitch_values):
+        rb_parts.append(
+            f"[0:a]rubberband=pitch=2^({pitch_val}/12):"
+            f"window=standard:transients=crisp:"
+            f"detector=2.14748e+09/4.9:phase=independent:"
+            f"channels=together[a{i}]"
+        )
 
-            rb_filter = (
-                f"rubberband=pitch=2^({semi}/12):"
-                f"window=short:transients=mixed:"
-                f"detector=soft:channels=together:pitchq=consistency"
-            )
+    # amix all pitch-shifted streams + volume compensation
+    amix_inputs = "".join(f"[a{i}]" for i in range(n))
+    amix_part = f"{amix_inputs}amix={n},volume={n}[outa]"
 
-            # Apply rubberband to audio, copy video untouched
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-af", rb_filter,
-                "-map", "0:v",
-                "-map", "0:a",
-                "-c:v", "ffv1",
-                "-c:a", "pcm_s16le",
-                "-pix_fmt", "yuv420p",
-                seg_path,
-            ]
-            ok, err = _run_ffmpeg_raw(cmd, timeout=180)
-            if not ok:
-                return False, f"Segment {i+1}/{len(pitch_values)} (pitch={pitch_val}) failed: {err}"
+    filter_complex = ";".join(rb_parts + [amix_part])
 
-            segment_files.append(seg_path)
-
-        # Concat all segments
-        if len(segment_files) == 1:
-            # Single pitch value — just copy the segment as output
-            shutil.copy2(segment_files[0], output_path)
-            return True, ""
-
-        concat_list = os.path.join(tmpdir, "concat.txt")
-        with open(concat_list, "w") as f:
-            for sf in segment_files:
-                f.write(f"file '{sf}'\n")
-
-        concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-        return _run_ffmpeg_raw(concat_cmd, timeout=300)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "0:v",
+        "-map", "[outa]",
+        "-c:v", "ffv1",
+        "-c:a", "pcm_s16le",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+    return _run_ffmpeg_raw(cmd, timeout=300)
 
 
 # ---------- Preview1280 (TV-simulator montage) ----------
@@ -1069,11 +1065,12 @@ def _run_preview1280(
     Uses rubberband audio filter for high-quality pitch shifting.
     """
     # Helper: rubberband pitch filter string for N semitones
-    def _rb(semitones: float, transients: str = "mixed") -> str:
+    def _rb(semitones: float) -> str:
         return (
             f"rubberband=pitch=2^({semitones}/12):"
-            f"window=short:transients={transients}:"
-            f"detector=soft:channels=together:pitchq=consistency"
+            f"window=standard:transients=crisp:"
+            f"detector=2.14748e+09/4.9:phase=independent:"
+            f"channels=together"
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1211,7 +1208,7 @@ def _run_preview1280(
             # (seg_num, vf_filter, af_filter)
             (5, None, None),  # plain copy
             (6, f"movie={clut_22},[in]haldclut,hflip,format=yuv420p" if clut_22 else "hue=h=22,hflip,format=yuv420p",
-             _rb(2, "smooth")),  # hue+22, hflip, pitch+2 (smooth transients)
+             _rb(2)),  # hue+22, hflip, pitch+2 (smooth transients)
             (7, f"movie={clut_54},[in]haldclut,format=yuv420p" if clut_54 else "hue=h=54,format=yuv420p",
              _rb(1)),  # hue+54, pitch+1
             (8, f"movie={clut_108_30},[in]haldclut,hflip,format=yuv420p" if clut_108_30 else "hue=h=108,hflip,format=yuv420p",

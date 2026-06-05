@@ -162,19 +162,24 @@ Defaults: start=1.85s, duration=0.85s per segment.
 
 ## Multipitch
 
-The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using FFmpeg's `rubberband` audio filter. Each slash-separated semitone value creates a separate pitch-shifted segment (with `-map 0:v -map 0:a` to preserve video), then all segments are concatenated.
+The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using FFmpeg\'s `rubberband` audio filter with `filter_complex` + `amix`. Each slash-separated semitone value creates a separate pitch-shifted copy of the audio, and all copies are mixed together simultaneously.
 
-**Pipeline per pitch value:**
-1. Apply rubberband pitch shift: `rubberband=pitch=2^(N/12):window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency`
-2. Map video from input stream 0 untouched, map pitch-shifted audio from stream 0
+**Pipeline:**
+```
+[0:a]rubberband=pitch=2^(1/12):window=standard:transients=crisp:detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
+[0:a]rubberband=pitch=2^(4/12):...[a1];
+[0:a]rubberband=pitch=2^(7/12):...[a2];
+[a0][a1][a2]amix=3,volume=3[outa]
+-map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
+```
 
 **Usage:** `g!multipitch <semitones/separated/by/slash>`
 
-**Example:** `g!multipitch 1/4/7` — creates three segments with +1, +4, +7 semitone shifts, then concatenates them.
+**Example:** `g!multipitch 1/4/7` — all three pitches play simultaneously, mixed together.
 
 Negative values are supported: `g!multipitch -3/0/5`
 
-**In effect chains:** `multipitch=1/4/7` uses rubberband with summed pitch values for a single-pass shift. For full per-voice segmentation, use the standalone `g!multipitch` command.
+**In effect chains:** `multipitch=1/4/7` uses rubberband with summed pitch values for a single-pass shift (full amix requires `filter_complex` which is only in the standalone command).
 
 ## Configuration
 
