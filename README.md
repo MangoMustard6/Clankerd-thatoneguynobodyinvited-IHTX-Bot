@@ -39,6 +39,7 @@ python3 main.py
 | `g!ihtx [preset]` | `g!effect`, `g!destroy` | Apply a preset effect to an attached video/image |
 | `g!ihtx effect=value,... [rep] [dur]` | | Chain custom effects with repetitions and duration |
 | `g!preview1280 [start] [dur]` | `g!p1280` | 12-segment TV-simulator montage |
+| `g!multipitch <pitches>` | `g!mp`, `g!multi` | Multi-voice pitch shift (slash-separated semitones) |
 | `g!presets` | `g!effects`, `g!list` | List all available effect presets |
 | `g!ihtxhelp` | `g!bothelp` | Show help embed with full effect reference |
 
@@ -67,11 +68,11 @@ python3 main.py
 
 ## Custom Effect Chains
 
-Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semicolons.
+Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semicolons (multipitch uses slashes).
 
 **Usage:** `g!ihtx effect=value,effect=value,... [rep] [dur]`
 
-**Example:** `g!ihtx mirror=45,hue=90,pitch=5 3 10`
+**Example:** `g!ihtx mirror=45,hue=90,multipitch=5 3 10`
 
 ### Video Effects
 
@@ -129,7 +130,7 @@ Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semic
 
 | Effect | Syntax | Description |
 |--------|--------|-------------|
-| pitch | `pitch=<semitones>` | Shift pitch (e.g. 5 or -7). Multi: `pitch=5;-3;2` |
+| multipitch | `multipitch=<semitones>` | Multi-voice pitch shift. Slash-separated: `multipitch=1/4/7` |
 | volume | `volume=<val>` | Adjust volume multiplier |
 | vibrato | `vibrato=freq;depth` | Vibrato effect |
 | areverse | `areverse` | Reverse audio |
@@ -157,6 +158,25 @@ The `g!preview1280` command creates a 12-segment TV-simulator montage with:
 **Usage:** `g!preview1280 [start_offset] [segment_duration]`
 
 Defaults: start=1.85s, duration=0.85s per segment.
+
+## Multipitch
+
+The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using an external `pitch_multi_shifter` binary. Each slash-separated semitone value creates a separate pitch-shifted segment, then all segments are concatenated.
+
+**Pipeline per pitch value:**
+1. Extract audio at half sample rate via FFmpeg
+2. Pitch shift with the external binary (`--backend signalsmith --no-normalize`)
+3. Re-merge with video + bass boost (`asetrate=$sr,bass=g=2.5`)
+
+**Usage:** `g!multipitch <semitones/separated/by/slash>`
+
+**Example:** `g!multipitch 1/4/7` — creates three segments with +1, +4, +7 semitone shifts, then concatenates them.
+
+Negative values are supported: `g!multipitch -3/0/5`
+
+The binary is automatically downloaded from `https://file.garden/aTXso15ukD3mnuPI/multipitch` on first use and cached for subsequent runs.
+
+**In effect chains:** `multipitch=1/4/7` uses a simplified asetrate-based pitch shift (sum of all values). For full multi-voice processing, use the standalone `g!multipitch` command.
 
 ## Configuration
 
@@ -205,6 +225,7 @@ docker run -e DISCORD_TOKEN="your-token" ihtx-bot
 │   ├── ihtx_bot.py          # Main Discord bot (presets, effect chains, preview1280)
 │   ├── displacemaps/         # FFmpeg displacement assets
 │   │   └── tvsimulator.mov   # TV simulator displacement map
+│   └── program              # pitch_multi_shifter binary (auto-downloaded)
 │   ├── owner_ids.json
 │   ├── limits.json
 │   ├── tags.json

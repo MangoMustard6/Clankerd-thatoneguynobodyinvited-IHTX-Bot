@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import tempfile
+import shutil
 import subprocess
 import aiohttp
 import sys
@@ -67,7 +68,7 @@ def _is_owner_by_id(user_id: int) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "ihtxsync", "download", "dl"}
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "ihtxsync", "download", "dl"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -432,6 +433,7 @@ def _parse_effect_chain(effects_str: str) -> list[tuple[str, list[str]]]:
     """Parse 'effect=value,effect=value,...' into [(name, [params]), ...].
 
     Params are semicolon-separated sub-params within each effect.
+    For multipitch/mp/multi, params are slash-separated (e.g. multipitch=1/4/7).
     """
     effects = []
     for part in effects_str.split(","):
@@ -441,7 +443,11 @@ def _parse_effect_chain(effects_str: str) -> list[tuple[str, list[str]]]:
         if "=" in part:
             name, value = part.split("=", 1)
             name = name.strip().lower()
-            params = [p.strip() for p in value.split(";")]
+            # multipitch uses slash-separated pitch values
+            if name in ("multipitch", "mp", "multi"):
+                params = [p.strip() for p in value.split("/")]
+            else:
+                params = [p.strip() for p in value.split(";")]
         else:
             name = part.lower()
             params = []
@@ -730,8 +736,8 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
             scale_val = params[0] if params else "2"
             vf_parts.append(f"scale=iw*{scale_val}:ih*{scale_val},crop=iw/2:ih/2")
 
-        elif name in ("pitch", "volume", "vibrato", "areverse"):
-            # Audio effects — handled separately in _build_af_for_effects
+        elif name in ("multipitch", "mp", "multi", "volume", "vibrato", "areverse"):
+            # Audio effects — handled separately in _build_af_for_effects / _run_multipitch
             pass
 
         elif name == "lut":
@@ -749,10 +755,12 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
     """Build an -af audio filter string from parsed effects."""
     af_parts = []
     for name, params in effects:
-        if name == "pitch":
-            # pitch in semitones — use rubberband or asetrate
+        if name in ("multipitch", "mp", "multi"):
+            # multipitch in semitones — slash-separated, e.g. multipitch=1/4/7
+            # Fallback for inline effect chains: use simple asetrate pitch shift
+            # (full multi-voice pipeline runs via _run_multipitch for standalone command)
             semitones = params[0] if params else "0"
-            # Multiple semitones: pitch=5;-3;2 → add them
+            # Multiple semitones: multipitch=1/4/7 → sum them for single-pass fallback
             if len(params) > 1:
                 total = sum(float(s) for s in params)
             else:
@@ -882,6 +890,163 @@ def _run_effect_chain(
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             output_path
+        ]
+        return _run_ffmpeg_raw(concat_cmd, timeout=300)
+
+
+
+
+# ---------- Multipitch (external pitch_multi_shifter pipeline) ----------
+
+_PITCH_SHIFTER_PATH: str | None = None
+
+
+async def _ensure_pitch_shifter(workdir: str) -> str:
+    """Ensure the pitch_multi_shifter binary exists, downloading if needed.
+
+    Returns the path to the executable.
+    """
+    global _PITCH_SHIFTER_PATH
+
+    # If we already have a cached path and it exists, return it
+    if _PITCH_SHIFTER_PATH and os.path.isfile(_PITCH_SHIFTER_PATH):
+        return _PITCH_SHIFTER_PATH
+
+    # Check common locations
+    candidates = [
+        os.path.join(workdir, "program"),
+        "bot/program",
+        "/app/bot/program",
+        "program",
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            _PITCH_SHIFTER_PATH = c
+            return c
+
+    # Download it
+    dest = os.path.join(workdir, "program")
+    try:
+        await download_url(
+            "https://file.garden/aTXso15ukD3mnuPI/multipitch",
+            dest
+        )
+        os.chmod(dest, 0o755)
+        _PITCH_SHIFTER_PATH = dest
+        return dest
+    except Exception as e:
+        raise FileNotFoundError(
+            f"pitch_multi_shifter binary not found and could not be downloaded: {e}"
+        )
+
+
+def _run_multipitch(
+    input_path: str,
+    output_path: str,
+    pitch_values: list[str],
+    program_path: str,
+) -> tuple[bool, str]:
+    """Run the multipitch pipeline using the external pitch_multi_shifter binary.
+
+    Pipeline per pitch value:
+      1. Extract audio at half sample rate: ffmpeg -i input -af asetrate=$sr/2 half$i.wav
+      2. Pitch shift with external binary: ./program half$i.wav out$i.wav <pitch> --backend signalsmith --no-normalize
+      3. Re-merge with video + bass boost: ffmpeg -i input -i out$i.wav -af asetrate=$sr,bass=g=2.5 ...
+
+    After all segments, concat them into the final output.
+    """
+    if not pitch_values:
+        return False, "No pitch values provided."
+
+    # Get sample rate from input
+    sr_str = _ffprobe(input_path,
+                      "-select_streams", "a:0",
+                      "-show_entries", "stream=sample_rate",
+                      "-of", "default=nw=1:nk=1")
+    try:
+        sr = int(sr_str)
+    except (ValueError, TypeError):
+        sr = 44100  # fallback
+
+    half_sr = sr // 2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        segment_files = []
+
+        for i, pitch_val in enumerate(pitch_values):
+            half_wav = os.path.join(tmpdir, f"h{i}.wav")
+            out_wav = os.path.join(tmpdir, f"out{i}.wav")
+            seg_mp4 = os.path.join(tmpdir, f"a{i}.mp4")
+
+            # Step 1: Extract audio from input at half sample rate
+            extract_cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-af", f"asetrate={half_sr}",
+                "-vn",
+                half_wav,
+            ]
+            ok, err = _run_ffmpeg_raw(extract_cmd, timeout=120)
+            if not ok:
+                return False, f"Step 1 (extract audio) failed for pitch={pitch_val}: {err}"
+
+            # Step 2: Run pitch_multi_shifter
+            shift_cmd = [
+                program_path,
+                half_wav,
+                out_wav,
+                pitch_val,
+                "--backend", "signalsmith",
+                "--no-normalize",
+            ]
+            try:
+                result = subprocess.run(shift_cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode != 0:
+                    return False, f"Step 2 (pitch shifter) failed for pitch={pitch_val}: {result.stderr[-1500:]}"
+            except subprocess.TimeoutExpired:
+                return False, f"Step 2 (pitch shifter) timed out for pitch={pitch_val}"
+            except Exception as e:
+                return False, f"Step 2 (pitch shifter) error for pitch={pitch_val}: {e}"
+
+            # Step 3: Re-merge video with shifted audio + bass boost
+            merge_cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-i", out_wav,
+                "-af", f"asetrate={sr},bass=g=2.5",
+                "-map", "0:v",
+                "-map", "1:a",
+                "-c:v", "ffv1",
+                "-c:a", "pcm_s16le",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                seg_mp4,
+            ]
+            ok, err = _run_ffmpeg_raw(merge_cmd, timeout=180)
+            if not ok:
+                return False, f"Step 3 (merge) failed for pitch={pitch_val}: {err}"
+
+            segment_files.append(seg_mp4)
+
+        # Step 4: Concat all segments
+        if len(segment_files) == 1:
+            # Only one pitch value — just copy the segment as output
+            shutil.copy2(segment_files[0], output_path)
+            return True, ""
+
+        concat_list = os.path.join(tmpdir, "concat.txt")
+        with open(concat_list, "w") as f:
+            for sf in segment_files:
+                f.write(f"file '{sf}'\n")
+
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            output_path,
         ]
         return _run_ffmpeg_raw(concat_cmd, timeout=300)
 
@@ -1190,7 +1355,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset or effect. Available presets: {preset_list}\n"
-            f"Or chain effects: `g!ihtx hflip,hue=90,pitch=5 3 10`\n"
+            f"Or chain effects: `g!ihtx hflip,hue=90,multipitch=5 3 10`\n"
             f"Use `g!ihtxhelp` for full effect list."
         )
         return
@@ -1213,12 +1378,12 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
             f"**I HATE THE X — IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]` or `g!ihtx effect=value,...`.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom effects:** `g!ihtx hflip,hue=90,pitch=5 3 10`\n"
+            f"**Custom effects:** `g!ihtx hflip,hue=90,multipitch=5 3 10`\n"
             f"Use `g!ihtxhelp` for full effect list.\n\n"
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
             f"`g!ihtx glitch`\n"
-            f"`g!ihtx mirror=45,hue=90,pitch=5 3 10`"
+            f"`g!ihtx mirror=45,hue=90,multipitch=5 3 10`"
         )
         return
 
@@ -1376,6 +1541,112 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+
+
+@bot.command(name="multipitch", aliases=["mp", "multi"])
+async def multipitch_command(ctx: commands.Context, *, args: str = ""):
+    """Apply multi-voice pitch shifting to an attached video using the pitch_multi_shifter binary.
+
+    Usage:
+      g!multipitch <pitch_values>     — slash-separated semitone values
+      g!mp 1/4/7                      — aliases
+      g!multi -3/0/5                  — negative values supported
+
+    Example: g!multipitch 1/4/7
+    """
+    if not args:
+        await ctx.reply(
+            "**IHTX Multipitch**\n"
+            "Attach a video and use `g!multipitch <pitches>`.\n\n"
+            "Pitches are slash-separated semitone values.\n"
+            "Each pitch creates a separate shifted segment, then they are concatenated.\n\n"
+            "Example: `g!multipitch 1/4/7`\n"
+            "Aliases: `g!mp`, `g!multi`"
+        )
+        return
+
+    # Parse slash-separated pitch values
+    pitch_values = [v.strip() for v in args.split("/") if v.strip()]
+    if not pitch_values:
+        await ctx.reply("No pitch values provided. Use slash-separated values like `1/4/7`.")
+        return
+
+    # Look for attachments
+    attachment = None
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "Attach a video and use `g!multipitch <pitches>`.\n"
+            "Example: `g!multipitch 1/4/7`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"Multipitch requires a video file. Got `{suffix}`.")
+        return
+
+    pitch_str = "/".join(pitch_values)
+    status_msg = await ctx.reply(
+        f"⚙️ Applying **multipitch** ({pitch_str})... this may take a moment."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_multipitch.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        # Ensure pitch shifter binary is available
+        try:
+            program_path = await _ensure_pitch_shifter(tmpdir)
+        except FileNotFoundError as e:
+            await status_msg.edit(content=f"❌ {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_multipitch,
+            input_path, output_path, pitch_values, program_path
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ Multipitch failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
+            return
+
+        out_filename = f"multipitch_{pitch_str}_{Path(attachment.filename).stem}.mp4"
+        try:
+            await ctx.reply(
+                content=f"✅ **IHTX multipitch** ({pitch_str}) applied!",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
@@ -1408,12 +1679,18 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="g!ihtx effect=value,effect=value [rep] [dur]",
         value="Chain custom effects. Params use `=`, sub-params use `;`.\n"
-              "Example: `g!ihtx mirror=45,hue=90,pitch=5 3 10`",
+              "Example: `g!ihtx mirror=45,hue=90,multipitch=5 3 10`",
         inline=False,
     )
     embed.add_field(
         name="g!preview1280 [start] [dur]",
         value="12-segment TV-simulator montage.\nDefaults: start=1.85, dur=0.85",
+        inline=False,
+    )
+    embed.add_field(
+        name="g!multipitch <pitches>  (aliases: mp, multi)",
+        value="Multi-voice pitch shift via external binary.\n"
+              "Slash-separated semitones: `g!multipitch 1/4/7`",
         inline=False,
     )
     embed.add_field(
@@ -1436,7 +1713,7 @@ async def help_command(ctx: commands.Context):
         "scroll=h;v, pan=x;y, vreverse, watermark=<url>, ring[=<url>], "
         "miui, reddit, caption=<text>"
     )
-    audio_effects = "pitch=<semitones>, volume=<val>, vibrato=freq;depth, areverse"
+    audio_effects = "multipitch=<semitones> (slash-sep: 1/4/7), volume=<val>, vibrato=freq;depth, areverse"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
