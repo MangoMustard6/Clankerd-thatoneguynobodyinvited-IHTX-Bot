@@ -759,8 +759,9 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
             semitones = params if params else ["0"]
             if len(semitones) == 1:
                 # Single pitch — simple rubberband + bass boost
+                pitch_ratio = 2 ** (float(semitones[0]) / 12)
                 af_parts.append(
-                    f"rubberband=pitch=2^({semitones[0]}/12):"
+                    f"rubberband=pitch={pitch_ratio:.6f}:"
                     f"window=standard:transients=crisp:"
                     f"detector=2.14748e+09/4.9:phase=independent:"
                     f"channels=together,bass=g=2.5"
@@ -770,8 +771,9 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
                 # Store a marker so _build_ffmpeg_cmd_for_effects can detect it.
                 # For now, sum pitches into single rubberband as inline fallback.
                 total = sum(float(s) for s in semitones)
+                pitch_ratio = 2 ** (total / 12)
                 af_parts.append(
-                    f"rubberband=pitch=2^({total}/12):"
+                    f"rubberband=pitch={pitch_ratio:.6f}:"
                     f"window=standard:transients=crisp:"
                     f"detector=2.14748e+09/4.9:phase=independent:"
                     f"channels=together,bass=g=2.5"
@@ -919,13 +921,13 @@ def _run_multipitch(
 
     Example for pitches 1;4;7:
       filter_complex="
-        [0:a]rubberband=pitch=2^(1/12):window=standard:transients=crisp:
+        [0:a]rubberband=pitch=1.059463:window=standard:transients=crisp:
           detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
-        [0:a]rubberband=pitch=2^(4/12):window=standard:transients=crisp:
+        [0:a]rubberband=pitch=1.259921:window=standard:transients=crisp:
           detector=2.14748e+09/4.9:phase=independent:channels=together[a1];
-        [0:a]rubberband=pitch=2^(7/12):window=standard:transients=crisp:
+        [0:a]rubberband=pitch=1.498307:window=standard:transients=crisp:
           detector=2.14748e+09/4.9:phase=independent:channels=together[a2];
-        [a0][a1][a2]amix=3,volume=3[outa]
+        [a0][a1][a2]amix=3,volume=3,bass=g=2.5[outa]
       "
       -map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
     """
@@ -943,10 +945,12 @@ def _run_multipitch(
 
     # Build filter_complex string
     # Each pitch gets its own rubberband instance on [0:a], outputting to [a{i}]
+    # Pre-compute 2^(N/12) as a float to avoid FFmpeg expression parsing issues
     rb_parts = []
     for i, pitch_val in enumerate(pitch_values):
+        pitch_ratio = 2 ** (float(pitch_val) / 12)
         rb_parts.append(
-            f"[0:a]rubberband=pitch=2^({pitch_val}/12):"
+            f"[0:a]rubberband=pitch={pitch_ratio:.6f}:"
             f"window=standard:transients=crisp:"
             f"detector=2.14748e+09/4.9:phase=independent:"
             f"channels=together[a{i}]"
@@ -1061,9 +1065,11 @@ def _run_preview1280(
     Uses rubberband audio filter for high-quality pitch shifting.
     """
     # Helper: rubberband pitch filter string for N semitones
+    # Pre-compute 2^(N/12) as a float to avoid FFmpeg expression parsing issues
     def _rb(semitones: float) -> str:
+        pitch_ratio = 2 ** (semitones / 12)
         return (
-            f"rubberband=pitch=2^({semitones}/12):"
+            f"rubberband=pitch={pitch_ratio:.6f}:"
             f"window=standard:transients=crisp:"
             f"detector=2.14748e+09/4.9:phase=independent:"
             f"channels=together"
