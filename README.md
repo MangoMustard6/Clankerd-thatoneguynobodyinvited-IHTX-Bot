@@ -40,7 +40,7 @@ python3 main.py
 | `g!ihtx [preset]` | `g!effect`, `g!destroy` | Apply a preset effect to an attached video/image |
 | `g!ihtx effect=value,... [rep] [dur]` | | Chain custom effects with repetitions and duration |
 | `g!preview1280 [start] [dur]` | `g!p1280` | 12-segment TV-simulator montage |
-| `g!multipitch <pitches>` | `g!mp`, `g!multi` | Multi-voice pitch shift (slash-separated semitones) |
+| `g!multipitch <pitches>` | `g!mp`, `g!multi` | Multi-voice pitch shift (semicolon-separated semitones) |
 | `g!presets` | `g!effects`, `g!list` | List all available effect presets |
 | `g!ihtxhelp` | `g!bothelp` | Show help embed with full effect reference |
 
@@ -69,7 +69,7 @@ python3 main.py
 
 ## Custom Effect Chains
 
-Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semicolons (multipitch uses slashes).
+Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semicolons (including multipitch pitch values).
 
 **Usage:** `g!ihtx effect=value,effect=value,... [rep] [dur]`
 
@@ -131,7 +131,7 @@ Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semic
 
 | Effect | Syntax | Description |
 |--------|--------|-------------|
-| multipitch | `multipitch=<semitones>` | Multi-voice pitch shift. Slash-separated: `multipitch=1/4/7` |
+| multipitch | `multipitch=<semitones>` | Multi-voice pitch shift. Semicolon-separated: `multipitch=1;4;7` |
 | volume | `volume=<val>` | Adjust volume multiplier |
 | vibrato | `vibrato=freq;depth` | Vibrato effect |
 | areverse | `areverse` | Reverse audio |
@@ -162,24 +162,24 @@ Defaults: start=1.85s, duration=0.85s per segment.
 
 ## Multipitch
 
-The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using FFmpeg\'s `rubberband` audio filter with `filter_complex` + `amix`. Each slash-separated semitone value creates a separate pitch-shifted copy of the audio, and all copies are mixed together simultaneously.
+The `g!multipitch` command (aliases: `g!mp`, `g!multi`) applies multi-voice pitch shifting using FFmpeg\'s `rubberband` audio filter with `filter_complex` + `amix`. Each semicolon-separated semitone value creates a separate pitch-shifted copy of the audio, and all copies are mixed together simultaneously.
 
 **Pipeline:**
 ```
 [0:a]rubberband=pitch=2^(1/12):window=standard:transients=crisp:detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
 [0:a]rubberband=pitch=2^(4/12):...[a1];
 [0:a]rubberband=pitch=2^(7/12):...[a2];
-[a0][a1][a2]amix=3,volume=3[outa]
+[a0][a1][a2]amix=3,volume=3,bass=g=2.5[outa]
 -map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
 ```
 
-**Usage:** `g!multipitch <semitones/separated/by/slash>`
+**Usage:** `g!multipitch <semitones;separated;by;semicolon>`
 
-**Example:** `g!multipitch 1/4/7` — all three pitches play simultaneously, mixed together.
+**Example:** `g!multipitch 1;4;7` — all three pitches play simultaneously, mixed together.
 
-Negative values are supported: `g!multipitch -3/0/5`
+Negative values are supported: `g!multipitch -3;0;5`
 
-**In effect chains:** `multipitch=1/4/7` uses rubberband with summed pitch values for a single-pass shift (full amix requires `filter_complex` which is only in the standalone command).
+**In effect chains:** `multipitch=1;4;7` uses rubberband with summed pitch values for a single-pass shift (full amix requires `filter_complex` which is only in the standalone command).
 
 ## Configuration
 
