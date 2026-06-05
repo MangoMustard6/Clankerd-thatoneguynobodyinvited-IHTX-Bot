@@ -1158,7 +1158,7 @@ async def on_ready():
     print("------")
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
-        name="logos get destroyed | g!ihtx"
+        name="Meet the Sparkles! ✨👗 | Sparkles Magical Market Full Episode | Cartoons for Kids"
     ))
 
 
