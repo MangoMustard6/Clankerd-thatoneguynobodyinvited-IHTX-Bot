@@ -10,6 +10,7 @@ A Discord bot that applies destructive FFmpeg visual effects to videos and image
 - [FFmpeg](https://ffmpeg.org/) (required)
 - [ImageMagick](https://imagemagick.org/) (required for preview1280 and huehsv effect)
 - [sox](http://sox.sourceforge.net/) (optional, for advanced audio effects)
+- FFmpeg with rubberband filter support (required for preview1280 pitch shifting)
 
 ### Install
 
@@ -147,13 +148,13 @@ Use `g!ihtx` with comma-separated `effect=value` pairs. Sub-parameters use semic
 
 The `g!preview1280` command creates a 12-segment TV-simulator montage with:
 
-- Hue shifts using Hald CLUTs (45°, 180°, 22°, 120°)
+- Hue shifts using Hald CLUTs (54°, 180°, 22°, 108°+saturation boost)
 - Horizontal flips and mirror compositions
-- TV-simulator displacement mapping
-- Pitch variations per segment (+1, -2, +2, +3 semitones)
+- TV-simulator displacement mapping with contrast and hue adjustments
+- Pitch variations per segment via rubberband filter (+1, -2, +2, +3 semitones)
 - Final upscale to original video resolution
 
-**Requirements:** ImageMagick (`magick` command) and the `tvsimulator.mov` displacement map at `bot/displacemaps/tvsimulator.mov`.
+**Requirements:** ImageMagick (`magick` command), FFmpeg with `rubberband` filter support, and the `tvsimulator.mov` displacement map at `bot/displacemaps/tvsimulator.mov`.
 
 **Usage:** `g!preview1280 [start_offset] [segment_duration]`
 

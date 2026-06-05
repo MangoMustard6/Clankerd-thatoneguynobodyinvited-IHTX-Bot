@@ -1094,21 +1094,28 @@ async def _ensure_displacement_map(workdir: str) -> str:
 def _generate_hald_cluts(workdir: str) -> list[str]:
     """Generate Hald CLUT .ppm files for hue shifts using ImageMagick.
 
-    Returns paths to [hslhue_45.ppm, hslhue_180.ppm, hslhue_22.ppm, hslhue_120.ppm].
+    Returns paths to [hslhue_54.ppm, hslhue_180.ppm, hslhue_22.ppm, hslhue_108_30.ppm].
+    CLUT hue values use ImageMagick -modulate formula: hue_frac * 200 + 100 (or +200 for sat boost).
     """
+    # (filename, brightness, saturation, hue_mod_value)
+    # hue_mod_value = hue_fraction * 200 + 100
+    # For saturation-boosted CLUTs, saturation > 100 and hue_mod = hue_fraction * 200 + 200
     clut_specs = [
-        ("hslhue_45.ppm", 45),
-        ("hslhue_180.ppm", 180),
-        ("hslhue_22.ppm", 22),
-        ("hslhue_120.ppm", 120),
+        # hslhue_54: hue shift 54° → fraction 0.15, mod = 0.15*200+100 = 130
+        ("hslhue_54.ppm", 100, 100, 130),
+        # hslhue_180: hue shift 180° → fraction 0.5, mod = 0.5*200+100 = 200
+        ("hslhue_180.ppm", 100, 100, 200),
+        # hslhue_22: hue shift 22° → fraction 0.06, mod = 0.06*200+100 = 112
+        ("hslhue_22.ppm", 100, 100, 112),
+        # hslhue_108_30: hue shift 108° + saturation boost → fraction 0.3, mod = 0.3*200+200 = 260
+        ("hslhue_108_30.ppm", 100, 130, 260),
     ]
     paths = []
-    for filename, hue_deg in clut_specs:
+    for filename, brightness, saturation, hue_mod in clut_specs:
         path = os.path.join(workdir, filename)
-        mod_val = hue_deg / 1.8 + 100
         cmd = [
             "magick", "hald:4",
-            "-modulate", f"100,100,{mod_val}",
+            "-modulate", f"{brightness},{saturation},{hue_mod}",
             path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1130,7 +1137,16 @@ def _run_preview1280(
 
     This creates a 12-segment montage at 640x360, then scales to original size.
     Requires: ffmpeg, ImageMagick (magick), and the tvsimulator.mov displacement map.
+    Uses rubberband audio filter for high-quality pitch shifting.
     """
+    # Helper: rubberband pitch filter string for N semitones
+    def _rb(semitones: float, transients: str = "mixed") -> str:
+        return (
+            f"rubberband=pitch=2^({semitones}/12):"
+            f"window=short:transients={transients}:"
+            f"detector=soft:channels=together:pitchq=consistency"
+        )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         info = _ffprobe_video_info(input_path)
         w, h = info["width"], info["height"]
@@ -1141,10 +1157,10 @@ def _run_preview1280(
 
         # Generate Hald CLUTs
         cluts = _generate_hald_cluts(tmpdir)
-        clut_45 = cluts[0] if os.path.exists(cluts[0]) else None
+        clut_54 = cluts[0] if os.path.exists(cluts[0]) else None
         clut_180 = cluts[1] if os.path.exists(cluts[1]) else None
         clut_22 = cluts[2] if os.path.exists(cluts[2]) else None
-        clut_120 = cluts[3] if os.path.exists(cluts[3]) else None
+        clut_108_30 = cluts[3] if os.path.exists(cluts[3]) else None
 
         # Locate displacement map
         disp_map = None
@@ -1185,7 +1201,7 @@ def _run_preview1280(
         # Helper to build segment ffmpeg commands
         segments = []
 
-        # Segment 1: plain copy
+        # Segment 1: plain copy, duration t
         seg1 = os.path.join(tmpdir, "1.avi")
         segments.append(([
             "ffmpeg", "-y", "-i", avi0,
@@ -1193,21 +1209,21 @@ def _run_preview1280(
             seg1
         ], seg1))
 
-        # Segment 2: hue +45, pitch +1 semitone
+        # Segment 2: hue +54 (hslhue_54), pitch +1 semitone (rubberband)
         seg2 = os.path.join(tmpdir, "2.avi")
-        if clut_45:
+        if clut_54:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", f"movie={clut_45},[in]haldclut,format=yuv420p",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", f"movie={clut_54},[in]haldclut,format=yuv420p",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg2
             ], seg2))
         else:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", "hue=h=45",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", "hue=h=54",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg2
             ], seg2))
@@ -1226,7 +1242,7 @@ def _run_preview1280(
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0, "-stream_loop", "-1", "-i", disp_map,
                 "-filter_complex", fc,
-                "-af", "asetrate=44100*0.891,aresample=44100",
+                "-af", _rb(-2),
                 "-map", "[v]", "-map", "0:a",
                 "-pix_fmt", "yuv420p",
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
@@ -1237,26 +1253,26 @@ def _run_preview1280(
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
                 "-vf", "hue=h=180,hflip,crop=iw/2:ih:0:0,split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p",
-                "-af", "asetrate=44100*0.891,aresample=44100",
+                "-af", _rb(-2),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg3
             ], seg3))
 
-        # Segment 4: hue +45, pitch +1 semitone (same as seg2)
+        # Segment 4: hue +54 (hslhue_54), pitch +1 semitone (same as seg2)
         seg4 = os.path.join(tmpdir, "4.avi")
-        if clut_45:
+        if clut_54:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", f"movie={clut_45},[in]haldclut,format=yuv420p",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", f"movie={clut_54},[in]haldclut,format=yuv420p",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg4
             ], seg4))
         else:
             segments.append(([
                 "ffmpeg", "-y", "-i", avi0,
-                "-vf", "hue=h=45",
-                "-af", "asetrate=44100*1.059,aresample=44100",
+                "-vf", "hue=h=54",
+                "-af", _rb(1),
                 "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
                 seg4
             ], seg4))
@@ -1266,18 +1282,18 @@ def _run_preview1280(
             # (seg_num, vf_filter, af_filter)
             (5, None, None),  # plain copy
             (6, f"movie={clut_22},[in]haldclut,hflip,format=yuv420p" if clut_22 else "hue=h=22,hflip,format=yuv420p",
-             "asetrate=44100*1.122,aresample=44100"),  # hue+22, hflip, pitch+2
-            (7, f"movie={clut_45},[in]haldclut,format=yuv420p" if clut_45 else "hue=h=45,format=yuv420p",
-             "asetrate=44100*1.059,aresample=44100"),  # hue+45, pitch+1
-            (8, f"movie={clut_120},[in]haldclut,hflip,format=yuv420p" if clut_120 else "hue=h=120,hflip,format=yuv420p",
-             "asetrate=44100*1.189,aresample=44100"),  # hue+120, hflip, pitch+3
+             _rb(2, "smooth")),  # hue+22, hflip, pitch+2 (smooth transients)
+            (7, f"movie={clut_54},[in]haldclut,format=yuv420p" if clut_54 else "hue=h=54,format=yuv420p",
+             _rb(1)),  # hue+54, pitch+1
+            (8, f"movie={clut_108_30},[in]haldclut,hflip,format=yuv420p" if clut_108_30 else "hue=h=108,hflip,format=yuv420p",
+             _rb(3)),  # hue+108+sat30, hflip, pitch+3
             (9, f"movie={clut_180},[in]haldclut,format=yuv420p" if clut_180 else "hue=h=180,format=yuv420p",
-             "asetrate=44100*0.891,aresample=44100"),  # hue+180, pitch-2
+             _rb(-2)),  # hue+180, pitch-2
             (10, "hflip", None),  # just hflip
-            (11, f"movie={clut_45},[in]haldclut,format=yuv420p" if clut_45 else "hue=h=45,format=yuv420p",
-             "asetrate=44100*1.059,aresample=44100"),  # hue+45, pitch+1
-            (12, f"movie={clut_120},[in]haldclut,hflip,format=yuv420p" if clut_120 else "hue=h=120,hflip,format=yuv420p",
-             "asetrate=44100*1.189,aresample=44100"),  # hue+120, hflip, pitch+3
+            (11, f"movie={clut_54},[in]haldclut,format=yuv420p" if clut_54 else "hue=h=54,format=yuv420p",
+             _rb(1)),  # hue+54, pitch+1
+            (12, f"movie={clut_108_30},[in]haldclut,hflip,format=yuv420p" if clut_108_30 else "hue=h=108,hflip,format=yuv420p",
+             _rb(3)),  # hue+108+sat30, hflip, pitch+3
         ]
 
         for seg_num, vf, af in short_specs:
