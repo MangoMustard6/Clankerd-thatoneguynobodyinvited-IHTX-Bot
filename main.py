@@ -1,5 +1,23 @@
+"""
+IHTX Bot — entry point for `python3 main.py` or Replit workflow.
+
+Delegates to bot/ihtx_bot.py which contains the full Discord bot.
+"""
+
+import os
+import sys
+
 def main():
-    print("Hello from repl-nix-workspace!")
+    # Replit sets DISCORD_TOKEN as a secret / env var
+    token = os.environ.get("DISCORD_TOKEN")
+    if not token:
+        print("ERROR: DISCORD_TOKEN environment variable not set.", file=sys.stderr)
+        print("Set it via Replit Secrets or your shell before running.", file=sys.stderr)
+        sys.exit(1)
+
+    # Import and run the bot module
+    from bot import ihtx_bot
+    ihtx_bot.bot.run(token)
 
 
 if __name__ == "__main__":
