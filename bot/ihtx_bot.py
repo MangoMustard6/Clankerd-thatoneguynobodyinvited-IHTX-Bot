@@ -1462,7 +1462,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
             f"`g!ihtx glitch`\n"
-            f"`g!ihtx mirror=45,hue=90,multipitch=25;5;8.5 3 10`"
+            f"`g!ihtx 10 0.5 - mp4 default huehsv 0.5;mirror=45;multipitch=25;5;8.5`\n"
+            f"`g!ihtx 5 0.25 - mp4 default multipitch=1;2;3;4`"
         )
         return
 
