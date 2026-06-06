@@ -474,14 +474,258 @@ def _run_huehsv(
 
 
 
+# ---------- Pipe effects engine ----------
+
+def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
+    """Parse semicolon-separated pipe effects.
+
+    Each effect is: name=value or name value.
+    Params are semicolon-separated within each effect.
+    """
+    effects = []
+    for part in pipe_str.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        # Strip optional annotations like (magick)
+        part = re.sub(r"\s*\(magick\)\s*", "", part, flags=re.IGNORECASE)
+        if "=" in part:
+            name, value = part.split("=", 1)
+            name = name.strip().lower()
+            params = [p.strip() for p in value.split(";") if p.strip()]
+        else:
+            # Check if there's a space-separated value (e.g. "huehsv 0.5")
+            tokens = part.split(None, 1)
+            name = tokens[0].strip().lower()
+            params = []
+            if len(tokens) > 1:
+                params = [p.strip() for p in tokens[1].split(";") if p.strip()]
+        effects.append((name, params))
+    return effects
+
+
+def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
+    """Build a single FFmpeg -vf filter string for a pipe effect."""
+    if name == "hflip":
+        return "hflip"
+    if name == "vflip":
+        return "vflip"
+    if name == "invert":
+        return "negate"
+    if name == "grayscale":
+        return "colorchannelmixer=.299:.587:.114:0:.299:.587:.114:0:.299:.587:.114"
+    if name == "sepia":
+        return "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"
+    if name == "rotate":
+        angle = params[0] if params else "0"
+        return f"rotate={angle}/180*PI"
+    if name == "ccshue":
+        val = params[0] if params else "0"
+        return f"hue=h={val}"
+    if name == "brightness":
+        val = params[0] if params else "0"
+        return f"eq=brightness={val}"
+    if name == "contrast":
+        val = params[0] if params else "1"
+        return f"eq=contrast={val}"
+    if name == "saturation":
+        val = params[0] if params else "1"
+        return f"hue=s={val}"
+    if name == "swapuv":
+        return "swapuv"
+    if name == "mirror":
+        angle = params[0] if params else "0"
+        a_val = float(angle)
+        mirror_geq = "p(W*0.5-abs(X-W*0.5),Y)"
+        if a_val == 0:
+            return f"format=yuv444p,geq='{mirror_geq}',format=yuv420p"
+        a_plus_90 = a_val + 90
+        return (
+            f"format=yuv444p,"
+            f"rotate={a_plus_90}/180*PI:iw*2:ih*2,"
+            f"geq='{mirror_geq}',"
+            f"rotate=-{a_plus_90}/180*PI,"
+            f"crop=iw/2:ih/2,"
+            f"format=yuv420p"
+        )
+    if name == "zoom":
+        amount = params[0] if params else "1.1"
+        zoom_geq = f"p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})"
+        return (
+            f"format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
+            f"geq='{zoom_geq}',"
+            f"scale=iw:ih,crop=iw:ih,format=yuv420p"
+        )
+    if name in ("pinch&punch", "p&p", "pinchpunch"):
+        strength = params[0] if len(params) > 0 else "1"
+        radius = params[1] if len(params) > 1 else "0.5"
+        cx = params[2] if len(params) > 2 else "0.5"
+        cy = params[3] if len(params) > 3 else "0.5"
+        geq_expr = (
+            f"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),"
+            f"H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))"
+        )
+        return f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
+    if name == "swirl":
+        angle = params[0] if len(params) > 0 else "180"
+        radius = params[1] if len(params) > 1 else "0.5"
+        cx = params[2] if len(params) > 2 else "0.5"
+        cy = params[3] if len(params) > 3 else "0.5"
+        fallout = params[4] if len(params) > 4 else "quad"
+        lock = params[5] if len(params) > 5 else "false"
+        exp_str = "" if fallout == "linear" else "^2"
+        min_wh = "min(W,H)"
+        swirl_geq = (
+            f"p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),"
+            f"H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))"
+        )
+        if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
+            return f"format=yuv444p,scale=ih:ih,geq='{swirl_geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
+        return f"format=yuv444p,geq='{swirl_geq}',scale=iw:ih,format=yuv420p"
+    if name == "gm91deform":
+        deform_geq = (
+            "p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/1.22"
+            "+((Y-H/2)*(-0.136))+((0.047*W)*pow((Y-H/2)/(H/2),2))+(-W/40)"
+            ",(H/2)+((Y-H/2)/1.27)/lerp(1,sin((X/W)*PI),0.12)"
+            "-(((0.014)*H)*pow((X-W/2)/(W/2),2))+((X-W/2)*(0.12))-(1.2))"
+        )
+        return (
+            f"format=yuv444p,scale=360:360,setsar=1:1,rotate=0:iw*1.05:ih*1.05,"
+            f"geq='{deform_geq}',"
+            f"scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale=iw:ih,setsar=1,format=yuv420p"
+        )
+    if name == "realgm4":
+        return "curves=r='0/0 0.5/0.75 1/0':g='0/0 0.5/0.75 1/0':b='0/0 0.5/0.75 1/0',format=yuv420p"
+    if name == "invertrgb":
+        r_inv = params[0] if len(params) > 0 else "1"
+        g_inv = params[1] if len(params) > 1 else "0"
+        b_inv = params[2] if len(params) > 2 else "0"
+        r_curve = "0/1 1/0" if r_inv == "1" else "0/0 1/1"
+        g_curve = "0/1 1/0" if g_inv == "1" else "0/0 1/1"
+        b_curve = "0/1 1/0" if b_inv == "1" else "0/0 1/1"
+        return f"curves=r='{r_curve}':g='{g_curve}':b='{b_curve}'"
+    if name == "invlum":
+        return "curves=all='0/1 1/0'"
+    if name == "volume":
+        val = params[0] if params else "1"
+        return f"volume={val}"
+    if name == "vibrato":
+        freq = params[0] if len(params) > 0 else "5"
+        depth = params[1] if len(params) > 1 else "0.5"
+        return f"vibrato=f={freq}:d={depth}"
+    if name == "areverse":
+        return "areverse"
+    if name == "channelblend":
+        r = params[0] if len(params) > 0 else "r"
+        g = params[1] if len(params) > 1 else "g"
+        b = params[2] if len(params) > 2 else "b"
+        ch_map = {"r": "1:0:0", "g": "0:1:0", "b": "0:0:1"}
+        rr = ch_map.get(r, "1:0:0")
+        gg = ch_map.get(g, "0:1:0")
+        bb = ch_map.get(b, "0:0:1")
+        return (
+            f"colorchannelmixer=rr={rr.split(':')[0]}:rg={rr.split(':')[1]}:rb={rr.split(':')[2]}"
+            f":gr={gg.split(':')[0]}:gg={gg.split(':')[1]}:gb={gg.split(':')[2]}"
+            f":br={bb.split(':')[0]}:bg={bb.split(':')[1]}:bb={bb.split(':')[2]}"
+        )
+    return None
+
+
+def _apply_pipe_effects(
+    input_path: str,
+    output_path: str,
+    effects: list[tuple[str, list[str]]],
+) -> tuple[bool, str]:
+    """Apply pipe effects sequentially.
+
+    Each effect is applied to the output of the previous one.
+    Effects: huehsv (ImageMagick), multipitch (SoX), or FFmpeg filters.
+    """
+    if not effects:
+        # Just copy
+        ok, err = _run_ffmpeg_raw(["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path], timeout=60)
+        return ok, err
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        current = input_path
+        ffmpeg_vf_parts = []
+        ffmpeg_af_parts = []
+
+        for i, (name, params) in enumerate(effects):
+            is_last = (i == len(effects) - 1)
+
+            # ImageMagick effect
+            if name == "huehsv":
+                val = float(params[0]) if params else 0.5
+                if is_last:
+                    out = output_path
+                else:
+                    out = os.path.join(tmpdir, f"pipe_{i}.mp4")
+                ok, err = _run_huehsv(current, out, val)
+                if not ok:
+                    return False, err
+                current = out
+                continue
+
+            # SoX multipitch
+            if name in ("multipitch", "mp", "multi"):
+                if is_last:
+                    out = output_path
+                else:
+                    out = os.path.join(tmpdir, f"pipe_{i}.mp4")
+                ok, err = _run_multipitch(current, out, params)
+                if not ok:
+                    return False, err
+                current = out
+                continue
+
+            # FFmpeg video filter
+            vf = _build_ffmpeg_pipe_vf(name, params)
+            if vf:
+                ffmpeg_vf_parts.append(vf)
+                continue
+
+            # FFmpeg audio filter
+            af = _build_ffmpeg_pipe_vf(name, params)
+            if af and name in ("volume", "vibrato", "areverse"):
+                ffmpeg_af_parts.append(af)
+                continue
+
+            return False, f"Unknown pipe effect: {name}"
+
+        # Apply collected FFmpeg filters in one pass
+        if ffmpeg_vf_parts or ffmpeg_af_parts:
+            cmd = ["ffmpeg", "-y", "-i", current]
+            if ffmpeg_vf_parts:
+                cmd.extend(["-vf", ",".join(ffmpeg_vf_parts)])
+            if ffmpeg_af_parts:
+                cmd.extend(["-af", ",".join(ffmpeg_af_parts)])
+            cmd.extend([
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", output_path,
+            ])
+            ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+            if not ok:
+                return False, f"FFmpeg pipe filter failed: {err}"
+        else:
+            # No FFmpeg filters; if current is not output_path, copy
+            if current != output_path:
+                shutil.copyfile(current, output_path)
+
+    return True, ""
+
+
+# ---------- IHTX TagScript workflow ----------
+
 def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str, str] | None:
     """Parse TagScript-style IHTX custom syntax.
 
-    Syntax mirrors the icf+ tag:
-      <exports> <duration_expr> <no_trim> <export_file_format> <output_file_format> <...ffmpeg code>
+    Syntax:
+      <exports> <duration_expr> <no_trim> <export_file_format> <output_file_format> <pipe effects>
 
     Example:
-      10 0.483 - mp4 default -vf negate
+      10 0.483 - mp4 default huehsv 0.5;mirror=90;multipitch=1;-4;-23
     """
     parts = shlex.split(args)
     if len(parts) <= 5:
@@ -496,10 +740,10 @@ def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str, str] | 
     no_trim = parts[2]
     export_format = parts[3].lstrip(".") or "mp4"
     output_format = parts[4].lstrip(".") or "default"
-    ffmpeg_code = " ".join(parts[5:]).strip()
-    if not ffmpeg_code:
+    pipe_effects = " ".join(parts[5:]).strip()
+    if not pipe_effects:
         return None
-    return exports, duration_expr, no_trim, export_format, output_format, ffmpeg_code
+    return exports, duration_expr, no_trim, export_format, output_format, pipe_effects
 
 
 def _safe_awk_duration(duration_expr: str, vidlen: float) -> tuple[bool, str]:
@@ -529,14 +773,6 @@ def _safe_awk_duration(duration_expr: str, vidlen: float) -> tuple[bool, str]:
     return True, str(min(dur, MAX_DURATION))
 
 
-def _split_ffmpeg_code(ffmpeg_code: str) -> tuple[bool, list[str] | str]:
-    """Split raw FFmpeg code for subprocess execution while preserving quoted args."""
-    try:
-        return True, shlex.split(ffmpeg_code)
-    except ValueError as e:
-        return False, f"Invalid FFmpeg code quoting: {e}"
-
-
 def _concat_codec_args(output_format: str) -> list[str]:
     """Return final concat codec args matching the IHTX TagScript cases."""
     fmt = output_format.lower().lstrip(".")
@@ -561,14 +797,11 @@ def _run_ihtx_tagscript_workflow(
     no_trim: str,
     export_format: str,
     output_format: str,
-    ffmpeg_code: str,
+    pipe_effects_str: str,
 ) -> tuple[bool, str]:
-    """Run custom IHTX using the TagScript-style shell workflow.
+    """Run custom IHTX using the TagScript-style shell workflow with pipe effects.
 
-    This replaces the previous Python effect-chain repetition logic with the
-    original icf+/IHTX flow: create 0.mp4, repeatedly render raw FFmpeg code into
-    numbered exports, build concat.txt in forward/reverse order, then concat using
-    the format-specific codec case table.
+    Pipe effects are applied sequentially to each export.
     """
     if abs(exports) > MAX_REPETITIONS:
         exports = MAX_REPETITIONS if exports > 0 else -MAX_REPETITIONS
@@ -578,10 +811,9 @@ def _run_ihtx_tagscript_workflow(
     if output_format != "default" and not re.fullmatch(r"[A-Za-z0-9]+", output_format):
         return False, "Output file format must be alphanumeric or `default`."
 
-    split_ok, raw_args_or_error = _split_ffmpeg_code(ffmpeg_code)
-    if not split_ok:
-        return False, str(raw_args_or_error)
-    raw_args = list(raw_args_or_error)
+    effects = _parse_pipe_effects(pipe_effects_str)
+    if not effects:
+        return False, "No pipe effects provided."
 
     vidlen = _ffprobe_duration(input_path)
     if vidlen <= 0:
@@ -620,15 +852,7 @@ def _run_ihtx_tagscript_workflow(
         previous = base
         for i in range(1, total_exports + 2):
             current = os.path.join(tmpdir, f"{i}.{export_format}")
-            cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y"]
-            if not no_trim_enabled:
-                cmd.extend(["-stream_loop", "1"])
-            cmd.extend(["-i", previous])
-            cmd.extend(raw_args)
-            if not no_trim_enabled:
-                cmd.extend(["-t", dur])
-            cmd.extend(["-movflags", "+faststart", current])
-            ok, err = _run_ffmpeg_raw(cmd, timeout=300)
+            ok, err = _apply_pipe_effects(previous, current, effects)
             if not ok:
                 return False, f"Export {i} failed: {err}"
             previous = current
@@ -1193,7 +1417,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
     Usage:
       g!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
-      g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <ffmpeg code>   — custom TagScript workflow
+      g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>   — custom TagScript workflow
     """
     # Parse arguments: preset name or TagScript-style custom icf+ workflow.
     parts = args.split()
@@ -1208,8 +1432,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset or invalid custom IHTX syntax. Available presets: {preset_list}\n"
-            f"Custom syntax: `g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <ffmpeg code>`\n"
-            f"Example: `g!ihtx 10 0.483 - mp4 default -vf negate`\n"
+            f"Custom syntax: `g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>`\n"
+            f"Example: `g!ihtx 10 0.483 - mp4 default huehsv 0.5;mirror=90;multipitch=1;-4;-23`\n"
             f"Use `g!ihtxhelp` for full usage."
         )
         return
@@ -1233,7 +1457,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             f"**I HATE THE X — IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]` or the custom IHTX syntax.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom IHTX:** `g!ihtx 10 0.483 - mp4 default -vf negate`\n"
+            f"**Custom IHTX:** `g!ihtx 10 0.483 - mp4 default huehsv 0.5;mirror=90;multipitch=1;-4;-23`\n"
             f"Use `g!ihtxhelp` for full usage.\n\n"
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
@@ -1279,13 +1503,13 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             if not is_video:
                 await status_msg.edit(content="❌ Custom IHTX workflow requires video input (not images/GIFs).")
                 return
-            exports, duration_expr, no_trim, export_format, output_format, ffmpeg_code = custom_args
+            exports, duration_expr, no_trim, export_format, output_format, pipe_effects = custom_args
             output_ext = suffix if output_format == "default" else f".{output_format.lstrip('.')}"
             output_path = os.path.join(tmpdir, f"output{output_ext}")
             ok, err = await loop.run_in_executor(
                 None, _run_ihtx_tagscript_workflow,
                 input_path, output_path, exports, duration_expr, no_trim,
-                export_format, output_format, ffmpeg_code
+                export_format, output_format, pipe_effects
             )
 
         if not ok:
