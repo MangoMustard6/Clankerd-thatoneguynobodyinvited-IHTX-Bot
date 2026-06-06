@@ -762,22 +762,29 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]]) -> str | None:
                 pitch_ratio = 2 ** (float(semitones[0]) / 12)
                 af_parts.append(
                     f"rubberband=pitch={pitch_ratio:.6f}:"
-                    f"window=standard:transients=crisp:"
-                    f"detector=2.14748e+09/4.9:phase=independent:"
-                    f"channels=together,bass=g=2.5"
+                    f"window=short:transients=smooth:"
+                    f"channels=together:pitchq=consistency,"
+                    f"bass=g=2.5"
                 )
             else:
-                # Multiple pitches — cannot use -af for multi-stream, needs filter_complex.
-                # Store a marker so _build_ffmpeg_cmd_for_effects can detect it.
-                # For now, sum pitches into single rubberband as inline fallback.
-                total = sum(float(s) for s in semitones)
-                pitch_ratio = 2 ** (total / 12)
-                af_parts.append(
-                    f"rubberband=pitch={pitch_ratio:.6f}:"
-                    f"window=standard:transients=crisp:"
-                    f"detector=2.14748e+09/4.9:phase=independent:"
-                    f"channels=together,bass=g=2.5"
-                )
+                # Multiple pitches — asplit + rubberband per split + amix + bass boost
+                n = len(semitones)
+                # asplit
+                split_outputs = "".join(f"[{i+1}]" for i in range(n))
+                asplit = f"asplit={n}{split_outputs}"
+                # rubberband per split
+                rb_parts = []
+                for i, s in enumerate(semitones):
+                    pitch_ratio = 2 ** (float(s) / 12)
+                    rb_parts.append(
+                        f"[{i+1}]rubberband=pitch={pitch_ratio:.6f}:"
+                        f"window=short:transients=smooth:"
+                        f"channels=together:pitchq=consistency[0{i+1}]"
+                    )
+                # amix + bass
+                amix_inputs = "".join(f"[0{i+1}]" for i in range(n))
+                amix = f"{amix_inputs}amix={n}:normalize=0,bass=g=2.5"
+                af_parts.append(";".join([asplit] + rb_parts + [amix]))
 
         elif name == "volume":
             val = params[0] if params else "1"
@@ -914,22 +921,18 @@ def _run_multipitch(
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using FFmpeg filter_complex + amix.
+    """Run the multipitch pipeline using FFmpeg -af with asplit + rubberband + amix.
 
-    Creates multiple rubberband pitch-shifted copies of the input audio in a
-    single filter_complex graph, then mixes them together via amix.
+    Splits the audio into N copies via asplit, applies rubberband pitch shifting
+    to each copy, then mixes them together via amix with normalize=0 and bass boost.
 
     Example for pitches 1;4;7:
-      filter_complex="
-        [0:a]rubberband=pitch=1.059463:window=standard:transients=crisp:
-          detector=2.14748e+09/4.9:phase=independent:channels=together[a0];
-        [0:a]rubberband=pitch=1.259921:window=standard:transients=crisp:
-          detector=2.14748e+09/4.9:phase=independent:channels=together[a1];
-        [0:a]rubberband=pitch=1.498307:window=standard:transients=crisp:
-          detector=2.14748e+09/4.9:phase=independent:channels=together[a2];
-        [a0][a1][a2]amix=3,volume=3,bass=g=2.5[outa]
-      "
-      -map 0:v -map "[outa]" -c:v ffv1 -c:a pcm_s16le
+      -af "asplit=3[1][2][3];
+           [1]rubberband=pitch=1.059463:window=short:transients=smooth:channels=together:pitchq=consistency[01];
+           [2]rubberband=pitch=1.259921:window=short:transients=smooth:channels=together:pitchq=consistency[02];
+           [3]rubberband=pitch=1.498307:window=short:transients=smooth:channels=together:pitchq=consistency[03];
+           [01][02][03]amix=3:normalize=0,bass=g=2.5"
+      -c:v ffv1 -c:a pcm_s16le
     """
     if not pitch_values:
         return False, "No pitch values provided."
@@ -943,38 +946,42 @@ def _run_multipitch(
         except ValueError:
             return False, f"Invalid pitch value: {pv!r}"
 
-    # Build filter_complex string
-    # Each pitch gets its own rubberband instance on [0:a], outputting to [a{i}]
-    # Pre-compute 2^(N/12) as a float to avoid FFmpeg expression parsing issues
+    # Build -af string:
+    # asplit=N -> N output pads numbered 1..N
+    # Each split -> rubberband pitch shift -> output pad numbered 01..0N
+    # All outputs -> amix=N:normalize=0,bass=g=2.5
+    # Pre-compute 2^(N/12) as float to avoid FFmpeg expression parsing issues
+
+    # asplit part
+    split_outputs = "".join(f"[{i+1}]" for i in range(n))
+    asplit = f"asplit={n}{split_outputs}"
+
+    # rubberband parts
     rb_parts = []
     for i, pitch_val in enumerate(pitch_values):
         pitch_ratio = 2 ** (float(pitch_val) / 12)
         rb_parts.append(
-            f"[0:a]rubberband=pitch={pitch_ratio:.6f}:"
-            f"window=standard:transients=crisp:"
-            f"detector=2.14748e+09/4.9:phase=independent:"
-            f"channels=together[a{i}]"
+            f"[{i+1}]rubberband=pitch={pitch_ratio:.6f}:"
+            f"window=short:transients=smooth:"
+            f"channels=together:pitchq=consistency[0{i+1}]"
         )
 
-    # amix all pitch-shifted streams + volume compensation + bass boost
-    amix_inputs = "".join(f"[a{i}]" for i in range(n))
-    amix_part = f"{amix_inputs}amix={n},volume={n},bass=g=2.5[outa]"
+    # amix part
+    amix_inputs = "".join(f"[0{i+1}]" for i in range(n))
+    amix = f"{amix_inputs}amix={n}:normalize=0,bass=g=2.5"
 
-    filter_complex = ";".join(rb_parts + [amix_part])
+    af_str = ";".join([asplit] + rb_parts + [amix])
 
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
-        "-filter_complex", filter_complex,
-        "-map", "0:v",
-        "-map", "[outa]",
+        "-af", af_str,
         "-c:v", "ffv1",
         "-c:a", "pcm_s16le",
         "-pix_fmt", "yuv420p",
         output_path,
     ]
     return _run_ffmpeg_raw(cmd, timeout=300)
-
 
 # ---------- Preview1280 (TV-simulator montage) ----------
 
@@ -1066,13 +1073,12 @@ def _run_preview1280(
     """
     # Helper: rubberband pitch filter string for N semitones
     # Pre-compute 2^(N/12) as a float to avoid FFmpeg expression parsing issues
-    def _rb(semitones: float) -> str:
+    def _rb(semitones: float, transients: str = "mixed") -> str:
         pitch_ratio = 2 ** (semitones / 12)
         return (
             f"rubberband=pitch={pitch_ratio:.6f}:"
-            f"window=standard:transients=crisp:"
-            f"detector=2.14748e+09/4.9:phase=independent:"
-            f"channels=together"
+            f"window=short:transients={transients}:"
+            f"detector=soft:channels=together:pitchq=consistency"
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1210,7 +1216,7 @@ def _run_preview1280(
             # (seg_num, vf_filter, af_filter)
             (5, None, None),  # plain copy
             (6, f"movie={clut_22},[in]haldclut,hflip,format=yuv420p" if clut_22 else "hue=h=22,hflip,format=yuv420p",
-             _rb(2)),  # hue+22, hflip, pitch+2 (smooth transients)
+             _rb(2, "smooth")),  # hue+22, hflip, pitch+2 (smooth transients)
             (7, f"movie={clut_54},[in]haldclut,format=yuv420p" if clut_54 else "hue=h=54,format=yuv420p",
              _rb(1)),  # hue+54, pitch+1
             (8, f"movie={clut_108_30},[in]haldclut,hflip,format=yuv420p" if clut_108_30 else "hue=h=108,hflip,format=yuv420p",
