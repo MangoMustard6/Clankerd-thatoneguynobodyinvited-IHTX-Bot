@@ -10,6 +10,7 @@ ImageMagick/sox/etc. depending on advanced effects.
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 import asyncio
 import json
 import math
@@ -519,6 +520,11 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
             deg = params[0] if params else "0"
             vf_parts.append(f"hue=h={deg}")
 
+        elif name == "ccshue":
+            # FFmpeg hue=h=value directly (no 1.8 multiplier, unlike huehsv)
+            val = params[0] if params else "0"
+            vf_parts.append(f"hue=h={val}")
+
         elif name == "brightness":
             val = params[0] if params else "0"
             vf_parts.append(f"eq=brightness={val}")
@@ -559,6 +565,19 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
 
         elif name == "fisheye":
             # fisheye=strength;radius;cx;cy
+            strength = params[0] if len(params) > 0 else "1"
+            radius = params[1] if len(params) > 1 else "0.5"
+            cx = params[2] if len(params) > 2 else "0.5"
+            cy = params[3] if len(params) > 3 else "0.5"
+            vf_parts.append(
+                f'format=yuv444p,geq='
+                f'"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),'
+                f'H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))",'
+                f'scale=iw:ih,format=yuv420p'
+            )
+
+        elif name in ("pinch&punch", "p&p", "pinchpunch"):
+            # pinch&punch / p&p =strength;radius;cx;cy — geq fisheye (same formula as fisheye)
             strength = params[0] if len(params) > 0 else "1"
             radius = params[1] if len(params) > 1 else "0.5"
             cx = params[2] if len(params) > 2 else "0.5"
@@ -636,15 +655,21 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
             vf_parts.append(f"scale=iw*{scale_val}:ih*{scale_val},crop=iw/2:ih/2")
 
         elif name == "mirror":
+            # Mirror fold via frei0r mirr0r: rotate+mirr0r+rotate+crop
             angle = params[0] if params else "0"
-            # Mirror fold: flip one half over at the given angle
+            # Compute (angle+90) for the rotation
+            a_plus_90 = float(angle) + 90
             if float(angle) == 0:
+                # Simple horizontal mirror for angle=0
                 vf_parts.append("split[l][r];[r]hflip[rf];[l][rf]hstack")
             else:
-                rad = float(angle) * math.pi / 180
+                # rotate=(angle+90)/180*PI:iw*2:ih*2,scroll=0:0:0.5,frei0r=mirr0r:0.5,rotate=-(angle+90)/180*PI,crop=iw/2:ih/2
                 vf_parts.append(
-                    f"split[l][r];[r]hflip,rotate={angle}*PI/180:ow=iw:(oh*2-ih)/2[rf];"
-                    f"[l][rf]overlay"
+                    f"rotate={a_plus_90}/180*PI:iw*2:ih*2,"
+                    f"scroll=0:0:0.5,"
+                    f"frei0r=mirr0r:0.5,"
+                    f"rotate=-{a_plus_90}/180*PI,"
+                    f"crop=iw/2:ih/2"
                 )
 
         elif name == "tile":
@@ -1348,15 +1373,24 @@ def _run_preview1280(
 async def on_ready():
     print(f"IHTX Bot online as {bot.user} (ID: {bot.user.id})")
     print("------")
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
         name="Meet the Sparkles! ✨👗 | Sparkles Magical Market Full Episode | Cartoons for Kids"
     ))
 
 
-@bot.command(name="ihtx", aliases=["effect", "destroy"])
+@bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
+@app_commands.describe(args="Preset name or effect chain (e.g. chaos, hflip,hue=90,multipitch=25;5;8.5)")
 async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
-    """Apply an IHTX FFmpeg effect to an attached video or image.
+    """HEAVY COMMAND: replicates ihtx from FFmpeg.
+
+    Apply an IHTX FFmpeg effect to an attached video or image.
 
     Usage:
       g!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
@@ -1480,7 +1514,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
-@bot.command(name="preview1280", aliases=["p1280"])
+@bot.hybrid_command(name="preview1280", aliases=["p1280"], description="Create a 12-segment TV-simulator preview montage")
+@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)")
 async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
     """Create a 12-segment TV-simulator preview montage from an attached video.
 
@@ -1570,7 +1605,8 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 
 
-@bot.command(name="multipitch", aliases=["mp", "multi"])
+@bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via SoX")
+@app_commands.describe(args="Semicolon-separated semitone values (e.g. 25;5;8.5)")
 async def multipitch_command(ctx: commands.Context, *, args: str = ""):
     """Apply multi-voice pitch shifting to an attached video using SoX pitch.
 
@@ -1667,7 +1703,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
-@bot.command(name="presets", aliases=["effects", "list"])
+@bot.hybrid_command(name="presets", aliases=["effects", "list"], description="List all available IHTX presets")
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
     lines = [f"`{name}` — {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS)]
@@ -1685,7 +1721,7 @@ async def presets_command(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
-@bot.command(name="ihtxhelp", aliases=["bothelp"])
+@bot.hybrid_command(name="ihtxhelp", aliases=["bothelp"], description="Show IHTX Bot help and effect list")
 async def help_command(ctx: commands.Context):
     embed = discord.Embed(
         title="IHTX Bot — Help",
@@ -1722,12 +1758,14 @@ async def help_command(ctx: commands.Context):
     # Effect reference
     video_effects = (
         "hflip, vflip, invert, invlum, invertrgb=r;g;b, grayscale, sepia, "
-        "rotate=<deg>, hue=<deg>, ffmpeghue=<deg>, brightness=<val>, "
+        "rotate=<deg>, hue=<deg>, huehsv=<val> (magick-style), ccshue=<val> (FFmpeg hue=h=), "
+        "ffmpeghue=<deg>, brightness=<val>, "
         "contrast=<val>, saturation=<val>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "fisheye=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lock, "
-        "wave=hs;hf;ha;hp;vs;vf;va;vp, zoom=<scale>, mirror=<angle>, "
+        "fisheye=strength;radius;cx;cy, pinch&punch|p&p=strength;radius;cx;cy, "
+        "swirl=angle;radius;cx;cy;fallout;lock, "
+        "wave=hs;hf;ha;hp;vs;vf;va;vp, zoom=<scale>, mirror=<degrees>, "
         "tile=x;y, polar, depolar, orb, deorb, gm91deform"
     )
     transform_effects = (
