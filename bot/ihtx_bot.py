@@ -497,27 +497,20 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
             vf_parts.append(f"curves=r='{r_curve}':g='{g_curve}':b='{b_curve}'")
 
         elif name == "grayscale":
-            vf_parts.append("hue=s=0")
+            # Grayscale via luminance-preserving channel mix (sepia mode without tint)
+            vf_parts.append("colorchannelmixer=.299:.587:.114:0:.299:.587:.114:0:.299:.587:.114")
 
         elif name == "sepia":
             vf_parts.append("colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131")
 
         elif name == "rotate":
             angle = params[0] if params else "0"
-            vf_parts.append(f"rotate={angle}*PI/180")
-
-        elif name == "hue":
-            deg = params[0] if params else "0"
-            vf_parts.append(f"hue=h={deg}")
+            vf_parts.append(f"rotate={angle}/180*PI")
 
         elif name == "huehsv":
             # Use FFmpeg hue filter with h parameter mapped from magick-style
             val = params[0] if params else "0"
             deg = float(val) * 1.8 if val else 0
-            vf_parts.append(f"hue=h={deg}")
-
-        elif name == "ffmpeghue":
-            deg = params[0] if params else "0"
             vf_parts.append(f"hue=h={deg}")
 
         elif name == "ccshue":
@@ -535,7 +528,7 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
 
         elif name == "saturation":
             val = params[0] if params else "1"
-            vf_parts.append(f"eq=saturation={val}")
+            vf_parts.append(f"hue=s={val}")
 
         elif name == "channelblend":
             # channelblend=r;g;b — swap/mix RGB channels
@@ -556,37 +549,29 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
             vf_parts.append("swapuv")
 
         elif name == "gm4":
-            # Selective colour boost (blacks/whites)
-            vf_parts.append("eq=contrast=1.4:brightness=0.02:saturation=1.3,curves=preset=lighter")
+            # GM4: selective colour isolation via split+alphamerge+overlay
+            # Requires filter_complex — flag it for special handling
+            vf_parts.append("GM4_COMPLEX")
 
         elif name == "realgm4":
-            # Solarise via curves inversion
-            vf_parts.append("curves=all='0/0 0.5/1 1/0'")
-
-        elif name == "fisheye":
-            # fisheye=strength;radius;cx;cy
-            strength = params[0] if len(params) > 0 else "1"
-            radius = params[1] if len(params) > 1 else "0.5"
-            cx = params[2] if len(params) > 2 else "0.5"
-            cy = params[3] if len(params) > 3 else "0.5"
-            vf_parts.append(
-                f'format=yuv444p,geq='
-                f'"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),'
-                f'H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))",'
-                f'scale=iw:ih,format=yuv420p'
-            )
+            # Real GM4: solarise via per-channel curves with midtone boost
+            vf_parts.append("curves=r='0/0 0.5/0.75 1/0':g='0/0 0.5/0.75 1/0':b='0/0 0.5/0.75 1/0',format=yuv420p")
 
         elif name in ("pinch&punch", "p&p", "pinchpunch"):
-            # pinch&punch / p&p =strength;radius;cx;cy — geq fisheye (same formula as fisheye)
+            # pinch&punch / p&p =strength;radius;cx;cy — geq fisheye distortion
+            # Commas inside geq p(x,y) must be escaped as \, for FFmpeg's filter parser
             strength = params[0] if len(params) > 0 else "1"
             radius = params[1] if len(params) > 1 else "0.5"
             cx = params[2] if len(params) > 2 else "0.5"
             cy = params[3] if len(params) > 3 else "0.5"
+            geq_expr = (
+                f'p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),'
+                f'H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))'
+            )
+            # Escape commas inside geq expression for FFmpeg filter parser: , -> \,
+            geq_escaped = geq_expr.replace(',', '\\,')
             vf_parts.append(
-                f'format=yuv444p,geq='
-                f'"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),'
-                f'H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))",'
-                f'scale=iw:ih,format=yuv420p'
+                f'format=yuv444p,geq="{geq_escaped}",scale=iw:ih,format=yuv420p'
             )
 
         elif name == "swirl":
@@ -613,46 +598,14 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
                     f'H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))",'
                     f'scale=iw:ih,format=yuv420p'
                 )
-
-        elif name == "wave":
-            # wave=hspeed;hfreq;hampli;hphase;vspeed;vfreq;vampli;vphase [separate] [noclip]
-            hs = params[0] if len(params) > 0 else "1"
-            hf = params[1] if len(params) > 1 else "10"
-            ha = params[2] if len(params) > 2 else "15"
-            hp = params[3] if len(params) > 3 else "0"
-            vs = params[4] if len(params) > 4 else "0"
-            vf_val = params[5] if len(params) > 5 else "10"
-            va = params[6] if len(params) > 6 else "15"
-            vp = params[7] if len(params) > 7 else "0"
-            separate = params[8].lower() if len(params) > 8 else "false"
-            noclip = params[9].lower() if len(params) > 9 else "false"
-
-            separate_b = separate in ("1", "true", "t", "y", "yes", "+", "on")
-            noclip_b = noclip in ("1", "true", "t", "y", "yes", "+", "on")
-
-            prefix = "drawbox=t=1," if not noclip_b else ""
-            if separate_b:
-                h_wave = (
-                    f'geq="p(X\\,Y-((sin((T*5*{hs}+({hp}*15))+(X/W)*(PI*{hf})))*(-15*{ha}))))"'
-                )
-                v_wave = (
-                    f'geq="p(X-((sin((T*5*{vs}+({vp}*15))+(Y/H)*(PI*{vf_val})))*(-15*{va}))\\,Y)"'
-                )
-                vf_parts.append(
-                    f'{prefix}format=yuv444p,scale=640:640,{h_wave},{v_wave},scale={w}:{h},setsar=1:1,format=yuv420p'
-                )
-            else:
-                combined = (
-                    f'geq="p(X-((sin((T*5*{vs}+({vp}*15))+(Y/H)*(PI*{vf_val})))*(-15*{va})),'
-                    f'Y-((sin((T*5*{hs}+({hp}*15))+(X/W)*(PI*{hf})))*(-15*{ha})))"'
-                )
-                vf_parts.append(
-                    f'{prefix}format=yuv444p,scale=640:640,{combined},scale={w}:{h},setsar=1:1,format=yuv420p'
-                )
-
         elif name == "zoom":
-            scale_val = params[0] if params else "2"
-            vf_parts.append(f"scale=iw*{scale_val}:ih*{scale_val},crop=iw/2:ih/2")
+            # Zoom via geq pixel-remap with rotation
+            amount = params[0] if params else "1.1"
+            vf_parts.append(
+                f'format=yuv444p,rotate=0:iw*1.1:ih*1.1,'
+                f'geq="p((W/2)+(X-(W/2))/{amount}\\,(H/2)+(Y-(H/2))/{amount})",'
+                f'scale=iw:ih,crop={w}:{h},format=yuv420p'
+            )
 
         elif name == "mirror":
             # Mirror fold via frei0r mirr0r: rotate+mirr0r+rotate+crop
@@ -672,34 +625,6 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
                     f"crop=iw/2:ih/2"
                 )
 
-        elif name == "tile":
-            tx = params[0] if len(params) > 0 else "2"
-            ty = params[1] if len(params) > 1 else "2"
-            vf_parts.append(f"tile={tx}x{ty}")
-
-        elif name == "polar":
-            vf_parts.append("geq=p(X+W/2-Y+H/2:sin(2*PI*X/W)*H/2+H/2),format=yuv420p")
-
-        elif name == "depolar":
-            vf_parts.append("geq=p(W/2+sin(2*PI*Y/H)*(H/2):cos(2*PI*Y/H)*(W/2)),format=yuv420p")
-
-        elif name == "orb":
-            # Fisheye orb
-            vf_parts.append(
-                'format=yuv444p,geq='
-                '"p(W/2+(X-W/2)/sqrt(1-4*((X-W/2)/W)^2-4*((Y-H/2)/H)^2),'
-                'H/2+(Y-H/2)/sqrt(1-4*((X-W/2)/W)^2-4*((Y-H/2)/H)^2))",'
-                'scale=iw:ih,format=yuv420p'
-            )
-
-        elif name == "deorb":
-            vf_parts.append(
-                'format=yuv444p,geq='
-                '"p(W/2+(X-W/2)*sqrt(1-4*((X-W/2)/W)^2-4*((Y-H/2)/H)^2),'
-                'H/2+(Y-H/2)*sqrt(1-4*((X-W/2)/W)^2-4*((Y-H/2)/H)^2))",'
-                'scale=iw:ih,format=yuv420p'
-            )
-
         elif name == "gm91deform":
             vf_parts.append(
                 f'format=yuv444p,scale=360:360,setsar=1:1,rotate=0:iw*1.05:ih*1.05,'
@@ -707,66 +632,6 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
                 f'"p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/lerp(1,1.22)+((Y-H/2)*(-0.136))+((0.047*W)*pow((Y-H/2)/(H/2),2))+(-W/40),(H/2)+((Y-H/2)/lerp(1,1.27))/lerp(1,sin((X/W)*PI),0.12)-(((0.014)*H)*pow((X-W/2)/(W/2),2))+((X-W/2)*(0.12))-(1.2))",'
                 f'scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale={w}:{h},setsar=1,format=yuv420p'
             )
-
-        elif name == "scroll":
-            # scroll=h;v or scroll=x1;y1;x2;y2;dur
-            if len(params) == 1 and params[0].startswith("hpos="):
-                x = params[0].split("=", 1)[1]
-                vf_parts.append(f"scroll=hpos={x}")
-            elif len(params) == 1 and params[0].startswith("ypos="):
-                y = params[0].split("=", 1)[1]
-                vf_parts.append(f"scroll=vpos={y}")
-            elif len(params) >= 4:
-                x1, y1, x2, y2 = params[0], params[1], params[2], params[3]
-                dur = params[4] if len(params) > 4 else "10"
-                vf_parts.append(f"scroll=h_speed=({x2}-{x1})/{dur}:v_speed=({y2}-{y1})/{dur}")
-            else:
-                h_speed = params[0] if len(params) > 0 else "0"
-                v_speed = params[1] if len(params) > 1 else "0"
-                vf_parts.append(f"scroll=h_speed={h_speed}:v_speed={v_speed}")
-
-        elif name == "pan":
-            px = params[0] if len(params) > 0 else "0"
-            py = params[1] if len(params) > 1 else "0"
-            vf_parts.append(f"pan=x={px}:y={py}")
-
-        elif name == "vreverse":
-            vf_parts.append("reverse")
-
-        elif name == "watermark":
-            url = params[0] if params else ""
-            if url:
-                vf_parts.append(f"movie='{url}',[in]overlay=0:0")
-            # URL download handled separately in _build_ffmpeg_cmd_for_effects
-
-        elif name == "ring":
-            url = params[0] if params else "https://files.catbox.moe/ns8i66.png"
-            vf_parts.append(f"movie='{url}',[in]overlay=0:0")
-
-        elif name == "miui":
-            vf_parts.append(
-                "drawtext=text='MIUI':fontsize=24:fontcolor=white@0.6:"
-                "x=W-tw-10:y=H-th-10:borderw=1:bordercolor=black@0.5"
-            )
-
-        elif name == "reddit":
-            vf_parts.append(
-                "drawtext=text='reddit':fontsize=20:fontcolor=white@0.5:"
-                "x=W-tw-10:y=H-th-10:borderw=1:bordercolor=black@0.4"
-            )
-
-        elif name == "caption":
-            text = params[0] if params else ""
-            # Escape special chars for FFmpeg drawtext
-            text = text.replace("'", "'\\''").replace(":", "\\:").replace("=", "\\=")
-            vf_parts.append(
-                f"drawtext=text='{text}':fontsize=h/15:fontcolor=white:"
-                f"borderw=2:bordercolor=black:x=(W-tw)/2:y=10"
-            )
-
-        elif name == "zoom":
-            scale_val = params[0] if params else "2"
-            vf_parts.append(f"scale=iw*{scale_val}:ih*{scale_val},crop=iw/2:ih/2")
 
         elif name in ("multipitch", "mp", "multi", "volume", "vibrato", "areverse"):
             # Audio effects — handled separately in _build_af_for_effects / _run_multipitch
@@ -825,7 +690,7 @@ def _build_ffmpeg_cmd_for_effects(
     cmd = ["ffmpeg", "-y", "-i", input_path]
 
     # Handle special cases that need filter_complex
-    needs_complex = any(n in ("watermark", "ring", "polar", "depolar") for n, _ in effects)
+    needs_complex = any(n in ("gm4",) for n, _ in effects)
     # Check for raw ffmpeg() effect
     raw_ffmpeg_args = []
     for name, params in effects:
@@ -835,9 +700,36 @@ def _build_ffmpeg_cmd_for_effects(
     if raw_ffmpeg_args:
         cmd.extend(raw_ffmpeg_args)
     else:
-        if vf_parts:
-            vf_str = ",".join(vf_parts)
-            cmd.extend(["-vf", vf_str])
+        if needs_complex:
+            # Handle effects requiring filter_complex (e.g. gm4)
+            fc_parts = []
+            simple_vf = []
+            for part in vf_parts:
+                if part == "GM4_COMPLEX":
+                    # gm4: split=3+alphamerge+overlay
+                    fc_parts.append(
+                        "split=3[a][b][t];"
+                        "[a]format=gray,curves=r='0/0 0.5/0 1/0':g='0/0 0.5/0 1/0':b='0/0 0.5/0 1/0'[aa];"
+                        "[b]format=gray,curves=all='0/0 0.5/0 1/1'[bb];"
+                        "[aa][bb]alphamerge[c];"
+                        "[t][c]overlay"
+                    )
+                else:
+                    simple_vf.append(part)
+            if fc_parts:
+                # Build filter_complex string with simple filters prepended to [in]
+                if simple_vf:
+                    pre = ",".join(simple_vf) + ","
+                else:
+                    pre = ""
+                fc_str = pre + ",".join(fc_parts)
+                cmd.extend(["-filter_complex", fc_str])
+            elif simple_vf:
+                cmd.extend(["-vf", ",".join(simple_vf)])
+        else:
+            if vf_parts:
+                vf_str = ",".join(vf_parts)
+                cmd.extend(["-vf", vf_str])
         if af:
             cmd.extend(["-af", af])
 
@@ -1758,26 +1650,19 @@ async def help_command(ctx: commands.Context):
     # Effect reference
     video_effects = (
         "hflip, vflip, invert, invlum, invertrgb=r;g;b, grayscale, sepia, "
-        "rotate=<deg>, hue=<deg>, huehsv=<val> (magick-style), ccshue=<val> (FFmpeg hue=h=), "
-        "ffmpeghue=<deg>, brightness=<val>, "
-        "contrast=<val>, saturation=<val>, swapuv, gm4, realgm4"
+        "rotate=<deg>, huehsv=<val> (magick-style), ccshue=<val> (FFmpeg hue=h=), "
+        "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "fisheye=strength;radius;cx;cy, pinch&punch|p&p=strength;radius;cx;cy, "
+        "pinch&punch|p&p=strength;radius;cx;cy, "
         "swirl=angle;radius;cx;cy;fallout;lock, "
-        "wave=hs;hf;ha;hp;vs;vf;va;vp, zoom=<scale>, mirror=<degrees>, "
-        "tile=x;y, polar, depolar, orb, deorb, gm91deform"
-    )
-    transform_effects = (
-        "scroll=h;v, pan=x;y, vreverse, watermark=<url>, ring[=<url>], "
-        "miui, reddit, caption=<text>"
+        "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
     audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
     embed.add_field(name="Distortion", value=distortion_effects, inline=False)
-    embed.add_field(name="Transform/Overlay", value=transform_effects, inline=False)
     embed.add_field(name="Audio", value=audio_effects, inline=False)
     embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
 
