@@ -761,6 +761,186 @@ def _build_ffmpeg_cmd_for_effects(
     return cmd
 
 
+
+def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str, str] | None:
+    """Parse TagScript-style IHTX custom syntax.
+
+    Syntax mirrors the icf+ tag:
+      <exports> <duration_expr> <no_trim> <export_file_format> <output_file_format> <...ffmpeg code>
+
+    Example:
+      10 0.483 - mp4 default -vf negate
+    """
+    parts = shlex.split(args)
+    if len(parts) <= 5:
+        return None
+    try:
+        exports = int(parts[0])
+    except ValueError:
+        return None
+    if exports == 0:
+        return None
+    duration_expr = parts[1]
+    no_trim = parts[2]
+    export_format = parts[3].lstrip(".") or "mp4"
+    output_format = parts[4].lstrip(".") or "default"
+    ffmpeg_code = " ".join(parts[5:]).strip()
+    if not ffmpeg_code:
+        return None
+    return exports, duration_expr, no_trim, export_format, output_format, ffmpeg_code
+
+
+def _safe_awk_duration(duration_expr: str, vidlen: float) -> tuple[bool, str]:
+    """Evaluate the tag duration expression using awk like the original TagScript."""
+    if not duration_expr or len(duration_expr) > 200:
+        return False, "Invalid duration expression."
+    if any(ch in duration_expr for ch in "\n\r\0"):
+        return False, "Duration expression cannot contain newlines."
+    try:
+        result = subprocess.run(
+            ["awk", "-v", f"vidlen={vidlen}", f"BEGIN{{ printf {duration_expr} }}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:
+        return False, f"Duration expression failed: {e}"
+    if result.returncode != 0:
+        return False, result.stderr[-1000:] or "Duration expression failed."
+    value = result.stdout.strip()
+    try:
+        dur = float(value)
+    except ValueError:
+        return False, f"Duration expression did not produce a number: {value!r}"
+    if not math.isfinite(dur) or dur <= 0:
+        return False, "Duration must be a positive finite number."
+    return True, str(min(dur, MAX_DURATION))
+
+
+def _split_ffmpeg_code(ffmpeg_code: str) -> tuple[bool, list[str] | str]:
+    """Split raw FFmpeg code for subprocess execution while preserving quoted args."""
+    try:
+        return True, shlex.split(ffmpeg_code)
+    except ValueError as e:
+        return False, f"Invalid FFmpeg code quoting: {e}"
+
+
+def _concat_codec_args(output_format: str) -> list[str]:
+    """Return final concat codec args matching the IHTX TagScript cases."""
+    fmt = output_format.lower().lstrip(".")
+    if fmt == "mkv":
+        return ["-c:v", "mpeg2video", "-q:v", "1", "-c:a", "flac", "-pix_fmt", "yuv420p", "-bufsize", "64M"]
+    if fmt == "mxf":
+        return ["-c:v", "mpeg2video", "-qscale", "1", "-qmin", "1", "-c:a", "pcm_s16le", "-ar", "48000", "-pix_fmt", "yuv420p", "-bufsize", "64M"]
+    if fmt == "mov":
+        return ["-c:v", "libx264", "-profile:v", "high422", "-level:v", "5", "-tune", "zerolatency", "-q:v", "1", "-crf", "30", "-preset", "superfast", "-c:a", "aac", "-q:a", "10", "-b:a", "192K", "-aac_coder", "fast", "-pix_fmt", "yuv420p", "-bufsize", "64M"]
+    if fmt == "mp4":
+        return ["-c:v", "libx264", "-profile:v", "high422", "-level:v", "5", "-tune", "zerolatency", "-q:v", "1", "-crf", "30", "-preset", "superfast", "-c:a", "flac", "-pix_fmt", "yuv420p", "-bufsize", "64M"]
+    if fmt == "avi":
+        return ["-c:v", "mpeg2video", "-c:a", "flac", "-pix_fmt", "yuv420p"]
+    return ["-pix_fmt", "yuv420p", "-bufsize", "64M"]
+
+
+def _run_ihtx_tagscript_workflow(
+    input_path: str,
+    output_path: str,
+    exports: int,
+    duration_expr: str,
+    no_trim: str,
+    export_format: str,
+    output_format: str,
+    ffmpeg_code: str,
+) -> tuple[bool, str]:
+    """Run custom IHTX using the TagScript-style shell workflow.
+
+    This replaces the previous Python effect-chain repetition logic with the
+    original icf+/IHTX flow: create 0.mp4, repeatedly render raw FFmpeg code into
+    numbered exports, build concat.txt in forward/reverse order, then concat using
+    the format-specific codec case table.
+    """
+    if abs(exports) > MAX_REPETITIONS:
+        exports = MAX_REPETITIONS if exports > 0 else -MAX_REPETITIONS
+
+    if not re.fullmatch(r"[A-Za-z0-9]+", export_format):
+        return False, "Export file format must be alphanumeric (example: mp4)."
+    if output_format != "default" and not re.fullmatch(r"[A-Za-z0-9]+", output_format):
+        return False, "Output file format must be alphanumeric or `default`."
+
+    split_ok, raw_args_or_error = _split_ffmpeg_code(ffmpeg_code)
+    if not split_ok:
+        return False, str(raw_args_or_error)
+    raw_args = list(raw_args_or_error)
+
+    vidlen = _ffprobe_duration(input_path)
+    if vidlen <= 0:
+        return False, "Could not read input duration."
+    dur_ok, dur_or_error = _safe_awk_duration(duration_expr, vidlen)
+    if not dur_ok:
+        return False, dur_or_error
+    dur = dur_or_error
+
+    in_ext = Path(input_path).suffix.lower().lstrip(".") or "mp4"
+    extension = in_ext if output_format == "default" else output_format.lower().lstrip(".")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = os.path.join(tmpdir, "0.mp4")
+        final_output = os.path.join(tmpdir, f"icfplus.{extension}")
+
+        warmup = os.path.join(tmpdir, "a.mp4")
+        _run_ffmpeg_raw([
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", "https://file.garden/aTXso15ukD3mnuPI/resized.mp4",
+            "-vf", "scale=4:4,setsar=1:1,geq=r=128:g=128:b=128",
+            "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-an", "-t", "0.03", warmup,
+        ], timeout=60)
+
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-stream_loop", "-1", "-i", input_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "16M",
+            "-c:a", "flac", "-t", dur, "-movflags", "+faststart", base,
+        ], timeout=180)
+        if not ok:
+            return False, f"Base render failed: {err}"
+
+        no_trim_enabled = no_trim.lower() in {"true", "yes"}
+        total_exports = abs(exports)
+        previous = base
+        for i in range(1, total_exports + 2):
+            current = os.path.join(tmpdir, f"{i}.{export_format}")
+            cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y"]
+            if not no_trim_enabled:
+                cmd.extend(["-stream_loop", "1"])
+            cmd.extend(["-i", previous])
+            cmd.extend(raw_args)
+            if not no_trim_enabled:
+                cmd.extend(["-t", dur])
+            cmd.extend(["-movflags", "+faststart", current])
+            ok, err = _run_ffmpeg_raw(cmd, timeout=300)
+            if not ok:
+                return False, f"Export {i} failed: {err}"
+            previous = current
+
+        concat_list = os.path.join(tmpdir, "concat.txt")
+        sequence = range(total_exports, 0, -1) if exports < 0 else range(1, total_exports + 1)
+        with open(concat_list, "w") as f:
+            for i in sequence:
+                f.write(f"file '{os.path.join(tmpdir, f'{i}.{export_format}')}'\n")
+
+        concat_cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list,
+        ]
+        concat_cmd.extend(_concat_codec_args(extension))
+        concat_cmd.extend(["-movflags", "+faststart", final_output])
+        ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
+        if not ok:
+            return False, f"Concat failed: {err}"
+        shutil.copyfile(final_output, output_path)
+
+    return True, ""
+
+
 def _run_effect_chain(
     input_path: str,
     output_path: str,
@@ -1421,30 +1601,24 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
     Usage:
       g!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
-      g!ihtx effect=value,effect=value [rep] [dur]   — custom effect chain
+      g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <ffmpeg code>   — custom TagScript workflow
     """
-    # Parse arguments: could be a preset name, or an effect chain with optional rep/dur
+    # Parse arguments: preset name or TagScript-style custom icf+ workflow.
     parts = args.split()
-    first = parts[0].lower()
+    first = parts[0].lower() if parts else "chaos"
 
-    # Check if it's a preset or a custom effect chain
-    is_preset = first in VISUAL_PRESETS and "=" not in first
-    is_chain = "=" in first
+    is_preset = first in VISUAL_PRESETS and len(parts) == 1
+    custom_args = None if is_preset else _parse_ihtx_custom_args(args)
 
     if is_preset:
         preset = first
-    elif is_chain:
-        effects_str = first
-        repetitions = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-        dur_override = float(parts[2]) if len(parts) > 2 else None
-        repetitions = min(repetitions, MAX_REPETITIONS)
-    else:
-        # Unknown token — show help
+    elif custom_args is None:
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
-            f"Unknown preset or effect. Available presets: {preset_list}\n"
-            f"Or chain effects: `g!ihtx hflip,hue=90,multipitch=25;5;8.5 3 10`\n"
-            f"Use `g!ihtxhelp` for full effect list."
+            f"Unknown preset or invalid custom IHTX syntax. Available presets: {preset_list}\n"
+            f"Custom syntax: `g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <ffmpeg code>`\n"
+            f"Example: `g!ihtx 10 0.483 - mp4 default -vf negate`\n"
+            f"Use `g!ihtxhelp` for full usage."
         )
         return
 
@@ -1465,10 +1639,10 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"**I HATE THE X — IHTX Bot**\n"
-            f"Attach a video or image and use `g!ihtx [preset]` or `g!ihtx effect=value,...`.\n\n"
+            f"Attach a video or image and use `g!ihtx [preset]` or the custom IHTX syntax.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom effects:** `g!ihtx hflip,hue=90,multipitch=25;5;8.5 3 10`\n"
-            f"Use `g!ihtxhelp` for full effect list.\n\n"
+            f"**Custom IHTX:** `g!ihtx 10 0.483 - mp4 default -vf negate`\n"
+            f"Use `g!ihtxhelp` for full usage.\n\n"
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
             f"`g!ihtx glitch`\n"
@@ -1489,7 +1663,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
     out_ext = get_output_ext(suffix, is_video)
 
     status_msg = await ctx.reply(
-        f"⚙️ Applying **{'preset: ' + preset if is_preset else 'custom effects'}**... this may take a moment."
+        f"⚙️ Applying **{'preset: ' + preset if is_preset else 'custom IHTX TagScript workflow'}**... this may take a moment."
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1509,13 +1683,17 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
                 None, run_ffmpeg, input_path, output_path, preset, is_video
             )
         else:
-            # Custom effect chain — only supports video
+            # Custom IHTX follows the TagScript icf+ shell workflow and only supports video.
             if not is_video:
-                await status_msg.edit(content="❌ Custom effect chains require video input (not images/GIFs).")
+                await status_msg.edit(content="❌ Custom IHTX workflow requires video input (not images/GIFs).")
                 return
+            exports, duration_expr, no_trim, export_format, output_format, ffmpeg_code = custom_args
+            output_ext = suffix if output_format == "default" else f".{output_format.lstrip('.')}"
+            output_path = os.path.join(tmpdir, f"output{output_ext}")
             ok, err = await loop.run_in_executor(
-                None, _run_effect_chain,
-                input_path, output_path, effects_str, repetitions, dur_override
+                None, _run_ihtx_tagscript_workflow,
+                input_path, output_path, exports, duration_expr, no_trim,
+                export_format, output_format, ffmpeg_code
             )
 
         if not ok:
@@ -1534,7 +1712,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
         try:
             await ctx.reply(
-                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!\n⚠️ Use `g!syncaudio` to sync video to audio if needed.",
+                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!\n⚠️ Make sure you use `g!syncaudio` or `g!syncaudio alt` afterwards to make sure the video is synced to the audio.",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
