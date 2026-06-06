@@ -1584,8 +1584,11 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)")
-    except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+    except discord.HTTPException as e:
+        if "50240" in str(e):
+            print("Entry Point command conflict — skipping bulk sync (slash commands already registered)")
+        else:
+            print(f"Failed to sync slash commands: {e}")
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
         name="Meet the Sparkles! ✨👗 | Sparkles Magical Market Full Episode | Cartoons for Kids"
