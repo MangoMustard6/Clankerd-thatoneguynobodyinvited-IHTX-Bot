@@ -1053,7 +1053,7 @@ def _generate_hald_cluts(workdir: str) -> list[str]:
         ("hslhue_108_30.ppm", 100, 130, 260),
     ]
     paths = []
-    for filename, brightness, saturation, hue_mod in clut_specs:
+    for i, (filename, brightness, saturation, hue_mod) in enumerate(clut_specs):
         path = os.path.join(workdir, filename)
         cmd = [
             "magick", "hald:4",
@@ -1065,6 +1065,14 @@ def _generate_hald_cluts(workdir: str) -> list[str]:
             # Fallback: create a simple identity CLUT
             # If magick isn't available, skip CLUT effects
             pass
+        # For hslhue_108_30 (index 3), apply additional -modulate 100,100,0
+        if i == 3 and os.path.exists(path):
+            extra_cmd = [
+                "magick", path,
+                "-modulate", "100,100,0",
+                path
+            ]
+            subprocess.run(extra_cmd, capture_output=True, text=True, timeout=30)
         paths.append(path)
     return paths
 
