@@ -576,6 +576,7 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
 
         elif name == "swirl":
             # swirl=angle;radius;cx;cy;fallout;lockaspect
+            # Commas inside geq p(x,y) must be escaped as \, for FFmpeg's filter parser
             angle = params[0] if len(params) > 0 else "180"
             radius = params[1] if len(params) > 1 else "0.5"
             cx = params[2] if len(params) > 2 else "0.5"
@@ -584,52 +585,72 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
             lock = params[5] if len(params) > 5 else "false"
             exp_str = "" if fallout == "linear" else "^2"
             min_wh = "min(W,H)"
+            # Build geq expression with normal commas, then escape for FFmpeg
+            geq_expr = (
+                f'p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),'
+                f'H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))'
+            )
+            geq_escaped = geq_expr.replace(',', '\\\\,')
             if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
                 vf_parts.append(
                     f'format=yuv444p,scale={h}:{h},'
-                    f'geq="p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),'
-                    f'H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))",'
+                    f'geq="{geq_escaped}",'
                     f'scale={w}:{h},setsar=1:1,format=yuv420p'
                 )
             else:
                 vf_parts.append(
                     f'format=yuv444p,'
-                    f'geq="p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),'
-                    f'H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))",'
+                    f'geq="{geq_escaped}",'
                     f'scale=iw:ih,format=yuv420p'
                 )
         elif name == "zoom":
             # Zoom via geq pixel-remap with rotation
+            # Commas inside geq p(x,y) must be escaped as \, for FFmpeg's filter parser
             amount = params[0] if params else "1.1"
+            geq_expr = f'p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})'
+            geq_escaped = geq_expr.replace(',', '\\\\,')
             vf_parts.append(
                 f'format=yuv444p,rotate=0:iw*1.1:ih*1.1,'
-                f'geq="p((W/2)+(X-(W/2))/{amount}\\,(H/2)+(Y-(H/2))/{amount})",'
+                f'geq="{geq_escaped}",'
                 f'scale=iw:ih,crop={w}:{h},format=yuv420p'
             )
 
         elif name == "mirror":
-            # Mirror fold via frei0r mirr0r: rotate+mirr0r+rotate+crop
+            # Mirror fold via geq + rotate (no frei0r, no filter_complex needed)
             angle = params[0] if params else "0"
-            # Compute (angle+90) for the rotation
-            a_plus_90 = float(angle) + 90
-            if float(angle) == 0:
-                # Simple horizontal mirror for angle=0
-                vf_parts.append("split[l][r];[r]hflip[rf];[l][rf]hstack")
-            else:
-                # rotate=(angle+90)/180*PI:iw*2:ih*2,scroll=0:0:0.5,frei0r=mirr0r:0.5,rotate=-(angle+90)/180*PI,crop=iw/2:ih/2
+            a_val = float(angle)
+            # geq: for X >= W/2, sample from the mirrored position (W-X)
+            geq_expr = 'p(if(gt(X,W/2),W-X,X),Y)'
+            geq_escaped = geq_expr.replace(',', '\\\\,')
+            if a_val == 0:
+                # Horizontal mirror fold
                 vf_parts.append(
-                    f"rotate={a_plus_90}/180*PI:iw*2:ih*2,"
-                    f"scroll=0:0:0.5,"
-                    f"frei0r=mirr0r:0.5,"
-                    f"rotate=-{a_plus_90}/180*PI,"
-                    f"crop=iw/2:ih/2"
+                    f'format=yuv444p,geq="{geq_escaped}",format=yuv420p'
+                )
+            else:
+                # Diagonal mirror: rotate to align fold line vertical, fold, rotate back, crop
+                a_plus_90 = a_val + 90
+                vf_parts.append(
+                    f'format=yuv444p,'
+                    f'rotate={a_plus_90}/180*PI:iw*2:ih*2,'
+                    f'geq="{geq_escaped}",'
+                    f'rotate=-{a_plus_90}/180*PI,'
+                    f'crop=iw/2:ih/2,'
+                    f'scale={w}:{h},setsar=1,format=yuv420p'
                 )
 
         elif name == "gm91deform":
+            # Commas inside geq p(x,y) must be escaped as \, for FFmpeg's filter parser
+            geq_expr = (
+                'p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/lerp(1,1.22)'
+                '+((Y-H/2)*(-0.136))+((0.047*W)*pow((Y-H/2)/(H/2),2))+(-W/40),'
+                '(H/2)+((Y-H/2)/lerp(1,1.27))/lerp(1,sin((X/W)*PI),0.12)'
+                '-(((0.014)*H)*pow((X-W/2)/(W/2),2))+((X-W/2)*(0.12))-(1.2))'
+            )
+            geq_escaped = geq_expr.replace(',', '\\\\,')
             vf_parts.append(
                 f'format=yuv444p,scale=360:360,setsar=1:1,rotate=0:iw*1.05:ih*1.05,'
-                f'geq='
-                f'"p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/lerp(1,1.22)+((Y-H/2)*(-0.136))+((0.047*W)*pow((Y-H/2)/(H/2),2))+(-W/40),(H/2)+((Y-H/2)/lerp(1,1.27))/lerp(1,sin((X/W)*PI),0.12)-(((0.014)*H)*pow((X-W/2)/(W/2),2))+((X-W/2)*(0.12))-(1.2))",'
+                f'geq="{geq_escaped}",'
                 f'scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale={w}:{h},setsar=1,format=yuv420p'
             )
 
