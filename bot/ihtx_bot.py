@@ -1413,8 +1413,8 @@ async def on_ready():
 
 
 @bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
-@app_commands.describe(args="Preset name or effect chain (e.g. chaos, hflip,hue=90,multipitch=25;5;8.5)")
-async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
+@app_commands.describe(args="Preset name or effect chain (e.g. chaos, hflip,hue=90,multipitch=25;5;8.5)", attachment="Video or image file to process")
+async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment: discord.Attachment = None):
     """HEAVY COMMAND: replicates ihtx from FFmpeg.
 
     Apply an IHTX FFmpeg effect to an attached video or image.
@@ -1448,17 +1448,18 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
         )
         return
 
-    # Look for attachments (or referenced message attachments)
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
@@ -1542,24 +1543,25 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
 
 
 @bot.hybrid_command(name="preview1280", aliases=["p1280"], description="Create a 12-segment TV-simulator preview montage")
-@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)")
-async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
+@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)", attachment="Video file to preview")
+async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85, attachment: discord.Attachment = None):
     """Create a 12-segment TV-simulator preview montage from an attached video.
 
     Usage: g!preview1280 [start_offset] [segment_duration]
     Default: start=1.85, duration=0.85
     """
-    # Look for attachments
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         await ctx.reply(
@@ -1633,8 +1635,8 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 
 @bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via SoX")
-@app_commands.describe(args="Semicolon-separated semitone values (e.g. 25;5;8.5)")
-async def multipitch_command(ctx: commands.Context, *, args: str = ""):
+@app_commands.describe(args="Semicolon-separated semitone values (e.g. 25;5;8.5)", attachment="Video or audio file to pitch-shift")
+async def multipitch_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
     """Apply multi-voice pitch shifting to an attached video using SoX pitch.
 
     Usage:
@@ -1661,17 +1663,18 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("No pitch values provided. Use semicolon-separated values like `25;5;8.5`.")
         return
 
-    # Look for attachments
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         await ctx.reply(
@@ -1733,8 +1736,8 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
 
 
 @bot.hybrid_command(name="syncaudio", aliases=["sa", "sync"], description="Sync video and audio durations by adjusting playback speed")
-@app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed")
-async def syncaudio_command(ctx: commands.Context, mode: str = ""):
+@app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed", attachment="Video file to sync")
+async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: discord.Attachment = None):
     """Sync video and audio durations.
 
     Default: adjusts video speed to match audio.
@@ -1748,17 +1751,18 @@ async def syncaudio_command(ctx: commands.Context, mode: str = ""):
     """
     alt_mode = mode.lower().strip() == "alt"
 
-    # Look for attachments
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         mode_desc = "adjusts **video speed** to match audio" if not alt_mode else "adjusts **audio speed** to match video"
@@ -1932,7 +1936,8 @@ def _parse_digits(s: str) -> int:
         raise ValueError("Could not parse id")
 
 
-@bot.command(name="blockuser")
+@bot.hybrid_command(name="blockuser", description="Owner-only: add a user to the blocklist")
+@app_commands.describe(user="User mention or ID to block")
 @commands.check(_is_owner)
 async def blockuser(ctx: commands.Context, user: str):
     """Owner-only: add a user ID or mention to the user blocklist."""
@@ -1949,7 +1954,8 @@ async def blockuser(ctx: commands.Context, user: str):
     await ctx.reply(f"✅ Blocked user `{user_id}`.")
 
 
-@bot.command(name="unblockuser")
+@bot.hybrid_command(name="unblockuser", description="Owner-only: remove a user from the blocklist")
+@app_commands.describe(user="User mention or ID to unblock")
 @commands.check(_is_owner)
 async def unblockuser(ctx: commands.Context, user: str):
     """Owner-only: remove a user ID or mention from the user blocklist."""
@@ -1966,7 +1972,8 @@ async def unblockuser(ctx: commands.Context, user: str):
     await ctx.reply(f"✅ Unblocked user `{user_id}`.")
 
 
-@bot.command(name="blockchannel")
+@bot.hybrid_command(name="blockchannel", description="Owner-only: add a channel to the blocklist")
+@app_commands.describe(channel="Channel mention or ID to block (omit for current channel)")
 @commands.check(_is_owner)
 async def blockchannel(ctx: commands.Context, channel: str = None):
     """Owner-only: add a channel to the channel blocklist. If omitted, blocks current channel."""
@@ -1986,7 +1993,8 @@ async def blockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Blocked channel `{channel_id}`.")
 
 
-@bot.command(name="unblockchannel")
+@bot.hybrid_command(name="unblockchannel", description="Owner-only: remove a channel from the blocklist")
+@app_commands.describe(channel="Channel mention or ID to unblock (omit for current channel)")
 @commands.check(_is_owner)
 async def unblockchannel(ctx: commands.Context, channel: str = None):
     """Owner-only: remove a channel from the channel blocklist. If omitted, unblocks current channel."""
@@ -2006,18 +2014,21 @@ async def unblockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Unblocked channel `{channel_id}`.")
 
 
-@bot.command(name="say")
+@bot.hybrid_command(name="say", description="Owner-only: make the bot send a message")
+@app_commands.describe(message="Message content to send")
 @commands.check(_is_owner)
 async def say(ctx: commands.Context, *, message: str):
     """Owner-only: make the bot send a plain message in the current channel."""
     try:
         await ctx.send(message)
-        await ctx.message.add_reaction("✅")
+        if ctx.message:
+            await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send message: {e}")
 
 
-@bot.command(name="sayembed")
+@bot.hybrid_command(name="sayembed", description="Owner-only: make the bot send an embed")
+@app_commands.describe(content="Embed content (use | to split title|description)")
 @commands.check(_is_owner)
 async def sayembed(ctx: commands.Context, *, content: str):
     """
@@ -2034,7 +2045,8 @@ async def sayembed(ctx: commands.Context, *, content: str):
             desc = content
         emb = discord.Embed(title=title or None, description=desc or None, color=discord.Color.dark_red())
         await ctx.send(embed=emb)
-        await ctx.message.add_reaction("✅")
+        if ctx.message:
+            await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send embed: {e}")
 
