@@ -559,7 +559,7 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
 
         elif name in ("pinch&punch", "p&p", "pinchpunch"):
             # pinch&punch / p&p =strength;radius;cx;cy — geq fisheye distortion
-            # Commas inside geq p(x,y) must be escaped as \, for FFmpeg's filter parser
+            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
             strength = params[0] if len(params) > 0 else "1"
             radius = params[1] if len(params) > 1 else "0.5"
             cx = params[2] if len(params) > 2 else "0.5"
@@ -568,15 +568,13 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
                 f'p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),'
                 f'H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))'
             )
-            # Escape commas inside geq expression for FFmpeg filter parser: , -> \,
-            geq_escaped = geq_expr.replace(',', '\,')
             vf_parts.append(
-                f'format=yuv444p,geq="{geq_escaped}",scale=iw:ih,format=yuv420p'
+                f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
             )
 
         elif name == "swirl":
             # swirl=angle;radius;cx;cy;fallout;lockaspect
-            # Build geq expression first, then escape commas for FFmpeg filter parser
+            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
             angle = params[0] if len(params) > 0 else "180"
             radius = params[1] if len(params) > 1 else "0.5"
             cx = params[2] if len(params) > 2 else "0.5"
@@ -589,47 +587,41 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
                 f'p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),'
                 f'H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))'
             )
-            # Escape commas inside geq expression for FFmpeg filter parser: , -> \,
-            swirl_geq_esc = swirl_geq.replace(',', '\,')
             if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
                 vf_parts.append(
-                    f'format=yuv444p,scale={h}:{h},'
-                    f'geq="{swirl_geq_esc}",'
-                    f'scale={w}:{h},setsar=1:1,format=yuv420p'
+                    f"format=yuv444p,scale={h}:{h},"
+                    f"geq='{swirl_geq}',"
+                    f"scale={w}:{h},setsar=1:1,format=yuv420p"
                 )
             else:
                 vf_parts.append(
-                    f'format=yuv444p,'
-                    f'geq="{swirl_geq_esc}",'
-                    f'scale=iw:ih,format=yuv420p'
+                    f"format=yuv444p,"
+                    f"geq='{swirl_geq}',"
+                    f"scale=iw:ih,format=yuv420p"
                 )
         elif name == "zoom":
             # Zoom via geq pixel-remap with rotation
-            # Build geq expression first, then escape commas for FFmpeg filter parser
+            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
             amount = params[0] if params else "1.1"
             zoom_geq = f'p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})'
-            # Escape commas inside geq expression for FFmpeg filter parser: , -> \,
-            zoom_geq_esc = zoom_geq.replace(',', '\,')
             vf_parts.append(
-                f'format=yuv444p,rotate=0:iw*1.1:ih*1.1,'
-                f'geq="{zoom_geq_esc}",'
-                f'scale=iw:ih,crop={w}:{h},format=yuv420p'
+                f"format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
+                f"geq='{zoom_geq}',"
+                f"scale=iw:ih,crop={w}:{h},format=yuv420p"
             )
 
         elif name == "mirror":
             # Mirror fold via native FFmpeg (no frei0r needed)
-            # Build geq expression for horizontal mirror, then rotate for angled mirrors
+            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
             angle = params[0] if params else "0"
             a_val = float(angle)
-            # geq that mirrors left half to right: p(min(X,W-1-X),Y)
-            # Using W*0.5-abs(X-W*0.5) maps every X to its mirror distance from center
+            # geq that mirrors left half to right: W*0.5-abs(X-W*0.5) maps every X
+            # to its mirror distance from center
             mirror_geq = 'p(W*0.5-abs(X-W*0.5),Y)'
-            # Escape commas inside geq expression for FFmpeg filter parser: , -> \,
-            mirror_geq_esc = mirror_geq.replace(',', '\,')
             if a_val == 0:
                 # Simple horizontal mirror for angle=0
                 vf_parts.append(
-                    f'format=yuv444p,geq="{mirror_geq_esc}",format=yuv420p'
+                    f"format=yuv444p,geq='{mirror_geq}',format=yuv420p"
                 )
             else:
                 # Rotate so mirror line is horizontal, apply mirror geq, rotate back, crop
@@ -637,26 +629,27 @@ def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -
                 vf_parts.append(
                     f"format=yuv444p,"
                     f"rotate={a_plus_90}/180*PI:iw*2:ih*2,"
-                    f'geq="{mirror_geq_esc}",'
+                    f"geq='{mirror_geq}',"
                     f"rotate=-{a_plus_90}/180*PI,"
                     f"crop=iw/2:ih/2,"
                     f"format=yuv420p"
                 )
 
         elif name == "gm91deform":
-            # Build geq expression first, then escape commas for FFmpeg filter parser
+            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
+            # lerp() requires 3 args lerp(a,b,t); the original expression had
+            # lerp(1,1.22) and lerp(1,1.27) with only 2 args, which errors on
+            # FFmpeg 5.x.  Replaced with their constant values (1.22 and 1.27).
             deform_geq = (
-                'p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/lerp(1,1.22)'
+                'p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/1.22'
                 '+((Y-H/2)*(-0.136))+((0.047*W)*pow((Y-H/2)/(H/2),2))+(-W/40)'
-                ',(H/2)+((Y-H/2)/lerp(1,1.27))/lerp(1,sin((X/W)*PI),0.12)'
+                ',(H/2)+((Y-H/2)/1.27)/lerp(1,sin((X/W)*PI),0.12)'
                 '-(((0.014)*H)*pow((X-W/2)/(W/2),2))+((X-W/2)*(0.12))-(1.2))'
             )
-            # Escape commas inside geq expression for FFmpeg filter parser: , -> \,
-            deform_geq_esc = deform_geq.replace(',', '\,')
             vf_parts.append(
-                f'format=yuv444p,scale=360:360,setsar=1:1,rotate=0:iw*1.05:ih*1.05,'
-                f'geq="{deform_geq_esc}",'
-                f'scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale={w}:{h},setsar=1,format=yuv420p'
+                f"format=yuv444p,scale=360:360,setsar=1:1,rotate=0:iw*1.05:ih*1.05,"
+                f"geq='{deform_geq}',"
+                f"scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale={w}:{h},setsar=1,format=yuv420p"
             )
 
         elif name in ("multipitch", "mp", "multi", "volume", "vibrato", "areverse"):
@@ -1420,8 +1413,8 @@ async def on_ready():
 
 
 @bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
-@app_commands.describe(args="Preset name or effect chain (e.g. chaos, hflip,hue=90,multipitch=25;5;8.5)")
-async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
+@app_commands.describe(args="Preset name or effect chain (e.g. chaos, hflip,hue=90,multipitch=25;5;8.5)", attachment="Video or image file to process")
+async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment: discord.Attachment = None):
     """HEAVY COMMAND: replicates ihtx from FFmpeg.
 
     Apply an IHTX FFmpeg effect to an attached video or image.
@@ -1455,17 +1448,18 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
         )
         return
 
-    # Look for attachments (or referenced message attachments)
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
@@ -1549,24 +1543,25 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
 
 
 @bot.hybrid_command(name="preview1280", aliases=["p1280"], description="Create a 12-segment TV-simulator preview montage")
-@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)")
-async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
+@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)", attachment="Video file to preview")
+async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85, attachment: discord.Attachment = None):
     """Create a 12-segment TV-simulator preview montage from an attached video.
 
     Usage: g!preview1280 [start_offset] [segment_duration]
     Default: start=1.85, duration=0.85
     """
-    # Look for attachments
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         await ctx.reply(
@@ -1640,8 +1635,8 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 
 @bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via SoX")
-@app_commands.describe(args="Semicolon-separated semitone values (e.g. 25;5;8.5)")
-async def multipitch_command(ctx: commands.Context, *, args: str = ""):
+@app_commands.describe(args="Semicolon-separated semitone values (e.g. 25;5;8.5)", attachment="Video or audio file to pitch-shift")
+async def multipitch_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
     """Apply multi-voice pitch shifting to an attached video using SoX pitch.
 
     Usage:
@@ -1668,17 +1663,18 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("No pitch values provided. Use semicolon-separated values like `25;5;8.5`.")
         return
 
-    # Look for attachments
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         await ctx.reply(
@@ -1740,8 +1736,8 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
 
 
 @bot.hybrid_command(name="syncaudio", aliases=["sa", "sync"], description="Sync video and audio durations by adjusting playback speed")
-@app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed")
-async def syncaudio_command(ctx: commands.Context, mode: str = ""):
+@app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed", attachment="Video file to sync")
+async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: discord.Attachment = None):
     """Sync video and audio durations.
 
     Default: adjusts video speed to match audio.
@@ -1755,17 +1751,18 @@ async def syncaudio_command(ctx: commands.Context, mode: str = ""):
     """
     alt_mode = mode.lower().strip() == "alt"
 
-    # Look for attachments
-    attachment = None
-    if ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
+    # Resolve attachment: slash commands pass it as a parameter;
+    # prefix commands need us to look at the message or referenced message.
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
 
     if not attachment:
         mode_desc = "adjusts **video speed** to match audio" if not alt_mode else "adjusts **audio speed** to match video"
@@ -1939,7 +1936,8 @@ def _parse_digits(s: str) -> int:
         raise ValueError("Could not parse id")
 
 
-@bot.command(name="blockuser")
+@bot.hybrid_command(name="blockuser", description="Owner-only: add a user to the blocklist")
+@app_commands.describe(user="User mention or ID to block")
 @commands.check(_is_owner)
 async def blockuser(ctx: commands.Context, user: str):
     """Owner-only: add a user ID or mention to the user blocklist."""
@@ -1956,7 +1954,8 @@ async def blockuser(ctx: commands.Context, user: str):
     await ctx.reply(f"✅ Blocked user `{user_id}`.")
 
 
-@bot.command(name="unblockuser")
+@bot.hybrid_command(name="unblockuser", description="Owner-only: remove a user from the blocklist")
+@app_commands.describe(user="User mention or ID to unblock")
 @commands.check(_is_owner)
 async def unblockuser(ctx: commands.Context, user: str):
     """Owner-only: remove a user ID or mention from the user blocklist."""
@@ -1973,7 +1972,8 @@ async def unblockuser(ctx: commands.Context, user: str):
     await ctx.reply(f"✅ Unblocked user `{user_id}`.")
 
 
-@bot.command(name="blockchannel")
+@bot.hybrid_command(name="blockchannel", description="Owner-only: add a channel to the blocklist")
+@app_commands.describe(channel="Channel mention or ID to block (omit for current channel)")
 @commands.check(_is_owner)
 async def blockchannel(ctx: commands.Context, channel: str = None):
     """Owner-only: add a channel to the channel blocklist. If omitted, blocks current channel."""
@@ -1993,7 +1993,8 @@ async def blockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Blocked channel `{channel_id}`.")
 
 
-@bot.command(name="unblockchannel")
+@bot.hybrid_command(name="unblockchannel", description="Owner-only: remove a channel from the blocklist")
+@app_commands.describe(channel="Channel mention or ID to unblock (omit for current channel)")
 @commands.check(_is_owner)
 async def unblockchannel(ctx: commands.Context, channel: str = None):
     """Owner-only: remove a channel from the channel blocklist. If omitted, unblocks current channel."""
@@ -2013,18 +2014,21 @@ async def unblockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Unblocked channel `{channel_id}`.")
 
 
-@bot.command(name="say")
+@bot.hybrid_command(name="say", description="Owner-only: make the bot send a message")
+@app_commands.describe(message="Message content to send")
 @commands.check(_is_owner)
 async def say(ctx: commands.Context, *, message: str):
     """Owner-only: make the bot send a plain message in the current channel."""
     try:
         await ctx.send(message)
-        await ctx.message.add_reaction("✅")
+        if ctx.message:
+            await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send message: {e}")
 
 
-@bot.command(name="sayembed")
+@bot.hybrid_command(name="sayembed", description="Owner-only: make the bot send an embed")
+@app_commands.describe(content="Embed content (use | to split title|description)")
 @commands.check(_is_owner)
 async def sayembed(ctx: commands.Context, *, content: str):
     """
@@ -2041,7 +2045,8 @@ async def sayembed(ctx: commands.Context, *, content: str):
             desc = content
         emb = discord.Embed(title=title or None, description=desc or None, color=discord.Color.dark_red())
         await ctx.send(embed=emb)
-        await ctx.message.add_reaction("✅")
+        if ctx.message:
+            await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send embed: {e}")
 
