@@ -444,7 +444,7 @@ def _parse_effect_chain(effects_str: str) -> list[tuple[str, list[str]]]:
     """Parse 'effect=value,effect=value,...' into [(name, [params]), ...].
 
     Params are semicolon-separated sub-params within each effect.
-    For multipitch/mp/multi, params are semicolon-separated (e.g. multipitch=1;4;7).
+    For multipitch/mp/multi, params are semicolon-separated (e.g. multipitch=25;5;8.5).
     """
     effects = []
     for part in effects_str.split(","):
@@ -763,36 +763,10 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]], input_path: str 
     af_parts = []
     for name, params in effects:
         if name in ("multipitch", "mp", "multi"):
-            # multipitch in semitones — semicolon-separated, e.g. multipitch=1;4;7
-            # Uses SoX-style pitch shifting (asetrate + aresample) + amix + atrim + bass
-            semitones = params if params else ["0"]
-            sr = _ffprobe_sample_rate(input_path) if input_path else 44100
-            if len(semitones) == 1:
-                # Single pitch — asetrate + aresample + atrim + bass boost
-                pitch_ratio = 2 ** (float(semitones[0]) / 12)
-                new_sr = int(sr * pitch_ratio)
-                af_parts.append(
-                    f"asetrate={new_sr},aresample={sr},"
-                    f"atrim=0.012,bass=g=2.5"
-                )
-            else:
-                # Multiple pitches — asplit + asetrate per split + amix + atrim + bass
-                n = len(semitones)
-                # asplit
-                split_outputs = "".join(f"[{i+1}]" for i in range(n))
-                asplit = f"asplit={n}{split_outputs}"
-                # asetrate pitch shift per split
-                pitch_parts = []
-                for i, s in enumerate(semitones):
-                    pitch_ratio = 2 ** (float(s) / 12)
-                    new_sr = int(sr * pitch_ratio)
-                    pitch_parts.append(
-                        f"[{i+1}]asetrate={new_sr},aresample={sr}[0{i+1}]"
-                    )
-                # amix + atrim + bass
-                amix_inputs = "".join(f"[0{i+1}]" for i in range(n))
-                amix = f"{amix_inputs}amix={n}:normalize=0,atrim=0.012,bass=g=2.5"
-                af_parts.append(";".join([asplit] + pitch_parts + [amix]))
+            # multipitch in semitones — semicolon-separated, e.g. multipitch=25;5;8.5
+            # Uses SoX pitch shifting (external pipeline) — handled as post-processing in _run_effect_chain
+            # Cannot be expressed as a simple -af string; requires WAV extraction + sox + re-merge
+            pass
 
         elif name == "volume":
             val = params[0] if params else "1"
@@ -858,90 +832,143 @@ def _run_effect_chain(
     repetitions: int = 1,
     duration_override: float | None = None,
 ) -> tuple[bool, str]:
-    """Run the full effect chain: parse → build → multi-segment → concat."""
+    """Run the full effect chain: parse → build → multi-segment → concat → multipitch post-process.
+
+    If the effect chain contains multipitch, the pipeline is:
+      1. Apply all non-multipitch effects via ffmpeg (video + simple audio)
+      2. Apply SoX multipitch as post-processing on the rendered result
+    """
     effects = _parse_effect_chain(effects_str)
     if not effects:
         return False, "No valid effects specified."
+
+    # Separate multipitch from other effects
+    multipitch_effects = [(n, p) for n, p in effects if n in ("multipitch", "mp", "multi")]
+    other_effects = [(n, p) for n, p in effects if n not in ("multipitch", "mp", "multi")]
 
     info = _ffprobe_video_info(input_path)
     w, h = info["width"], info["height"]
     dur = info["duration"]
 
-    if w == 0 or h == 0:
+    if w == 0 and h == 0:
         return False, "Could not read video dimensions from input."
 
     actual_dur = duration_override if duration_override else dur
     actual_dur = min(actual_dur, MAX_DURATION)
 
-    if repetitions <= 1:
-        # Simple single-pass render
-        cmd = _build_ffmpeg_cmd_for_effects(input_path, output_path, effects, w, h, actual_dur)
-        return _run_ffmpeg_raw(cmd, timeout=180)
+    # Determine if we need a temporary intermediate for multipitch post-processing
+    needs_multipitch = len(multipitch_effects) > 0
+    final_output = output_path
 
-    # Multi-segment: render N segments with slight parameter variation, then concat
-    # Each segment re-applies the effects with shifted parameters
     with tempfile.TemporaryDirectory() as tmpdir:
-        segment_files = []
-        for i in range(repetitions):
-            seg_path = os.path.join(tmpdir, f"seg_{i:04d}.ts")
-            # Build a slightly varied effect chain per segment
-            varied_effects = []
-            for ename, eparams in effects:
-                varied_params = list(eparams)
-                # Add progressive offset for hue, brightness, etc.
-                if ename in ("hue", "ffmpeghue") and eparams:
-                    base_val = float(eparams[0]) if eparams[0] else 0
-                    varied_params[0] = str(base_val + i * 30)
-                elif ename == "brightness" and eparams:
-                    base_val = float(eparams[0]) if eparams[0] else 0
-                    varied_params[0] = str(base_val + (i % 3 - 1) * 0.05)
-                varied_effects.append((ename, varied_params))
+        # If multipitch is present, render other effects to a temp file first
+        if needs_multipitch:
+            intermediate_path = os.path.join(tmpdir, "pre_multipitch.mp4")
+        else:
+            intermediate_path = output_path
 
-            cmd = _build_ffmpeg_cmd_for_effects(input_path, seg_path, varied_effects, w, h, actual_dur)
-            ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+        if repetitions <= 1:
+            # Simple single-pass render
+            if other_effects:
+                cmd = _build_ffmpeg_cmd_for_effects(input_path, intermediate_path, other_effects, w, h, actual_dur)
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"Render failed: {err}"
+            else:
+                # Only multipitch — copy input to intermediate
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-c:a", "pcm_s16le", "-preset", "ultrafast",
+                    intermediate_path,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"Copy to intermediate failed: {err}"
+
+        else:
+            # Multi-segment: render N segments with slight parameter variation, then concat
+            # Each segment re-applies the effects with shifted parameters
+            segment_files = []
+            for i in range(repetitions):
+                seg_path = os.path.join(tmpdir, f"seg_{i:04d}.ts")
+                # Build a slightly varied effect chain per segment
+                varied_effects = []
+                for ename, eparams in other_effects:
+                    varied_params = list(eparams)
+                    # Add progressive offset for hue, brightness, etc.
+                    if ename in ("hue", "ffmpeghue") and eparams:
+                        base_val = float(eparams[0]) if eparams[0] else 0
+                        varied_params[0] = str(base_val + i * 30)
+                    elif ename == "brightness" and eparams:
+                        base_val = float(eparams[0]) if eparams[0] else 0
+                        varied_params[0] = str(base_val + (i % 3 - 1) * 0.05)
+                    varied_effects.append((ename, varied_params))
+
+                cmd = _build_ffmpeg_cmd_for_effects(input_path, seg_path, varied_effects, w, h, actual_dur)
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"Segment {i+1}/{repetitions} failed: {err}"
+                segment_files.append(seg_path)
+
+            # Concat segments
+            concat_list = os.path.join(tmpdir, "concat.txt")
+            with open(concat_list, "w") as f:
+                for sf in segment_files:
+                    f.write(f"file '{sf}'\n")
+
+            concat_cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", concat_list,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                intermediate_path
+            ]
+            ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
             if not ok:
-                return False, f"Segment {i+1}/{repetitions} failed: {err}"
-            segment_files.append(seg_path)
+                return False, f"Concat failed: {err}"
 
-        # Concat segments
-        concat_list = os.path.join(tmpdir, "concat.txt")
-        with open(concat_list, "w") as f:
-            for sf in segment_files:
-                f.write(f"file '{sf}'\n")
+        # Apply multipitch post-processing if present
+        if needs_multipitch:
+            # Gather all pitch values from all multipitch effects
+            all_pitch_values = []
+            for _, params in multipitch_effects:
+                all_pitch_values.extend(params if params else ["0"])
 
-        concat_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            output_path
-        ]
-        return _run_ffmpeg_raw(concat_cmd, timeout=300)
+            if not all_pitch_values:
+                all_pitch_values = ["0"]
 
+            # Use SoX multipitch pipeline
+            ok, err = _run_multipitch(intermediate_path, output_path, all_pitch_values)
+            if not ok:
+                return False, f"Multipitch post-processing failed: {err}"
 
+    return True, ""
 
 
-# ---------- Multipitch (SoX asetrate pitch-shift pipeline) ----------
+
+
+# ---------- Multipitch (SoX pitch-shift pipeline) ----------
 
 def _run_multipitch(
     input_path: str,
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using FFmpeg -af with asplit + asetrate (SoX pitch) + amix.
+    """Run the multipitch pipeline using SoX pitch shifting + ffmpeg re-merge.
 
-    Splits the audio into N copies via asplit, applies SoX-style pitch shifting
-    (asetrate + aresample) to each copy, then mixes them together via amix with
-    normalize=0, atrim=0.012 and bass=g=2.5.
+    Pipeline per pitch voice:
+      1. ffmpeg -i input -c:a pcm_s16le -preset ultrafast a0.mp4  (export segment)
+      2. ffmpeg -i a0.mp4 b0.wav                                   (extract WAV)
+      3. sox b0.wav 1{i}.wav pitch -q {semitones*100} 25 5 8.5     (SoX pitch shift)
+      4. Single pitch: ffmpeg -i a0.mp4 -i 10.wav -filter_complex "[1:a]highpass=10[a]"
+         -map 0:v -map "[a]" -c:a pcm_s16le output
+         Multiple pitches: ffmpeg -i a0.mp4 -i 10.wav -i 11.wav ...
+         -filter_complex "[1][2]...amix=N:normalize=0,highpass=7.5"
+         -c:a pcm_s16le -preset ultrafast output
 
-    Example for pitches 1;4;7 (SR=44100):
-      -af "asplit=3[1][2][3];
-           [1]asetrate=46723,aresample=44100[01];
-           [2]asetrate=55562,aresample=44100[02];
-           [3]asetrate=66068,aresample=44100[03];
-           [01][02][03]amix=3:normalize=0,atrim=0.012,bass=g=2.5"
-      -c:v ffv1 -c:a pcm_s16le
+    SoX pitch effect syntax: pitch -q cents 25 5 8.5
+      where cents = semitones * 100
     """
     if not pitch_values:
         return False, "No pitch values provided."
@@ -955,43 +982,75 @@ def _run_multipitch(
         except ValueError:
             return False, f"Invalid pitch value: {pv!r}"
 
-    # Probe audio sample rate
-    sr = _ffprobe_sample_rate(input_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Step 1: Export base video with pcm_s16le audio
+        base_mp4 = os.path.join(tmpdir, "a0.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-c:a", "pcm_s16le", "-preset", "ultrafast",
+            base_mp4,
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Step 1 (export base) failed: {err}"
 
-    # Build -af string:
-    # asplit=N -> N output pads numbered 1..N
-    # Each split -> asetrate=SR*ratio,aresample=SR (SoX pitch shift)
-    # All outputs -> amix=N:normalize=0,atrim=0.012,bass=g=2.5
+        # Step 2: Extract WAV audio from base
+        base_wav = os.path.join(tmpdir, "b0.wav")
+        cmd = [
+            "ffmpeg", "-y", "-i", base_mp4,
+            base_wav,
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Step 2 (extract WAV) failed: {err}"
 
-    # asplit part
-    split_outputs = "".join(f"[{i+1}]" for i in range(n))
-    asplit = f"asplit={n}{split_outputs}"
+        # Step 3: SoX pitch shift for each voice
+        pitched_wavs = []
+        for i, pitch_val in enumerate(pitch_values):
+            cents = int(float(pitch_val) * 100)
+            out_wav = os.path.join(tmpdir, f"1{i}.wav")
+            cmd = [
+                "sox", base_wav, out_wav,
+                "pitch", "-q", str(cents), "25", "5", "8.5",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                return False, f"SoX pitch shift for voice {i+1} failed: {result.stderr}"
+            pitched_wavs.append(out_wav)
 
-    # asetrate pitch shift parts (SoX-style)
-    pitch_parts = []
-    for i, pitch_val in enumerate(pitch_values):
-        pitch_ratio = 2 ** (float(pitch_val) / 12)
-        new_sr = int(sr * pitch_ratio)
-        pitch_parts.append(
-            f"[{i+1}]asetrate={new_sr},aresample={sr}[0{i+1}]"
-        )
+        # Step 4: Re-merge with video
+        if n == 1:
+            # Single pitch: ffmpeg -i a0.mp4 -i 10.wav -filter_complex "[1:a]highpass=10[a]"
+            #   -map 0:v -map "[a]" -c:a pcm_s16le output
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", base_mp4,
+                "-i", pitched_wavs[0],
+                "-filter_complex", "[1:a]highpass=10[a]",
+                "-map", "0:v", "-map", "[a]",
+                "-c:a", "pcm_s16le",
+                output_path,
+            ]
+        else:
+            # Multiple pitches: ffmpeg -i a0.mp4 -i 10.wav -i 11.wav ...
+            #   -filter_complex "[1][2]...[N]amix=N:normalize=0,highpass=7.5"
+            #   -c:a pcm_s16le -preset ultrafast output
+            cmd = ["ffmpeg", "-y", "-i", base_mp4]
+            for wav in pitched_wavs:
+                cmd.extend(["-i", wav])
 
-    # amix + atrim + bass
-    amix_inputs = "".join(f"[0{i+1}]" for i in range(n))
-    amix = f"{amix_inputs}amix={n}:normalize=0,atrim=0.012,bass=g=2.5"
+            # Build filter_complex: [1][2]...[N]amix=N:normalize=0,highpass=7.5
+            mix_inputs = "".join(f"[{i+1}]" for i in range(n))
+            filter_complex = f"{mix_inputs}amix={n}:normalize=0,highpass=7.5"
 
-    af_str = ";".join([asplit] + pitch_parts + [amix])
+            cmd.extend([
+                "-filter_complex", filter_complex,
+                "-map", "0:v",
+                "-c:a", "pcm_s16le", "-preset", "ultrafast",
+                output_path,
+            ])
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-af", af_str,
-        "-c:v", "ffv1",
-        "-c:a", "pcm_s16le",
-        "-pix_fmt", "yuv420p",
-        output_path,
-    ]
-    return _run_ffmpeg_raw(cmd, timeout=300)
+        return _run_ffmpeg_raw(cmd, timeout=300)
 
 # ---------- Preview1280 (TV-simulator montage) ----------
 
@@ -1315,7 +1374,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset or effect. Available presets: {preset_list}\n"
-            f"Or chain effects: `g!ihtx hflip,hue=90,multipitch=5 3 10`\n"
+            f"Or chain effects: `g!ihtx hflip,hue=90,multipitch=25;5;8.5 3 10`\n"
             f"Use `g!ihtxhelp` for full effect list."
         )
         return
@@ -1338,12 +1397,12 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
             f"**I HATE THE X — IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]` or `g!ihtx effect=value,...`.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom effects:** `g!ihtx hflip,hue=90,multipitch=5 3 10`\n"
+            f"**Custom effects:** `g!ihtx hflip,hue=90,multipitch=25;5;8.5 3 10`\n"
             f"Use `g!ihtxhelp` for full effect list.\n\n"
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
             f"`g!ihtx glitch`\n"
-            f"`g!ihtx mirror=45,hue=90,multipitch=5 3 10`"
+            f"`g!ihtx mirror=45,hue=90,multipitch=25;5;8.5 3 10`"
         )
         return
 
@@ -1505,14 +1564,14 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 @bot.command(name="multipitch", aliases=["mp", "multi"])
 async def multipitch_command(ctx: commands.Context, *, args: str = ""):
-    """Apply multi-voice pitch shifting to an attached video using SoX asetrate.
+    """Apply multi-voice pitch shifting to an attached video using SoX pitch.
 
     Usage:
       g!multipitch <pitch_values>     — semicolon-separated semitone values
-      g!mp 1;4;7                      — aliases
+      g!mp 25;5;8.5                    — aliases
       g!multi -3;0;5                  — negative values supported
 
-    Example: g!multipitch 1;4;7
+    Example: g!multipitch 25;5;8.5
     """
     if not args:
         await ctx.reply(
@@ -1520,7 +1579,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
             "Attach a video and use `g!multipitch <pitches>`.\n\n"
             "Pitches are semicolon-separated semitone values.\n"
             "Each pitch creates a separate shifted voice, then they are mixed together.\n\n"
-            "Example: `g!multipitch 1;4;7`\n"
+            "Example: `g!multipitch 25;5;8.5`\n"
             "Aliases: `g!mp`, `g!multi`"
         )
         return
@@ -1528,7 +1587,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
     # Parse semicolon-separated pitch values
     pitch_values = [v.strip() for v in args.split(";") if v.strip()]
     if not pitch_values:
-        await ctx.reply("No pitch values provided. Use semicolon-separated values like `1;4;7`.")
+        await ctx.reply("No pitch values provided. Use semicolon-separated values like `25;5;8.5`.")
         return
 
     # Look for attachments
@@ -1546,7 +1605,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
     if not attachment:
         await ctx.reply(
             "Attach a video and use `g!multipitch <pitches>`.\n"
-            "Example: `g!multipitch 1;4;7`"
+            "Example: `g!multipitch 25;5;8.5`"
         )
         return
 
@@ -1632,7 +1691,7 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="g!ihtx effect=value,effect=value [rep] [dur]",
         value="Chain custom effects. Params use `=`, sub-params use `;`.\n"
-              "Example: `g!ihtx mirror=45,hue=90,multipitch=5 3 10`",
+              "Example: `g!ihtx mirror=45,hue=90,multipitch=25;5;8.5 3 10`",
         inline=False,
     )
     embed.add_field(
@@ -1642,8 +1701,9 @@ async def help_command(ctx: commands.Context):
     )
     embed.add_field(
         name="g!multipitch <pitches>  (aliases: mp, multi)",
-        value="Multi-voice pitch shift via SoX asetrate.\n"
-              "Semicolon-separated semitones: `g!multipitch 1;4;7`",
+        value="Multi-voice pitch shift via SoX.\n"
+              "Semicolon-separated semitones: `g!multipitch 25;5;8.5`\n"
+              "Can also be chained: `g!ihtx hflip,multipitch=25;5;8.5`",
         inline=False,
     )
     embed.add_field(
@@ -1666,7 +1726,7 @@ async def help_command(ctx: commands.Context):
         "scroll=h;v, pan=x;y, vreverse, watermark=<url>, ring[=<url>], "
         "miui, reddit, caption=<text>"
     )
-    audio_effects = "multipitch=<semitones> (semi-sep: 1;4;7), volume=<val>, vibrato=freq;depth, areverse"
+    audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
