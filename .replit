@@ -24,12 +24,12 @@ args = "IHTX Discord Bot"
 name = "IHTX Discord Bot"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python3 bot/ihtx_bot.py"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 main.py"
 
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
