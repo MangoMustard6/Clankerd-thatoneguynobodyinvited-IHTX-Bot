@@ -439,326 +439,38 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
 def get_output_ext(input_ext: str, is_video: bool) -> str:
     return ".mp4" if is_video else ".gif"
 
-# ---------- Effect chaining engine ----------
+# ---------- HueHSV (ImageMagick haldclut) ----------
 
-def _parse_effect_chain(effects_str: str) -> list[tuple[str, list[str]]]:
-    """Parse 'effect=value,effect=value,...' into [(name, [params]), ...].
-
-    Params are semicolon-separated sub-params within each effect.
-    For multipitch/mp/multi, params are semicolon-separated (e.g. multipitch=25;5;8.5).
-    """
-    effects = []
-    for part in effects_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" in part:
-            name, value = part.split("=", 1)
-            name = name.strip().lower()
-            params = [p.strip() for p in value.split(";")]
-        else:
-            name = part.lower()
-            params = []
-        effects.append((name, params))
-    return effects
-
-
-def _build_video_filters(effects: list[tuple[str, list[str]]], w: int, h: int) -> list[str]:
-    """Build a list of FFmpeg -vf filter strings from parsed effects.
-
-    Returns a list of individual filter chain strings (to be joined with ',').
-    """
-    vf_parts = []
-
-    for name, params in effects:
-        if name == "hflip":
-            vf_parts.append("hflip")
-
-        elif name == "vflip":
-            vf_parts.append("vflip")
-
-        elif name == "invert":
-            vf_parts.append("negate")
-
-        elif name == "invlum":
-            # Invert luminosity only via LUT
-            vf_parts.append("lumakey=L=128:H=255:mode=1,format=yuv420p"
-                            if False else
-                            "curves=all='0/1 1/0'")
-
-        elif name == "invertrgb":
-            # Invert specific channels: invertrgb=1;0;1 → invert R and B
-            r_inv = params[0] if len(params) > 0 else "1"
-            g_inv = params[1] if len(params) > 1 else "0"
-            b_inv = params[2] if len(params) > 2 else "0"
-            r_curve = "0/1 1/0" if r_inv == "1" else "0/0 1/1"
-            g_curve = "0/1 1/0" if g_inv == "1" else "0/0 1/1"
-            b_curve = "0/1 1/0" if b_inv == "1" else "0/0 1/1"
-            vf_parts.append(f"curves=r='{r_curve}':g='{g_curve}':b='{b_curve}'")
-
-        elif name == "grayscale":
-            # Grayscale via luminance-preserving channel mix (sepia mode without tint)
-            vf_parts.append("colorchannelmixer=.299:.587:.114:0:.299:.587:.114:0:.299:.587:.114")
-
-        elif name == "sepia":
-            vf_parts.append("colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131")
-
-        elif name == "rotate":
-            angle = params[0] if params else "0"
-            vf_parts.append(f"rotate={angle}/180*PI")
-
-        elif name == "huehsv":
-            # Use FFmpeg hue filter with h parameter mapped from magick-style
-            val = params[0] if params else "0"
-            deg = float(val) * 1.8 if val else 0
-            vf_parts.append(f"hue=h={deg}")
-
-        elif name == "ccshue":
-            # FFmpeg hue=h=value directly (no 1.8 multiplier, unlike huehsv)
-            val = params[0] if params else "0"
-            vf_parts.append(f"hue=h={val}")
-
-        elif name == "brightness":
-            val = params[0] if params else "0"
-            vf_parts.append(f"eq=brightness={val}")
-
-        elif name == "contrast":
-            val = params[0] if params else "1"
-            vf_parts.append(f"eq=contrast={val}")
-
-        elif name == "saturation":
-            val = params[0] if params else "1"
-            vf_parts.append(f"hue=s={val}")
-
-        elif name == "channelblend":
-            # channelblend=r;g;b — swap/mix RGB channels
-            r = params[0] if len(params) > 0 else "r"
-            g = params[1] if len(params) > 1 else "g"
-            b = params[2] if len(params) > 2 else "b"
-            ch_map = {"r": "1:0:0", "g": "0:1:0", "b": "0:0:1"}
-            rr = ch_map.get(r, "1:0:0")
-            gg = ch_map.get(g, "0:1:0")
-            bb = ch_map.get(b, "0:0:1")
-            vf_parts.append(
-                f"colorchannelmixer=rr={rr.split(':')[0]}:rg={rr.split(':')[1]}:rb={rr.split(':')[2]}"
-                f":gr={gg.split(':')[0]}:gg={gg.split(':')[1]}:gb={gg.split(':')[2]}"
-                f":br={bb.split(':')[0]}:bg={bb.split(':')[1]}:bb={bb.split(':')[2]}"
-            )
-
-        elif name == "swapuv":
-            vf_parts.append("swapuv")
-
-        elif name == "gm4":
-            # GM4: selective colour isolation via split+alphamerge+overlay
-            # Requires filter_complex — flag it for special handling
-            vf_parts.append("GM4_COMPLEX")
-
-        elif name == "realgm4":
-            # Real GM4: solarise via per-channel curves with midtone boost
-            vf_parts.append("curves=r='0/0 0.5/0.75 1/0':g='0/0 0.5/0.75 1/0':b='0/0 0.5/0.75 1/0',format=yuv420p")
-
-        elif name in ("pinch&punch", "p&p", "pinchpunch"):
-            # pinch&punch / p&p =strength;radius;cx;cy — geq fisheye distortion
-            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
-            strength = params[0] if len(params) > 0 else "1"
-            radius = params[1] if len(params) > 1 else "0.5"
-            cx = params[2] if len(params) > 2 else "0.5"
-            cy = params[3] if len(params) > 3 else "0.5"
-            geq_expr = (
-                f'p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),'
-                f'H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))'
-            )
-            vf_parts.append(
-                f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
-            )
-
-        elif name == "swirl":
-            # swirl=angle;radius;cx;cy;fallout;lockaspect
-            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
-            angle = params[0] if len(params) > 0 else "180"
-            radius = params[1] if len(params) > 1 else "0.5"
-            cx = params[2] if len(params) > 2 else "0.5"
-            cy = params[3] if len(params) > 3 else "0.5"
-            fallout = params[4] if len(params) > 4 else "quad"
-            lock = params[5] if len(params) > 5 else "false"
-            exp_str = "" if fallout == "linear" else "^2"
-            min_wh = "min(W,H)"
-            swirl_geq = (
-                f'p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),'
-                f'H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))'
-            )
-            if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
-                vf_parts.append(
-                    f"format=yuv444p,scale={h}:{h},"
-                    f"geq='{swirl_geq}',"
-                    f"scale={w}:{h},setsar=1:1,format=yuv420p"
-                )
-            else:
-                vf_parts.append(
-                    f"format=yuv444p,"
-                    f"geq='{swirl_geq}',"
-                    f"scale=iw:ih,format=yuv420p"
-                )
-        elif name == "zoom":
-            # Zoom via geq pixel-remap with rotation
-            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
-            amount = params[0] if params else "1.1"
-            zoom_geq = f'p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})'
-            vf_parts.append(
-                f"format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
-                f"geq='{zoom_geq}',"
-                f"scale=iw:ih,crop={w}:{h},format=yuv420p"
-            )
-
-        elif name == "mirror":
-            # Mirror fold via native FFmpeg (no frei0r needed)
-            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
-            angle = params[0] if params else "0"
-            a_val = float(angle)
-            # geq that mirrors left half to right: W*0.5-abs(X-W*0.5) maps every X
-            # to its mirror distance from center
-            mirror_geq = 'p(W*0.5-abs(X-W*0.5),Y)'
-            if a_val == 0:
-                # Simple horizontal mirror for angle=0
-                vf_parts.append(
-                    f"format=yuv444p,geq='{mirror_geq}',format=yuv420p"
-                )
-            else:
-                # Rotate so mirror line is horizontal, apply mirror geq, rotate back, crop
-                a_plus_90 = a_val + 90
-                vf_parts.append(
-                    f"format=yuv444p,"
-                    f"rotate={a_plus_90}/180*PI:iw*2:ih*2,"
-                    f"geq='{mirror_geq}',"
-                    f"rotate=-{a_plus_90}/180*PI,"
-                    f"crop=iw/2:ih/2,"
-                    f"format=yuv420p"
-                )
-
-        elif name == "gm91deform":
-            # Single quotes protect commas in FFmpeg filtergraph; no backslash escaping needed
-            # lerp() requires 3 args lerp(a,b,t); the original expression had
-            # lerp(1,1.22) and lerp(1,1.27) with only 2 args, which errors on
-            # FFmpeg 5.x.  Replaced with their constant values (1.22 and 1.27).
-            deform_geq = (
-                'p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/1.22'
-                '+((Y-H/2)*(-0.136))+((0.047*W)*pow((Y-H/2)/(H/2),2))+(-W/40)'
-                ',(H/2)+((Y-H/2)/1.27)/lerp(1,sin((X/W)*PI),0.12)'
-                '-(((0.014)*H)*pow((X-W/2)/(W/2),2))+((X-W/2)*(0.12))-(1.2))'
-            )
-            vf_parts.append(
-                f"format=yuv444p,scale=360:360,setsar=1:1,rotate=0:iw*1.05:ih*1.05,"
-                f"geq='{deform_geq}',"
-                f"scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale={w}:{h},setsar=1,format=yuv420p"
-            )
-
-        elif name in ("multipitch", "mp", "multi", "volume", "vibrato", "areverse"):
-            # Audio effects — handled separately in _build_af_for_effects / _run_multipitch
-            pass
-
-        elif name == "lut":
-            # LUT from URL — handled separately
-            pass
-
-        elif name == "ffmpeg":
-            # Raw ffmpeg flags — handled separately
-            pass
-
-    return vf_parts
-
-
-def _build_af_for_effects(effects: list[tuple[str, list[str]]], input_path: str = "") -> str | None:
-    """Build an -af audio filter string from parsed effects."""
-    af_parts = []
-    for name, params in effects:
-        if name in ("multipitch", "mp", "multi"):
-            # multipitch in semitones — semicolon-separated, e.g. multipitch=25;5;8.5
-            # Uses SoX pitch shifting (external pipeline) — handled as post-processing in _run_effect_chain
-            # Cannot be expressed as a simple -af string; requires WAV extraction + sox + re-merge
-            pass
-
-        elif name == "volume":
-            val = params[0] if params else "1"
-            af_parts.append(f"volume={val}")
-
-        elif name == "vibrato":
-            freq = params[0] if len(params) > 0 else "5"
-            depth = params[1] if len(params) > 1 else "0.5"
-            af_parts.append(f"vibrato=f={freq}:d={depth}")
-
-        elif name == "areverse":
-            af_parts.append("areverse")
-
-    if af_parts:
-        return ",".join(af_parts)
-    return None
-
-
-def _build_ffmpeg_cmd_for_effects(
+def _run_huehsv(
     input_path: str,
     output_path: str,
-    effects: list[tuple[str, list[str]]],
-    w: int,
-    h: int,
-    duration: float,
-) -> list[str]:
-    """Build a full ffmpeg command for the custom effect chain."""
-    vf_parts = _build_video_filters(effects, w, h)
-    af = _build_af_for_effects(effects, input_path)
+    hue: float,
+) -> tuple[bool, str]:
+    """Apply huehsv using ImageMagick haldclut + FFmpeg haldclut filter.
 
-    cmd = ["ffmpeg", "-y", "-i", input_path]
+    Uses: magick hald:6 -modulate 100,100,<hue*200+100> hsv.ppm
+    Then: ffmpeg -i input -vf "movie=hsv.ppm,[in]haldclut,format=rgba" -pix_fmt yuv420p output
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hald_path = os.path.join(tmpdir, "hsv.ppm")
+        modulate_val = hue * 200 + 100
+        # Generate hald clut using ImageMagick
+        cmd = ["magick", "hald:6", "-modulate", f"100,100,{modulate_val}", hald_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return False, f"Haldclut generation failed: {result.stderr}"
 
-    # Handle special cases that need filter_complex
-    needs_complex = any(n in ("gm4",) for n, _ in effects)
-    # Check for raw ffmpeg() effect
-    raw_ffmpeg_args = []
-    for name, params in effects:
-        if name == "ffmpeg":
-            raw_ffmpeg_args.extend(params)
+        # Apply via FFmpeg haldclut filter
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y", "-i", input_path,
+            "-vf", f"movie={hald_path},[in]haldclut,format=rgba",
+            "-pix_fmt", "yuv420p",
+            output_path,
+        ], timeout=180)
+        if not ok:
+            return False, f"FFmpeg haldclut failed: {err}"
 
-    if raw_ffmpeg_args:
-        cmd.extend(raw_ffmpeg_args)
-    else:
-        if needs_complex:
-            # Handle effects requiring filter_complex (e.g. gm4)
-            fc_parts = []
-            simple_vf = []
-            for part in vf_parts:
-                if part == "GM4_COMPLEX":
-                    # gm4: split=3+alphamerge+overlay
-                    fc_parts.append(
-                        "split=3[a][b][t];"
-                        "[a]format=gray,curves=r='0/0 0.5/0 1/0':g='0/0 0.5/0 1/0':b='0/0 0.5/0 1/0'[aa];"
-                        "[b]format=gray,curves=all='0/0 0.5/0 1/1'[bb];"
-                        "[aa][bb]alphamerge[c];"
-                        "[t][c]overlay"
-                    )
-                else:
-                    simple_vf.append(part)
-            if fc_parts:
-                # Build filter_complex string with simple filters prepended to [in]
-                if simple_vf:
-                    pre = ",".join(simple_vf) + ","
-                else:
-                    pre = ""
-                fc_str = pre + ",".join(fc_parts)
-                cmd.extend(["-filter_complex", fc_str])
-            elif simple_vf:
-                cmd.extend(["-vf", ",".join(simple_vf)])
-        else:
-            if vf_parts:
-                vf_str = ",".join(vf_parts)
-                cmd.extend(["-vf", vf_str])
-        if af:
-            cmd.extend(["-af", af])
-
-    cmd.extend([
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-t", str(min(duration, MAX_DURATION)),
-        output_path
-    ])
-    return cmd
+        return True, ""
 
 
 
@@ -939,129 +651,6 @@ def _run_ihtx_tagscript_workflow(
         shutil.copyfile(final_output, output_path)
 
     return True, ""
-
-
-def _run_effect_chain(
-    input_path: str,
-    output_path: str,
-    effects_str: str,
-    repetitions: int = 1,
-    duration_override: float | None = None,
-) -> tuple[bool, str]:
-    """Run the full effect chain: parse → build → multi-segment → concat → multipitch post-process.
-
-    If the effect chain contains multipitch, the pipeline is:
-      1. Apply all non-multipitch effects via ffmpeg (video + simple audio)
-      2. Apply SoX multipitch as post-processing on the rendered result
-    """
-    effects = _parse_effect_chain(effects_str)
-    if not effects:
-        return False, "No valid effects specified."
-
-    # Separate multipitch from other effects
-    multipitch_effects = [(n, p) for n, p in effects if n in ("multipitch", "mp", "multi")]
-    other_effects = [(n, p) for n, p in effects if n not in ("multipitch", "mp", "multi")]
-
-    info = _ffprobe_video_info(input_path)
-    w, h = info["width"], info["height"]
-    dur = info["duration"]
-
-    if w == 0 and h == 0:
-        return False, "Could not read video dimensions from input."
-
-    actual_dur = duration_override if duration_override else dur
-    actual_dur = min(actual_dur, MAX_DURATION)
-
-    # Determine if we need a temporary intermediate for multipitch post-processing
-    needs_multipitch = len(multipitch_effects) > 0
-    final_output = output_path
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # If multipitch is present, render other effects to a temp file first
-        if needs_multipitch:
-            intermediate_path = os.path.join(tmpdir, "pre_multipitch.mp4")
-        else:
-            intermediate_path = output_path
-
-        if repetitions <= 1:
-            # Simple single-pass render
-            if other_effects:
-                cmd = _build_ffmpeg_cmd_for_effects(input_path, intermediate_path, other_effects, w, h, actual_dur)
-                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
-                if not ok:
-                    return False, f"Render failed: {err}"
-            else:
-                # Only multipitch — copy input to intermediate
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-c:a", "pcm_s16le", "-preset", "ultrafast",
-                    intermediate_path,
-                ]
-                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
-                if not ok:
-                    return False, f"Copy to intermediate failed: {err}"
-
-        else:
-            # Multi-segment: render N segments with slight parameter variation, then concat
-            # Each segment re-applies the effects with shifted parameters
-            segment_files = []
-            for i in range(repetitions):
-                seg_path = os.path.join(tmpdir, f"seg_{i:04d}.ts")
-                # Build a slightly varied effect chain per segment
-                varied_effects = []
-                for ename, eparams in other_effects:
-                    varied_params = list(eparams)
-                    # Add progressive offset for hue-related effects, brightness, etc.
-                    if ename in ("huehsv", "ccshue") and eparams:
-                        base_val = float(eparams[0]) if eparams[0] else 0
-                        varied_params[0] = str(base_val + i * 30)
-                    elif ename == "brightness" and eparams:
-                        base_val = float(eparams[0]) if eparams[0] else 0
-                        varied_params[0] = str(base_val + (i % 3 - 1) * 0.05)
-                    varied_effects.append((ename, varied_params))
-
-                cmd = _build_ffmpeg_cmd_for_effects(input_path, seg_path, varied_effects, w, h, actual_dur)
-                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
-                if not ok:
-                    return False, f"Segment {i+1}/{repetitions} failed: {err}"
-                segment_files.append(seg_path)
-
-            # Concat segments
-            concat_list = os.path.join(tmpdir, "concat.txt")
-            with open(concat_list, "w") as f:
-                for sf in segment_files:
-                    f.write(f"file '{sf}'\n")
-
-            concat_cmd = [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", concat_list,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                intermediate_path
-            ]
-            ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
-            if not ok:
-                return False, f"Concat failed: {err}"
-
-        # Apply multipitch post-processing if present
-        if needs_multipitch:
-            # Gather all pitch values from all multipitch effects
-            all_pitch_values = []
-            for _, params in multipitch_effects:
-                all_pitch_values.extend(params if params else ["0"])
-
-            if not all_pitch_values:
-                all_pitch_values = ["0"]
-
-            # Use SoX multipitch pipeline
-            ok, err = _run_multipitch(intermediate_path, output_path, all_pitch_values)
-            if not ok:
-                return False, f"Multipitch post-processing failed: {err}"
-
-    return True, ""
-
-
 
 
 # ---------- Multipitch (SoX pitch-shift pipeline) ----------
@@ -1916,6 +1505,91 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
 
 
 
+@bot.hybrid_command(name="huehsv", aliases=["hhsv"], description="Apply hue shift via ImageMagick haldclut")
+@app_commands.describe(hue="Hue value (e.g. 0.5)", attachment="Video or image to hue-shift")
+async def huehsv_command(ctx: commands.Context, hue: float = 0.5, attachment: discord.Attachment = None):
+    """Apply hue shift using ImageMagick haldclut + FFmpeg.
+
+    Usage:
+      g!huehsv <hue>          — shift hue, default 0.5
+      g!hhsv <hue>            — alias
+
+    Internally: magick hald:6 -modulate 100,100,<hue*200+100> hsv.ppm
+    Then: ffmpeg -vf "movie=hsv.ppm,[in]haldclut,format=rgba" -pix_fmt yuv420p
+    """
+    # Resolve attachment
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
+
+    if not attachment:
+        await ctx.reply(
+            "**IHTX HueHSV**\n"
+            "Attach a video or image and use `g!huehsv <hue>`.\n\n"
+            "Applies hue shift via ImageMagick haldclut.\n"
+            "Example: `g!huehsv 0.5`\n"
+            "Aliases: `g!hhsv`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        await ctx.reply(f"Unsupported file type `{suffix}`. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        return
+
+    is_video = suffix in VIDEO_EXTENSIONS
+    out_ext = get_output_ext(suffix, is_video)
+
+    status_msg = await ctx.reply(
+        f"⚙️ Applying **huehsv** (hue={hue})... this may take a moment."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, f"output{out_ext}")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_huehsv, input_path, output_path, hue
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ HueHSV failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
+            return
+
+        out_filename = f"huehsv_{hue}_{Path(attachment.filename).stem}{out_ext}"
+        try:
+            await ctx.reply(
+                content=f"✅ **IHTX huehsv** (hue={hue}) applied!",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
 @bot.hybrid_command(name="syncaudio", aliases=["sa", "sync"], description="Sync video and audio durations by adjusting playback speed")
 @app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed", attachment="Video file to sync")
 async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: discord.Attachment = None):
@@ -2076,6 +1750,13 @@ async def help_command(ctx: commands.Context):
     audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
+    embed.add_field(
+        name="g!huehsv <hue>",
+        value="Apply hue shift via ImageMagick haldclut.\n"
+              "Example: `g!huehsv 0.5`\n"
+              "Aliases: `g!hhsv`",
+        inline=False,
+    )
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
     embed.add_field(name="Distortion", value=distortion_effects, inline=False)
     embed.add_field(name="Audio", value=audio_effects, inline=False)
