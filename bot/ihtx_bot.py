@@ -812,8 +812,8 @@ def _run_effect_chain(
                 varied_effects = []
                 for ename, eparams in other_effects:
                     varied_params = list(eparams)
-                    # Add progressive offset for hue, brightness, etc.
-                    if ename in ("hue", "ffmpeghue") and eparams:
+                    # Add progressive offset for hue-related effects, brightness, etc.
+                    if ename in ("huehsv", "ccshue") and eparams:
                         base_val = float(eparams[0]) if eparams[0] else 0
                         varied_params[0] = str(base_val + i * 30)
                     elif ename == "brightness" and eparams:
@@ -968,6 +968,122 @@ def _run_multipitch(
             ])
 
         return _run_ffmpeg_raw(cmd, timeout=300)
+
+
+
+
+
+def _build_atempo_chain(speed: float) -> str:
+    """Build an atempo filter chain that handles FFmpeg's 0.5–100.0 bounds.
+
+    FFmpeg's atempo filter only accepts values between 0.5 and 100.0.
+    For speeds outside this range, chain multiple atempo filters.
+    """
+    if 0.5 <= speed <= 100.0:
+        return f"atempo={speed}"
+    # Chain multiple atempo filters
+    parts = []
+    remaining = speed
+    while remaining > 100.0:
+        parts.append("atempo=100.0")
+        remaining /= 100.0
+    while remaining < 0.5:
+        parts.append("atempo=0.5")
+        remaining /= 0.5
+    parts.append(f"atempo={remaining}")
+    return ",".join(parts)
+
+
+# ---------- Syncaudio (video/audio duration sync) ----------
+
+def _run_syncaudio(
+    input_path: str,
+    output_path: str,
+    alt_mode: bool = False,
+) -> tuple[bool, str]:
+    """Sync video and audio durations by adjusting playback speed.
+
+    Default mode: adjust video speed (setpts) to match audio duration.
+    Alt mode: adjust audio speed (atempo) to match video duration.
+
+    Returns (ok, info_string_or_error).
+    """
+    # Extract video-only and audio-only streams
+    with tempfile.TemporaryDirectory() as tmpdir:
+        v_only = os.path.join(tmpdir, "v.mp4")
+        a_only = os.path.join(tmpdir, "a.wav")
+
+        # Extract video without audio
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-an", v_only]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Failed to extract video stream: {err}"
+
+        # Extract audio as WAV
+        cmd = ["ffmpeg", "-y", "-i", input_path, a_only]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Failed to extract audio stream: {err}"
+
+        # Get durations
+        vd = _ffprobe_duration(v_only)
+        ad = _ffprobe_duration(a_only)
+
+        # Get frame rate
+        fr_out = _ffprobe(v_only, "-select_streams", "v:0",
+                          "-show_entries", "stream=r_frame_rate",
+                          "-of", "default=nokey=1:noprint_wrappers=1")
+
+        if vd <= 0 or ad <= 0:
+            return False, f"Could not determine durations (video={vd:.3f}s, audio={ad:.3f}s)"
+
+        if alt_mode:
+            # Alt mode: adjust audio speed (atempo) to match video duration
+            speed = ad / vd
+            # FFmpeg atempo supports 0.5–100.0; chain if needed
+            atempo_filter = _build_atempo_chain(speed)
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", v_only,
+                "-stream_loop", "-1", "-i", a_only,
+                "-af", atempo_filter,
+                "-map", "0:v", "-map", "1:a",
+                "-t", str(vd),
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                output_path,
+            ]
+        else:
+            # Default mode: adjust video speed (setpts) to match audio duration
+            speed = vd / ad
+            # Use setpts to change video speed, keep original frame rate
+            fps_filter = f"setpts=1/({speed})*PTS"
+            if fr_out:
+                fps_filter += f",fps={fr_out}"
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", v_only,
+                "-stream_loop", "-1", "-i", a_only,
+                "-vf", fps_filter,
+                "-map", "0:v", "-map", "1:a",
+                "-t", str(max(vd, ad)),
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                output_path,
+            ]
+
+        ok, err = _run_ffmpeg_raw(cmd, timeout=300)
+        if not ok:
+            return False, f"Sync failed: {err}"
+
+        diff = vd - ad
+        info = (
+            f"Video: {vd:.3f}s\n"
+            f"Audio: {ad:.3f}s\n\n"
+            f"Speed Used: {speed:.6f}\n"
+            f"Diff: {diff:.6f}"
+        )
+        return True, info
 
 # ---------- Preview1280 (TV-simulator montage) ----------
 
@@ -1398,7 +1514,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
 
         try:
             await ctx.reply(
-                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!",
+                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!\n⚠️ Use `g!syncaudio` to sync video to audio if needed.",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -1595,6 +1711,101 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+
+
+@bot.hybrid_command(name="syncaudio", aliases=["sa", "sync"], description="Sync video and audio durations by adjusting playback speed")
+@app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed")
+async def syncaudio_command(ctx: commands.Context, mode: str = ""):
+    """Sync video and audio durations.
+
+    Default: adjusts video speed to match audio.
+    Alt mode: adjusts audio speed to match video.
+
+    Usage:
+      g!syncaudio         — adjust video speed to match audio
+      g!syncaudio alt     — adjust audio speed to match video
+      g!sa                — alias
+      g!sync alt          — alias
+    """
+    alt_mode = mode.lower().strip() == "alt"
+
+    # Look for attachments
+    attachment = None
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        mode_desc = "adjusts **video speed** to match audio" if not alt_mode else "adjusts **audio speed** to match video"
+        await ctx.reply(
+            "**IHTX Syncaudio**\n"
+            f"Attach a video and use `g!syncaudio [alt]`.\n\n"
+            f"Default: {mode_desc}\n"
+            "Alt mode (`alt`): adjusts the other stream instead.\n\n"
+            "Examples:\n"
+            "```\n"
+            "g!syncaudio         — video speed → match audio\n"
+            "g!syncaudio alt     — audio speed → match video\n"
+            "```\n"
+            "Aliases: `g!sa`, `g!sync`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"Syncaudio requires a video file. Got `{suffix}`.")
+        return
+
+    mode_label = "alt (audio→video)" if alt_mode else "default (video→audio)"
+    status_msg = await ctx.reply(
+        f"⚙️ Running **syncaudio** ({mode_label})... this may take a moment."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_syncaudio.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, info = await loop.run_in_executor(
+            None, _run_syncaudio,
+            input_path, output_path, alt_mode
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ Syncaudio failed:\n```\n{info[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
+            return
+
+        out_filename = f"syncaudio_{Path(attachment.filename).stem}.mp4"
+        try:
+            await ctx.reply(
+                content=f"✅ **IHTX syncaudio** ({mode_label}) applied!\n```\n{info}\n```",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
 @bot.hybrid_command(name="presets", aliases=["effects", "list"], description="List all available IHTX presets")
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
@@ -1658,12 +1869,19 @@ async def help_command(ctx: commands.Context):
         "swirl=angle;radius;cx;cy;fallout;lock, "
         "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
-    audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse"
+    audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
     embed.add_field(name="Distortion", value=distortion_effects, inline=False)
     embed.add_field(name="Audio", value=audio_effects, inline=False)
+    embed.add_field(
+        name="g!syncaudio [alt]",
+        value="Sync video & audio durations by adjusting playback speed.\n"
+              "Default: video speed → match audio. `alt`: audio speed → match video.\n"
+              "Aliases: `g!sa`, `g!sync`",
+        inline=False,
+    )
     embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
 
     embed.add_field(
