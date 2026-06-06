@@ -444,7 +444,7 @@ def _parse_effect_chain(effects_str: str) -> list[tuple[str, list[str]]]:
     """Parse 'effect=value,effect=value,...' into [(name, [params]), ...].
 
     Params are semicolon-separated sub-params within each effect.
-    For multipitch/mp/multi, params are semicolon-separated (e.g. multipitch=1;4;7).
+    For multipitch/mp/multi, params are semicolon-separated (e.g. multipitch=25;5;8.5).
     """
     effects = []
     for part in effects_str.split(","):
@@ -763,35 +763,36 @@ def _build_af_for_effects(effects: list[tuple[str, list[str]]], input_path: str 
     af_parts = []
     for name, params in effects:
         if name in ("multipitch", "mp", "multi"):
-            # multipitch in semitones — semicolon-separated, e.g. multipitch=1;4;7
-            # Uses SoX-style pitch shifting (asetrate + aresample) + amix + atrim + bass
+            # multipitch in semitones — semicolon-separated, e.g. multipitch=25;5;8.5
+            # Uses rubberband pitch shifting + amix + highpass
             semitones = params if params else ["0"]
-            sr = _ffprobe_sample_rate(input_path) if input_path else 44100
             if len(semitones) == 1:
-                # Single pitch — asetrate + aresample + atrim + bass boost
+                # Single pitch — rubberband + atrim + bass boost
                 pitch_ratio = 2 ** (float(semitones[0]) / 12)
-                new_sr = int(sr * pitch_ratio)
                 af_parts.append(
-                    f"asetrate={new_sr},aresample={sr},"
+                    f"rubberband=pitch={pitch_ratio:.6f}:"
+                    f"window=short:transients=mixed:"
+                    f"detector=soft:channels=together:pitchq=consistency,"
                     f"atrim=0.012,bass=g=2.5"
                 )
             else:
-                # Multiple pitches — asplit + asetrate per split + amix + atrim + bass
+                # Multiple pitches — asplit + rubberband per split + amix + highpass + atrim + bass
                 n = len(semitones)
                 # asplit
                 split_outputs = "".join(f"[{i+1}]" for i in range(n))
                 asplit = f"asplit={n}{split_outputs}"
-                # asetrate pitch shift per split
+                # rubberband pitch shift per split
                 pitch_parts = []
                 for i, s in enumerate(semitones):
                     pitch_ratio = 2 ** (float(s) / 12)
-                    new_sr = int(sr * pitch_ratio)
                     pitch_parts.append(
-                        f"[{i+1}]asetrate={new_sr},aresample={sr}[0{i+1}]"
+                        f"[{i+1}]rubberband=pitch={pitch_ratio:.6f}:"
+                        f"window=short:transients=mixed:"
+                        f"detector=soft:channels=together:pitchq=consistency[0{i+1}]"
                     )
-                # amix + atrim + bass
+                # amix + highpass + atrim + bass
                 amix_inputs = "".join(f"[0{i+1}]" for i in range(n))
-                amix = f"{amix_inputs}amix={n}:normalize=0,atrim=0.012,bass=g=2.5"
+                amix = f"{amix_inputs}amix={n}:normalize=0,highpass=f=5,atrim=0.012,bass=g=2.5"
                 af_parts.append(";".join([asplit] + pitch_parts + [amix]))
 
         elif name == "volume":
@@ -922,25 +923,25 @@ def _run_effect_chain(
 
 
 
-# ---------- Multipitch (SoX asetrate pitch-shift pipeline) ----------
+# ---------- Multipitch (rubberband pitch-shift pipeline) ----------
 
 def _run_multipitch(
     input_path: str,
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using FFmpeg -af with asplit + asetrate (SoX pitch) + amix.
+    """Run the multipitch pipeline using FFmpeg -af with asplit + rubberband pitch + amix.
 
-    Splits the audio into N copies via asplit, applies SoX-style pitch shifting
-    (asetrate + aresample) to each copy, then mixes them together via amix with
-    normalize=0, atrim=0.012 and bass=g=2.5.
+    Splits the audio into N copies via asplit, applies rubberband pitch shifting
+    to each copy, then mixes them together via amix with normalize=0, highpass=f=5,
+    atrim=0.012 and bass=g=2.5.
 
-    Example for pitches 1;4;7 (SR=44100):
+    Example for pitches 25;5;8.5 (SR=44100):
       -af "asplit=3[1][2][3];
-           [1]asetrate=46723,aresample=44100[01];
-           [2]asetrate=55562,aresample=44100[02];
-           [3]asetrate=66068,aresample=44100[03];
-           [01][02][03]amix=3:normalize=0,atrim=0.012,bass=g=2.5"
+           [1]rubberband=pitch=4.2190...:window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency[01];
+           [2]rubberband=pitch=1.3348...:window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency[02];
+           [3]rubberband=pitch=1.6148...:window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency[03];
+           [01][02][03]amix=3:normalize=0,highpass=f=5,atrim=0.012,bass=g=2.5"
       -c:v ffv1 -c:a pcm_s16le
     """
     if not pitch_values:
@@ -955,30 +956,28 @@ def _run_multipitch(
         except ValueError:
             return False, f"Invalid pitch value: {pv!r}"
 
-    # Probe audio sample rate
-    sr = _ffprobe_sample_rate(input_path)
-
     # Build -af string:
     # asplit=N -> N output pads numbered 1..N
-    # Each split -> asetrate=SR*ratio,aresample=SR (SoX pitch shift)
-    # All outputs -> amix=N:normalize=0,atrim=0.012,bass=g=2.5
+    # Each split -> rubberband pitch shift
+    # All outputs -> amix=N:normalize=0,highpass=f=5,atrim=0.012,bass=g=2.5
 
     # asplit part
     split_outputs = "".join(f"[{i+1}]" for i in range(n))
     asplit = f"asplit={n}{split_outputs}"
 
-    # asetrate pitch shift parts (SoX-style)
+    # rubberband pitch shift parts
     pitch_parts = []
     for i, pitch_val in enumerate(pitch_values):
         pitch_ratio = 2 ** (float(pitch_val) / 12)
-        new_sr = int(sr * pitch_ratio)
         pitch_parts.append(
-            f"[{i+1}]asetrate={new_sr},aresample={sr}[0{i+1}]"
+            f"[{i+1}]rubberband=pitch={pitch_ratio:.6f}:"
+            f"window=short:transients=mixed:"
+            f"detector=soft:channels=together:pitchq=consistency[0{i+1}]"
         )
 
-    # amix + atrim + bass
+    # amix + highpass + atrim + bass
     amix_inputs = "".join(f"[0{i+1}]" for i in range(n))
-    amix = f"{amix_inputs}amix={n}:normalize=0,atrim=0.012,bass=g=2.5"
+    amix = f"{amix_inputs}amix={n}:normalize=0,highpass=f=5,atrim=0.012,bass=g=2.5"
 
     af_str = ";".join([asplit] + pitch_parts + [amix])
 
@@ -1323,7 +1322,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset or effect. Available presets: {preset_list}\n"
-            f"Or chain effects: `g!ihtx hflip,hue=90,multipitch=5 3 10`\n"
+            f"Or chain effects: `g!ihtx hflip,hue=90,multipitch=25;5;8.5 3 10`\n"
             f"Use `g!ihtxhelp` for full effect list."
         )
         return
@@ -1346,12 +1345,12 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
             f"**I HATE THE X — IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]` or `g!ihtx effect=value,...`.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom effects:** `g!ihtx hflip,hue=90,multipitch=5 3 10`\n"
+            f"**Custom effects:** `g!ihtx hflip,hue=90,multipitch=25;5;8.5 3 10`\n"
             f"Use `g!ihtxhelp` for full effect list.\n\n"
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
             f"`g!ihtx glitch`\n"
-            f"`g!ihtx mirror=45,hue=90,multipitch=5 3 10`"
+            f"`g!ihtx mirror=45,hue=90,multipitch=25;5;8.5 3 10`"
         )
         return
 
@@ -1513,14 +1512,14 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 @bot.command(name="multipitch", aliases=["mp", "multi"])
 async def multipitch_command(ctx: commands.Context, *, args: str = ""):
-    """Apply multi-voice pitch shifting to an attached video using SoX asetrate.
+    """Apply multi-voice pitch shifting to an attached video using rubberband.
 
     Usage:
       g!multipitch <pitch_values>     — semicolon-separated semitone values
-      g!mp 1;4;7                      — aliases
+      g!mp 25;5;8.5                    — aliases
       g!multi -3;0;5                  — negative values supported
 
-    Example: g!multipitch 1;4;7
+    Example: g!multipitch 25;5;8.5
     """
     if not args:
         await ctx.reply(
@@ -1528,7 +1527,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
             "Attach a video and use `g!multipitch <pitches>`.\n\n"
             "Pitches are semicolon-separated semitone values.\n"
             "Each pitch creates a separate shifted voice, then they are mixed together.\n\n"
-            "Example: `g!multipitch 1;4;7`\n"
+            "Example: `g!multipitch 25;5;8.5`\n"
             "Aliases: `g!mp`, `g!multi`"
         )
         return
@@ -1536,7 +1535,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
     # Parse semicolon-separated pitch values
     pitch_values = [v.strip() for v in args.split(";") if v.strip()]
     if not pitch_values:
-        await ctx.reply("No pitch values provided. Use semicolon-separated values like `1;4;7`.")
+        await ctx.reply("No pitch values provided. Use semicolon-separated values like `25;5;8.5`.")
         return
 
     # Look for attachments
@@ -1554,7 +1553,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
     if not attachment:
         await ctx.reply(
             "Attach a video and use `g!multipitch <pitches>`.\n"
-            "Example: `g!multipitch 1;4;7`"
+            "Example: `g!multipitch 25;5;8.5`"
         )
         return
 
@@ -1640,7 +1639,7 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="g!ihtx effect=value,effect=value [rep] [dur]",
         value="Chain custom effects. Params use `=`, sub-params use `;`.\n"
-              "Example: `g!ihtx mirror=45,hue=90,multipitch=5 3 10`",
+              "Example: `g!ihtx mirror=45,hue=90,multipitch=25;5;8.5 3 10`",
         inline=False,
     )
     embed.add_field(
@@ -1650,8 +1649,8 @@ async def help_command(ctx: commands.Context):
     )
     embed.add_field(
         name="g!multipitch <pitches>  (aliases: mp, multi)",
-        value="Multi-voice pitch shift via SoX asetrate.\n"
-              "Semicolon-separated semitones: `g!multipitch 1;4;7`",
+        value="Multi-voice pitch shift via rubberband.\n"
+              "Semicolon-separated semitones: `g!multipitch 25;5;8.5`",
         inline=False,
     )
     embed.add_field(
@@ -1674,7 +1673,7 @@ async def help_command(ctx: commands.Context):
         "scroll=h;v, pan=x;y, vreverse, watermark=<url>, ring[=<url>], "
         "miui, reddit, caption=<text>"
     )
-    audio_effects = "multipitch=<semitones> (semi-sep: 1;4;7), volume=<val>, vibrato=freq;depth, areverse"
+    audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
