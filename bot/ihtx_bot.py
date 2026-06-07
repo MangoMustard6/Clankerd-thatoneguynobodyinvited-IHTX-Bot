@@ -69,7 +69,7 @@ def _is_owner_by_id(user_id: int) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "ihtxsync", "download", "dl"}
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "tvsim", "tv", "ihtxsync", "download", "dl"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -557,21 +557,29 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f"scale=iw:ih,crop=iw:ih,format=yuv420p"
         )
     if name in ("pinch&punch", "p&p", "pinchpunch"):
-        return "negate"
+        strength = params[0] if len(params) > 0 else "1"
+        radius = params[1] if len(params) > 1 else "0.5"
+        cx = params[2] if len(params) > 2 else "0.5"
+        cy = params[3] if len(params) > 3 else "0.5"
+        geq_expr = (
+            f"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),"
+            f"H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))"
+        )
+        return f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
     if name == "swirl":
         angle = params[0] if len(params) > 0 else "180"
         radius = params[1] if len(params) > 1 else "0.5"
         cx = params[2] if len(params) > 2 else "0.5"
         cy = params[3] if len(params) > 3 else "0.5"
         fallout = params[4] if len(params) > 4 else "quad"
-        lock = params[5] if len(params) > 5 else "false"
+        lockaspectratio = params[5] if len(params) > 5 else "false"
         exp_str = "" if fallout == "linear" else "^2"
         min_wh = "min(W,H)"
         swirl_geq = (
             f"p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),"
             f"H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))"
         )
-        if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
+        if lockaspectratio.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
             return f"format=yuv444p,scale=ih:ih,geq='{swirl_geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
         return f"format=yuv444p,geq='{swirl_geq}',scale=iw:ih,format=yuv420p"
     if name == "gm91deform":
@@ -1962,7 +1970,7 @@ async def help_command(ctx: commands.Context):
         "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "pinch&punch|p&p (map to negate), swirl=angle;radius;cx;cy;fallout;lock, "
+        "pinch&punch|p&p=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lockaspectratio, "
         "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
     audio_effects = "multipitch=<semitones> (pipe-sep: 25|5|8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
@@ -1985,6 +1993,13 @@ async def help_command(ctx: commands.Context):
               "Aliases: `g!sa`, `g!sync`",
         inline=False,
     )
+    embed.add_field(
+        name="g!tvsim [line_sync] [zoom_grill] [vertical]",
+        value="TV simulator with displacement mapping.\n"
+              "Defaults: line_sync=0.25, zoom=1, vertical=False\n"
+              "Aliases: `g!tv`",
+        inline=False,
+    )
     embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
 
     embed.add_field(
@@ -1999,6 +2014,174 @@ async def help_command(ctx: commands.Context):
     )
     embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
+
+
+# ---------- TV Simulator (tvsim) ----------
+
+def _run_tvsim(
+    input_path: str,
+    output_path: str,
+    line_sync: float = 0.25,
+    zoom_grill: float = 1.0,
+    vertical: bool = False,
+) -> tuple[bool, str]:
+    """Apply TV simulator effect using displacement map.
+
+    Parameters:
+      line_sync: 0-1, controls the scanline sync effect. Default 0.25.
+      zoom_grill: scales the displacement map crop. Default 1.0.
+      vertical: True = vertical orientation, False = horizontal.
+    """
+    line_sync = max(0.0, min(1.0, line_sync))
+    zoom_grill = max(0.1, zoom_grill)
+    contrast = (1 - line_sync) * 2.366666
+
+    # Download displacement map if needed
+    disp_url = "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
+    disp_path = os.path.join(os.path.dirname(output_path), "disp_map.mov")
+    if not os.path.exists(disp_path):
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(disp_url, disp_path)
+        except Exception:
+            return False, f"Failed to download displacement map from {disp_url}"
+
+    # Get input dimensions
+    w, h = 0, 0
+    info = _ffprobe_video_info(input_path)
+    w, h = info.get("width", 0), info.get("height", 0)
+    if w == 0 or h == 0:
+        return False, "Could not read input dimensions."
+
+    # Build filter_complex
+    if vertical:
+        # Vertical mode: [00][y][x]displace
+        fc = (
+            f"[0]scale=854:854,format=bgr32[00];"
+            f"[1]crop=iw:ih/{zoom_grill}:0:0,transpose=2,scale=854:854,"
+            f"eq=contrast={contrast},format=bgr32,hue=b=-0.033[x];"
+            f"color=s=854x854:c=#808080,format=bgr32[y];"
+            f"[00][y][x]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
+        )
+    else:
+        # Horizontal mode: [00][x][y]displace
+        fc = (
+            f"[0]scale=854:854,format=bgr32[00];"
+            f"[1]crop=iw:ih/{zoom_grill}:0:0,scale=854:854,"
+            f"eq=contrast={contrast},format=bgr32,hue=b=-0.033[x];"
+            f"color=s=854x854:c=#808080,format=bgr32[y];"
+            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
+        )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-stream_loop", "-1", "-i", disp_path,
+        "-filter_complex", fc,
+        "-shortest", "-map", "0:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", output_path,
+    ]
+    return _run_ffmpeg_raw(cmd, timeout=300)
+
+
+@bot.hybrid_command(name="tvsim", aliases=["tv"], description="Apply TV simulator displacement effect")
+@app_commands.describe(
+    line_sync="Scanline sync value 0-1 (default: 0.25)",
+    zoom_grill="Zoom grill factor (default: 1)",
+    vertical="Use vertical orientation (default: False)",
+    attachment="Video to apply TV simulator effect"
+)
+async def tvsim_command(
+    ctx: commands.Context,
+    line_sync: float = 0.25,
+    zoom_grill: float = 1.0,
+    vertical: bool = False,
+    attachment: discord.Attachment = None,
+):
+    """Apply TV simulator effect to an attached video.
+
+    Usage:
+      g!tvsim                     — default settings (0.25, 1, False)
+      g!tvsim 0.5 2 True          — custom: line_sync=0.5, zoom=2, vertical
+      g!tvsim 0.75                — line_sync=0.75, defaults for rest
+    """
+    # Resolve attachment
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
+
+    if not attachment:
+        await ctx.reply(
+            "**IHTX TV Simulator**\n"
+            "Attach a video and use `g!tvsim [line_sync] [zoom_grill] [vertical]`.\n\n"
+            "Parameters:\n"
+            "- `line_sync`: 0-1 (default: 0.25)\n"
+            "- `zoom_grill`: factor (default: 1)\n"
+            "- `vertical`: True/False (default: False)\n\n"
+            "Example: `g!tvsim 0.5 2 True`\n"
+            "Aliases: `g!tv`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"TV Simulator requires a video file. Got `{suffix}`.")
+        return
+
+    # Clamp values
+    if line_sync < 0 or line_sync > 1:
+        await ctx.reply("`line_sync` must be between 0 and 1.")
+        return
+
+    status_msg = await ctx.reply(
+        f"\u2699\ufe0f Applying **TV Simulator** (sync={line_sync}, zoom={zoom_grill}, vertical={vertical})..."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_tvsim.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"\u274c Failed to download your file: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_tvsim, input_path, output_path, line_sync, zoom_grill, vertical
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"\u274c TV Simulator failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="\u274c Output file too large for Discord (>25 MB). Try a shorter clip.")
+            return
+
+        out_filename = f"tvsim_{line_sync}_{zoom_grill}_{vertical}_{Path(attachment.filename).stem}.mp4"
+        try:
+            await ctx.reply(
+                content=f"\u2705 **IHTX TV Simulator** (sync={line_sync}, zoom={zoom_grill}, vertical={vertical}) applied!",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"\u274c Failed to upload result: {e}")
 
 
 # ---------- Owner-only moderation / utility commands ----------
