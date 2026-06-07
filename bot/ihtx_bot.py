@@ -556,8 +556,24 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f"geq='{zoom_geq}',"
             f"scale=iw:ih,crop=iw:ih,format=yuv420p"
         )
-    if name in ("pinch&punch", "p&p", "pinchpunch", "swirl"):
+    if name in ("pinch&punch", "p&p", "pinchpunch"):
         return "negate"
+    if name == "swirl":
+        angle = params[0] if len(params) > 0 else "180"
+        radius = params[1] if len(params) > 1 else "0.5"
+        cx = params[2] if len(params) > 2 else "0.5"
+        cy = params[3] if len(params) > 3 else "0.5"
+        fallout = params[4] if len(params) > 4 else "quad"
+        lock = params[5] if len(params) > 5 else "false"
+        exp_str = "" if fallout == "linear" else "^2"
+        min_wh = "min(W,H)"
+        swirl_geq = (
+            f"p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),"
+            f"H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))"
+        )
+        if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
+            return f"format=yuv444p,scale=ih:ih,geq='{swirl_geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
+        return f"format=yuv444p,geq='{swirl_geq}',scale=iw:ih,format=yuv420p"
     if name == "gm91deform":
         deform_geq = (
             "p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/1.22"
@@ -1946,7 +1962,7 @@ async def help_command(ctx: commands.Context):
         "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "pinch&punch|p&p|swirl (all map to negate), "
+        "pinch&punch|p&p (map to negate), swirl=angle;radius;cx;cy;fallout;lock, "
         "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
     audio_effects = "multipitch=<semitones> (pipe-sep: 25|5|8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
