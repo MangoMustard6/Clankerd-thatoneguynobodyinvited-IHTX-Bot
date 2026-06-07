@@ -670,6 +670,18 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
+            # TV simulator
+            if name in ("tvsim", "tv"):
+                line_sync = float(params[0]) if len(params) > 0 else 0.25
+                zoom_grill = float(params[1]) if len(params) > 1 else 1.0
+                vertical = params[2].lower() in ("1", "true", "t", "y", "yes", "+", "on") if len(params) > 2 else False
+                out = os.path.join(tmpdir, f"pipe_{i}.mp4")
+                ok, err = _run_tvsim(current, out, line_sync, zoom_grill, vertical)
+                if not ok:
+                    return False, err
+                current = out
+                continue
+
             # FFmpeg video filter
             vf = _build_ffmpeg_pipe_vf(name, params)
             if vf:
@@ -1970,7 +1982,7 @@ async def help_command(ctx: commands.Context):
         "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "pinch&punch|p&p=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lockaspectratio, "
+        "pinch&punch|p&p=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lockaspectratio, tvsim=line_sync;zoom_grill;vertical, "
         "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
     audio_effects = "multipitch=<semitones> (pipe-sep: 25|5|8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
