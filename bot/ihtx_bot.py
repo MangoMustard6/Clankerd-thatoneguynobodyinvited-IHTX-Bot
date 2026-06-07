@@ -618,7 +618,6 @@ def _apply_pipe_effects(
     Effects: huehsv (ImageMagick), multipitch (SoX), or FFmpeg filters.
     """
     if not effects:
-        # Just copy
         ok, err = _run_ffmpeg_raw(["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path], timeout=60)
         return ok, err
 
@@ -628,15 +627,10 @@ def _apply_pipe_effects(
         ffmpeg_af_parts = []
 
         for i, (name, params) in enumerate(effects):
-            is_last = (i == len(effects) - 1)
-
             # ImageMagick effect
             if name == "huehsv":
                 val = float(params[0]) if params else 0.5
-                if is_last:
-                    out = output_path
-                else:
-                    out = os.path.join(tmpdir, f"pipe_{i}.mp4")
+                out = os.path.join(tmpdir, f"pipe_{i}.mp4")
                 ok, err = _run_huehsv(current, out, val)
                 if not ok:
                     return False, err
@@ -645,10 +639,7 @@ def _apply_pipe_effects(
 
             # SoX multipitch
             if name in ("multipitch", "mp", "multi"):
-                if is_last:
-                    out = output_path
-                else:
-                    out = os.path.join(tmpdir, f"pipe_{i}.mp4")
+                out = os.path.join(tmpdir, f"pipe_{i}.mp4")
                 ok, err = _run_multipitch(current, out, params)
                 if not ok:
                     return False, err
@@ -685,7 +676,7 @@ def _apply_pipe_effects(
             if not ok:
                 return False, f"FFmpeg pipe filter failed: {err}"
         else:
-            # No FFmpeg filters; if current is not output_path, copy
+            # No FFmpeg filters; copy to final output
             if current != output_path:
                 shutil.copyfile(current, output_path)
 
