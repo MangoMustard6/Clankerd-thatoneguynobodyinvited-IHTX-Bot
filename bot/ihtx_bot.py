@@ -510,7 +510,7 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         return "hflip"
     if name == "vflip":
         return "vflip"
-    if name == "invert":
+    if name in ("invert", "negate"):
         return "negate"
     if name == "grayscale":
         return "colorchannelmixer=.299:.587:.114:0:.299:.587:.114:0:.299:.587:.114"
@@ -556,32 +556,8 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f"geq='{zoom_geq}',"
             f"scale=iw:ih,crop=iw:ih,format=yuv420p"
         )
-    if name in ("pinch&punch", "p&p", "pinchpunch"):
-        strength = params[0] if len(params) > 0 else "1"
-        radius = params[1] if len(params) > 1 else "0.5"
-        cx = params[2] if len(params) > 2 else "0.5"
-        cy = params[3] if len(params) > 3 else "0.5"
-        geq_expr = (
-            f"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),"
-            f"H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))"
-        )
-        return f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
-    if name == "swirl":
-        angle = params[0] if len(params) > 0 else "180"
-        radius = params[1] if len(params) > 1 else "0.5"
-        cx = params[2] if len(params) > 2 else "0.5"
-        cy = params[3] if len(params) > 3 else "0.5"
-        fallout = params[4] if len(params) > 4 else "quad"
-        lock = params[5] if len(params) > 5 else "false"
-        exp_str = "" if fallout == "linear" else "^2"
-        min_wh = "min(W,H)"
-        swirl_geq = (
-            f"p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),"
-            f"H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))"
-        )
-        if lock.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
-            return f"format=yuv444p,scale=ih:ih,geq='{swirl_geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
-        return f"format=yuv444p,geq='{swirl_geq}',scale=iw:ih,format=yuv420p"
+    if name in ("pinch&punch", "p&p", "pinchpunch", "swirl"):
+        return "negate"
     if name == "gm91deform":
         deform_geq = (
             "p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/1.22"
@@ -725,7 +701,7 @@ def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str, str] | 
       <exports> <duration_expr> <no_trim> <export_file_format> <output_file_format> <pipe effects>
 
     Example:
-      10 0.483 - mp4 default huehsv 0.5;mirror=90;multipitch=1;-4;-23
+      10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7
     """
     parts = shlex.split(args)
     if len(parts) <= 5:
@@ -899,6 +875,17 @@ def _run_multipitch(
     SoX pitch effect syntax: pitch -q cents 25 5 8.5
       where cents = semitones * 100
     """
+    # Flatten pitch values: support both | and ; separators
+    flattened = []
+    for pv in pitch_values:
+        if "|" in pv:
+            flattened.extend([v.strip() for v in pv.split("|") if v.strip()])
+        elif ";" in pv:
+            flattened.extend([v.strip() for v in pv.split(";") if v.strip()])
+        else:
+            flattened.append(pv.strip())
+    pitch_values = flattened
+
     if not pitch_values:
         return False, "No pitch values provided."
 
@@ -1409,7 +1396,7 @@ async def on_ready():
 
 
 @bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
-@app_commands.describe(args="Preset name or effect chain (e.g. chaos, hflip,hue=90,multipitch=25;5;8.5)", attachment="Video or image file to process")
+@app_commands.describe(args="Preset name or effect chain (e.g. chaos, huehsv 0.5;negate;multipitch=1|6|7)", attachment="Video or image file to process")
 async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment: discord.Attachment = None):
     """HEAVY COMMAND: replicates ihtx from FFmpeg.
 
@@ -1433,7 +1420,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         await ctx.reply(
             f"Unknown preset or invalid custom IHTX syntax. Available presets: {preset_list}\n"
             f"Custom syntax: `g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>`\n"
-            f"Example: `g!ihtx 10 0.483 - mp4 default huehsv 0.5;mirror=90;multipitch=1;-4;-23`\n"
+            f"Example: `g!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
             f"Use `g!ihtxhelp` for full usage."
         )
         return
@@ -1457,13 +1444,13 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             f"**I HATE THE X — IHTX Bot**\n"
             f"Attach a video or image and use `g!ihtx [preset]` or the custom IHTX syntax.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom IHTX:** `g!ihtx 10 0.483 - mp4 default huehsv 0.5;mirror=90;multipitch=1;-4;-23`\n"
+            f"**Custom IHTX:** `g!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
             f"Use `g!ihtxhelp` for full usage.\n\n"
             f"Examples:\n"
             f"`g!ihtx chaos`\n"
             f"`g!ihtx glitch`\n"
-            f"`g!ihtx 10 0.5 - mp4 default huehsv 0.5;mirror=45;multipitch=25;5;8.5`\n"
-            f"`g!ihtx 5 0.25 - mp4 default multipitch=1;2;3;4`"
+            f"`g!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=25|5|8.5`\n"
+            f"`g!ihtx 5 0.25 - mp4 default multipitch=1|2|3|4`"
         )
         return
 
@@ -1630,32 +1617,32 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 
 @bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via SoX")
-@app_commands.describe(args="Semicolon-separated semitone values (e.g. 25;5;8.5)", attachment="Video or audio file to pitch-shift")
+@app_commands.describe(args="Pipe-separated semitone values (e.g. 25|5|8.5)", attachment="Video or audio file to pitch-shift")
 async def multipitch_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
     """Apply multi-voice pitch shifting to an attached video using SoX pitch.
 
     Usage:
-      g!multipitch <pitch_values>     — semicolon-separated semitone values
-      g!mp 25;5;8.5                    — aliases
-      g!multi -3;0;5                  — negative values supported
+      g!multipitch <pitch_values>     — pipe-separated semitone values
+      g!mp 25|5|8.5                    — aliases
+      g!multi -3|0|5                  — negative values supported
 
-    Example: g!multipitch 25;5;8.5
+    Example: g!multipitch 25|5|8.5
     """
     if not args:
         await ctx.reply(
             "**IHTX Multipitch**\n"
             "Attach a video and use `g!multipitch <pitches>`.\n\n"
-            "Pitches are semicolon-separated semitone values.\n"
+            "Pitches are pipe-separated semitone values.\n"
             "Each pitch creates a separate shifted voice, then they are mixed together.\n\n"
-            "Example: `g!multipitch 25;5;8.5`\n"
+            "Example: `g!multipitch 25|5|8.5`\n"
             "Aliases: `g!mp`, `g!multi`"
         )
         return
 
-    # Parse semicolon-separated pitch values
-    pitch_values = [v.strip() for v in args.split(";") if v.strip()]
+    # Parse pipe-separated pitch values
+    pitch_values = [v.strip() for v in args.split("|") if v.strip()]
     if not pitch_values:
-        await ctx.reply("No pitch values provided. Use semicolon-separated values like `25;5;8.5`.")
+        await ctx.reply("No pitch values provided. Use pipe-separated values like `25|5|8.5`.")
         return
 
     # Resolve attachment: slash commands pass it as a parameter;
@@ -1674,7 +1661,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
     if not attachment:
         await ctx.reply(
             "Attach a video and use `g!multipitch <pitches>`.\n"
-            "Example: `g!multipitch 25;5;8.5`"
+            "Example: `g!multipitch 25|5|8.5`"
         )
         return
 
@@ -1687,7 +1674,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
         await ctx.reply(f"Multipitch requires a video file. Got `{suffix}`.")
         return
 
-    pitch_str = ";".join(pitch_values)
+    pitch_str = "|".join(pitch_values)
     status_msg = await ctx.reply(
         f"⚙️ Applying **multipitch** ({pitch_str})... this may take a moment."
     )
@@ -1941,7 +1928,7 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="g!ihtx effect=value,effect=value [rep] [dur]",
         value="Chain custom effects. Params use `=`, sub-params use `;`.\n"
-              "Example: `g!ihtx mirror=45,hue=90,multipitch=25;5;8.5 3 10`",
+              "Example: `g!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`",
         inline=False,
     )
     embed.add_field(
@@ -1952,8 +1939,8 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="g!multipitch <pitches>  (aliases: mp, multi)",
         value="Multi-voice pitch shift via SoX pitch.\n"
-              "Semicolon-separated semitones: `g!multipitch 25;5;8.5`\n"
-              "Can also be chained: `g!ihtx hflip,multipitch=25;5;8.5`",
+              "Pipe-separated semitones: `g!multipitch 25|5|8.5`\n"
+              "Can also be chained: `g!ihtx huehsv 0.5;negate;multipitch=25|5|8.5`",
         inline=False,
     )
     embed.add_field(
@@ -1963,16 +1950,15 @@ async def help_command(ctx: commands.Context):
     )
     # Effect reference
     video_effects = (
-        "hflip, vflip, invert, invlum, invertrgb=r;g;b, grayscale, sepia, "
+        "hflip, vflip, negate, invlum, invertrgb=r;g;b, grayscale, sepia, "
         "rotate=<deg>, huehsv=<val> (magick-style), ccshue=<val> (FFmpeg hue=h=), "
         "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "pinch&punch|p&p=strength;radius;cx;cy, "
-        "swirl=angle;radius;cx;cy;fallout;lock, "
+        "pinch&punch|p&p|swirl (all map to negate), "
         "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
-    audio_effects = "multipitch=<semitones> (semi-sep: 25;5;8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
+    audio_effects = "multipitch=<semitones> (pipe-sep: 25|5|8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(
