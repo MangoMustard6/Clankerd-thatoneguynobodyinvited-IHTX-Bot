@@ -1941,7 +1941,7 @@ async def help_command(ctx: commands.Context):
     )
     # Effect reference
     video_effects = (
-        "hflip, vflip, negate, invlum, invertrgb=r;g;b, grayscale, sepia, "
+        "hflip, vflip, negate (invert alias), invlum, invertrgb=r;g;b, grayscale, sepia, "
         "rotate=<deg>, huehsv=<val> (magick-style), ccshue=<val> (FFmpeg hue=h=), "
         "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
