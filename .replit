@@ -34,7 +34,7 @@ args = "python3 main.py"
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
-integrations = ["python_openai_ai_integrations:1.0.0"]
+integrations = []
 
 [postMerge]
 path = "scripts/post-merge.sh"

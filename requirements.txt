@@ -3,5 +3,4 @@ aiohttp>=3.8.1
 yt-dlp
 aiohttp
 discord.py
-openai
 yt-dlp
