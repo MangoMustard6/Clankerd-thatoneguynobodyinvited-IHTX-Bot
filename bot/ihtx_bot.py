@@ -158,6 +158,58 @@ def _save_channel_blocks():
 
 _load_channel_blocks()
 
+# Per-channel keyword blocklist
+KEYWORD_BLOCK_FILE = Path("bot/keyword_blocks.json")
+keyword_blocks: dict[int, set[str]] = {}
+
+
+def _normalize_keyword(keyword: str) -> str:
+    return re.sub(r"\s+", " ", keyword.strip().lower())
+
+
+def _load_keyword_blocks():
+    global keyword_blocks
+    try:
+        if KEYWORD_BLOCK_FILE.exists():
+            with KEYWORD_BLOCK_FILE.open() as f:
+                raw = json.load(f)
+            keyword_blocks = {
+                int(channel_id): {
+                    _normalize_keyword(keyword)
+                    for keyword in keywords
+                    if _normalize_keyword(str(keyword))
+                }
+                for channel_id, keywords in raw.items()
+            }
+        else:
+            keyword_blocks = {}
+    except Exception:
+        keyword_blocks = {}
+
+
+def _save_keyword_blocks():
+    KEYWORD_BLOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    serializable = {
+        str(channel_id): sorted(keywords)
+        for channel_id, keywords in keyword_blocks.items()
+        if keywords
+    }
+    with KEYWORD_BLOCK_FILE.open("w") as f:
+        json.dump(serializable, f, indent=2)
+
+
+def _blocked_keyword_for_message(channel_id: int, content: str) -> str | None:
+    keywords = keyword_blocks.get(channel_id, set())
+    if not keywords:
+        return None
+    normalized_content = content.lower()
+    for keyword in sorted(keywords, key=len, reverse=True):
+        if keyword and keyword in normalized_content:
+            return keyword
+    return None
+
+_load_keyword_blocks()
+
 # Tags (custom presets)
 TAGS_FILE = Path("bot/tags.json")
 tags: dict[str, dict] = {}
@@ -476,31 +528,64 @@ def _run_huehsv(
 
 # ---------- Pipe effects engine ----------
 
-def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
-    """Parse semicolon-separated pipe effects.
+PIPE_EFFECT_NAMES = {
+    "hflip", "vflip", "invert", "negate", "grayscale", "sepia", "rotate",
+    "ccshue", "brightness", "contrast", "saturation", "swapuv", "mirror",
+    "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
+    "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
+    "channelblend", "huehsv", "multipitch", "mp", "multi", "tvsim", "tv",
+    "syncaudio",
+}
 
-    Each effect is: name=value or name value.
-    Params are semicolon-separated within each effect.
+def _split_effect_params(value: str) -> list[str]:
+    """Split effect parameters using the separators users commonly type."""
+    return [p.strip() for p in re.split(r"[;,|\s]+", value.strip()) if p.strip()]
+
+
+def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
+    """Parse pipe effects from IHTX custom syntax.
+
+    Effects are separated with semicolons. Each effect can be written as
+    ``name=value`` or ``name value``. Parameters can be separated with spaces,
+    commas, semicolons, or pipes, so forms like ``tvsim=0.5,2,true`` and
+    ``tvsim 0.5 2 true`` both work.
     """
     effects = []
+    current_name = None
+    current_params: list[str] = []
+
     for part in pipe_str.split(";"):
         part = part.strip()
         if not part:
             continue
         # Strip optional annotations like (magick)
         part = re.sub(r"\s*\(magick\)\s*", "", part, flags=re.IGNORECASE)
+
         if "=" in part:
+            if current_name is not None:
+                effects.append((current_name, current_params))
             name, value = part.split("=", 1)
-            name = name.strip().lower()
-            params = [p.strip() for p in value.split(";") if p.strip()]
+            current_name = name.strip().lower()
+            current_params = _split_effect_params(value)
+            continue
+
+        tokens = part.split(None, 1)
+        possible_name = tokens[0].strip().lower()
+        if possible_name in PIPE_EFFECT_NAMES:
+            if current_name is not None:
+                effects.append((current_name, current_params))
+            current_name = possible_name
+            current_params = _split_effect_params(tokens[1]) if len(tokens) > 1 else []
+        elif current_name is not None:
+            # Treat semicolon fragments after an effect as additional params,
+            # e.g. tvsim=0.5;2;true.
+            current_params.extend(_split_effect_params(part))
         else:
-            # Check if there's a space-separated value (e.g. "huehsv 0.5")
-            tokens = part.split(None, 1)
-            name = tokens[0].strip().lower()
-            params = []
-            if len(tokens) > 1:
-                params = [p.strip() for p in tokens[1].split(";") if p.strip()]
-        effects.append((name, params))
+            current_name = possible_name
+            current_params = _split_effect_params(tokens[1]) if len(tokens) > 1 else []
+
+    if current_name is not None:
+        effects.append((current_name, current_params))
     return effects
 
 
@@ -1551,7 +1636,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
-@bot.hybrid_command(name="preview1280", aliases=["p1280"], description="Create a 12-segment TV-simulator preview montage")
+@bot.hybrid_command(name="preview1280", aliases=["p1280", "preview", "pv1280"], description="Create a 12-segment TV-simulator preview montage")
 @app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)", attachment="Video file to preview")
 async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85, attachment: discord.Attachment = None):
     """Create a 12-segment TV-simulator preview montage from an attached video.
@@ -2013,6 +2098,12 @@ async def help_command(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
+    embed.add_field(
+        name="Owner moderation",
+        value="`g!keywordblock <keyword> [channel]` blocks a keyword only in that channel.\n"
+              "`g!keywordblockremove <keyword> [channel]` removes that channel keyword block.",
+        inline=False,
+    )
 
     embed.add_field(
         name="Supported formats",
@@ -2097,7 +2188,7 @@ def _run_tvsim(
     return _run_ffmpeg_raw(cmd, timeout=300)
 
 
-@bot.hybrid_command(name="tvsim", aliases=["tv"], description="Apply TV simulator displacement effect")
+@bot.hybrid_command(name="tvsim", aliases=["tv", "tvsimulator"], description="Apply TV simulator displacement effect")
 @app_commands.describe(
     line_sync="Scanline sync value 0-1 (default: 0.25)",
     zoom_grill="Zoom grill factor (default: 1)",
@@ -2289,6 +2380,65 @@ async def unblockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Unblocked channel `{channel_id}`.")
 
 
+@bot.hybrid_command(name="keywordblock", aliases=["blockkeyword", "kb"], description="Owner-only: block a keyword in one channel")
+@app_commands.describe(keyword="Keyword or phrase to block", channel="Channel mention or ID (omit for current channel)")
+@commands.check(_is_owner)
+async def keywordblock(ctx: commands.Context, keyword: str, channel: str = None):
+    """Owner-only: block a keyword in a single channel.
+
+    This is channel-scoped only; it does not create a global keyword block.
+    """
+    normalized = _normalize_keyword(keyword)
+    if not normalized:
+        await ctx.reply("❌ Provide a keyword or phrase to block.")
+        return
+    if channel is None:
+        channel_id = ctx.channel.id
+    else:
+        try:
+            channel_id = _parse_digits(channel)
+        except ValueError:
+            await ctx.reply("❌ Invalid channel. Provide a channel mention or numeric ID.")
+            return
+
+    blocked = keyword_blocks.setdefault(channel_id, set())
+    if normalized in blocked:
+        await ctx.reply(f"Keyword `{normalized}` is already blocked in channel `{channel_id}`.")
+        return
+    blocked.add(normalized)
+    _save_keyword_blocks()
+    await ctx.reply(f"✅ Blocked keyword `{normalized}` in channel `{channel_id}`.")
+
+
+@bot.hybrid_command(name="keywordblockremove", aliases=["unblockkeyword", "removekeywordblock", "kbr"], description="Owner-only: remove a keyword block from one channel")
+@app_commands.describe(keyword="Keyword or phrase to unblock", channel="Channel mention or ID (omit for current channel)")
+@commands.check(_is_owner)
+async def keywordblockremove(ctx: commands.Context, keyword: str, channel: str = None):
+    """Owner-only: remove a keyword block from a single channel."""
+    normalized = _normalize_keyword(keyword)
+    if not normalized:
+        await ctx.reply("❌ Provide a keyword or phrase to unblock.")
+        return
+    if channel is None:
+        channel_id = ctx.channel.id
+    else:
+        try:
+            channel_id = _parse_digits(channel)
+        except ValueError:
+            await ctx.reply("❌ Invalid channel. Provide a channel mention or numeric ID.")
+            return
+
+    blocked = keyword_blocks.get(channel_id, set())
+    if normalized not in blocked:
+        await ctx.reply(f"Keyword `{normalized}` is not blocked in channel `{channel_id}`.")
+        return
+    blocked.discard(normalized)
+    if not blocked:
+        keyword_blocks.pop(channel_id, None)
+    _save_keyword_blocks()
+    await ctx.reply(f"✅ Removed keyword block `{normalized}` from channel `{channel_id}`.")
+
+
 @bot.hybrid_command(name="say", description="Owner-only: make the bot send a message")
 @app_commands.describe(message="Message content to send")
 @commands.check(_is_owner)
@@ -2324,6 +2474,33 @@ async def sayembed(ctx: commands.Context, *, content: str):
             await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send embed: {e}")
+
+
+# ---------- Message filtering ----------
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # Always allow owners to manage the bot and allow all bot commands to run.
+    if not _is_owner_by_id(message.author.id) and not message.content.startswith("g!"):
+        keyword = _blocked_keyword_for_message(message.channel.id, message.content)
+        if keyword:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            try:
+                await message.channel.send(
+                    f"{message.author.mention}, that keyword is blocked in this channel.",
+                    delete_after=8,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+    await bot.process_commands(message)
 
 
 # ---------- Error handling & run ----------
