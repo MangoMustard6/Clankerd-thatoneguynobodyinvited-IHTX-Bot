@@ -2753,6 +2753,41 @@ async def clearchat(ctx: commands.Context):
     await ctx.reply("🧹 Your conversation history has been cleared.")
 
 
+@bot.hybrid_command(name="imagine", aliases=["img", "gen", "generate"], description="Generate an image from a text prompt")
+@app_commands.describe(prompt="Describe the image you want to generate")
+async def imagine(ctx: commands.Context, *, prompt: str):
+    """Generate an image using AI from a text description."""
+    if _genai_client is None:
+        await ctx.reply("❌ Image generation is unavailable (missing `google-genai` package).")
+        return
+
+    async with ctx.typing():
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _genai_client.models.generate_images(
+                    model="imagen-3.0-generate-002",
+                    prompt=prompt,
+                    config=_genai_types.GenerateImagesConfig(
+                        number_of_images=1,
+                        aspect_ratio="1:1",
+                    ),
+                ),
+            )
+            image_bytes = response.generated_images[0].image.image_bytes
+        except Exception as e:
+            await ctx.reply(f"❌ Image generation failed: {e}")
+            return
+
+    import io
+    file = discord.File(fp=io.BytesIO(image_bytes), filename="imagine.png")
+    embed = discord.Embed(description=f"🎨 **{prompt}**", color=discord.Color.og_blurple())
+    embed.set_image(url="attachment://imagine.png")
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.reply(embed=embed, file=file)
+
+
 # ---------- Fun commands ----------
 
 _8BALL_RESPONSES = [
