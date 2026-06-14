@@ -297,9 +297,9 @@ def _save_autoreplies():
 
 _load_autoreplies()
 
-# Autoreply2 (per-user auto-reply toggle)
+# Autoreply2 (per-channel AI auto-reply toggle)
 AUTOREPLY2_FILE = Path("bot/autoreply2.json")
-autoreply2: set[int] = set()
+autoreply2: set[int] = set()  # stores channel IDs
 
 
 def _load_autoreply2():
@@ -307,7 +307,10 @@ def _load_autoreply2():
     try:
         if AUTOREPLY2_FILE.exists():
             with AUTOREPLY2_FILE.open() as f:
-                autoreply2 = set(int(x) for x in json.load(f))
+                raw = json.load(f)
+            # Migration: old format stored user IDs — wipe and start fresh as channel IDs
+            autoreply2 = set()
+            AUTOREPLY2_FILE.write_text("[]")
         else:
             autoreply2 = set()
     except Exception:
@@ -2871,39 +2874,62 @@ async def listautoreplies(ctx: commands.Context):
 
 # ---------- Autoreply2 ----------
 
-@bot.hybrid_command(name="autoreply2", aliases=["ar2"], description="Owner-only: toggle AI auto-reply to every message from a user")
-@app_commands.describe(user="The user to toggle AI auto-reply for")
+@bot.hybrid_command(name="autoreply2", aliases=["ar2"], description="Owner-only: toggle AI auto-reply for every message in this channel")
 @commands.check(_is_owner)
-async def autoreply2_cmd(ctx: commands.Context, user: discord.Member):
-    """Owner-only: toggle per-user AI auto-reply.
+async def autoreply2_cmd(ctx: commands.Context):
+    """Owner-only: toggle AI auto-reply on/off for the current channel.
 
-    When enabled, the bot responds to every message from that user using the AI (same as tugni;chat).
-    Run again on the same user to toggle off.
+    When enabled, the bot responds to every message in this channel using AI.
+    Run again to toggle off.
 
     Example:
-      tugni;autoreply2 @someone   ← toggles on
-      tugni;autoreply2 @someone   ← toggles off
+      tugni;autoreply2   ← toggles on in current channel
+      tugni;autoreply2   ← toggles off
     """
-    uid = user.id
-    if uid in autoreply2:
-        autoreply2.discard(uid)
+    cid = ctx.channel.id
+    if cid in autoreply2:
+        autoreply2.discard(cid)
         _save_autoreply2()
-        await ctx.reply(f"✅ AI auto-reply **disabled** for {user.mention}.")
+        await ctx.reply(f"✅ AI auto-reply **disabled** in {ctx.channel.mention}.")
     else:
-        autoreply2.add(uid)
+        autoreply2.add(cid)
         _save_autoreply2()
-        await ctx.reply(f"✅ AI auto-reply **enabled** for {user.mention}. The bot will reply to their messages using AI.")
+        await ctx.reply(f"✅ AI auto-reply **enabled** in {ctx.channel.mention}. The bot will reply to every message using AI.")
 
 
-@bot.hybrid_command(name="autoreply2list", aliases=["ar2list"], description="Owner-only: list all users with AI auto-reply enabled")
+@bot.hybrid_command(name="autoreply2list", aliases=["ar2list"], description="Owner-only: list all channels with AI auto-reply enabled")
 @commands.check(_is_owner)
 async def autoreply2list(ctx: commands.Context):
-    """Owner-only: list all active autoreply2 targets."""
+    """Owner-only: list all channels with autoreply2 active."""
     if not autoreply2:
-        await ctx.reply("No AI auto-reply targets set.")
+        await ctx.reply("No channels have AI auto-reply enabled.")
         return
-    lines = [f"<@{uid}>" for uid in autoreply2]
-    await ctx.reply("AI auto-reply enabled for:\n" + "\n".join(lines))
+    lines = [f"<#{cid}>" for cid in autoreply2]
+    await ctx.reply("AI auto-reply enabled in:\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="removear2mentions", aliases=["rarm2", "noar2ping"], description="Owner-only: stop autoreply2 from pinging a specific user")
+@app_commands.describe(user="The user to stop pinging in autoreply2 responses")
+@commands.check(_is_owner)
+async def removear2mentions(ctx: commands.Context, user: discord.Member):
+    """Owner-only: toggle off @mention pings for a user in autoreply2 responses.
+
+    When set, autoreply2 will still reply to their messages but won't ping them.
+    Run again on the same user to re-enable pings.
+
+    Example:
+      tugni;removear2mentions @someone   ← disables pings for them
+      tugni;removear2mentions @someone   ← re-enables pings
+    """
+    uid = user.id
+    if uid in autoreply2_no_mention:
+        autoreply2_no_mention.discard(uid)
+        _save_autoreply2_no_mention()
+        await ctx.reply(f"✅ Autoreply2 will now **ping** {user.mention} again.")
+    else:
+        autoreply2_no_mention.add(uid)
+        _save_autoreply2_no_mention()
+        await ctx.reply(f"✅ Autoreply2 will no longer ping {user.mention} when replying.")
 
 
 # ---------- Warnings ----------
@@ -3268,11 +3294,12 @@ async def on_message(message: discord.Message):
                 await message.reply(reply)
                 break
 
-        # Autoreply2 — AI reply to every message from targeted users
-        if message.author.id in autoreply2 and _genai_client is not None:
+        # Autoreply2 — AI reply to every message in enabled channels
+        if message.channel.id in autoreply2 and _genai_client is not None:
             ok2, _ = _check_heavy_limit(message.author.id)
             if ok2:
                 uid2 = message.author.id
+                no_ping = uid2 in autoreply2_no_mention
                 hist2 = _chat_histories.setdefault(uid2, [])
                 system2 = _CHAT_SYSTEM_PROMPT
                 if _OWNER_PERSONAS.get(uid2):
@@ -3298,11 +3325,9 @@ async def on_message(message: discord.Message):
                     text_only2 = [p for p in parts2 if "text" in p] or [{"text": "[media]"}]
                     hist2[-1] = {"role": "user", "parts": text_only2}
                     hist2.append({"role": "model", "parts": [{"text": reply2_text}]})
-                    if len(reply2_text) > 1900:
-                        for chunk in [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]:
-                            await message.reply(chunk)
-                    else:
-                        await message.reply(reply2_text)
+                    chunks2 = [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]
+                    for i, chunk in enumerate(chunks2):
+                        await message.reply(chunk, mention_author=(not no_ping and i == 0))
                 except Exception:
                     pass
 
