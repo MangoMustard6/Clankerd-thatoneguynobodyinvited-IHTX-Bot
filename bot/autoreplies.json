@@ -5,7 +5,10 @@
   },
   "67": {
     "response": "\"67\" \ud83e\udd16",
-    "channel_id": null
+    "channel_id": null,
+    "blocked_channels": [
+      1513368653137973329
+    ]
   },
   ".t": {
     "response": "HEY!!!! USE <#1496114769458106509> FOR A REASON, ||{mention}||",
