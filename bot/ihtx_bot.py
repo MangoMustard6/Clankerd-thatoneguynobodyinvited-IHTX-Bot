@@ -2772,14 +2772,14 @@ async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
 @bot.hybrid_command(name="autoreply", aliases=["ar"], description="Owner-only: add an autoreply trigger (optionally channel-specific)")
 @app_commands.describe(
     trigger="Word or phrase that triggers the reply",
-    channel="Optional: only reply in this channel (leave blank for all channels)",
+    channel='Optional: only reply in this channel (leave blank = all channels)',
     response="What the bot replies (use {mention} for user)",
 )
 @commands.check(_is_owner)
 async def autoreply(ctx: commands.Context, trigger: str, channel: discord.TextChannel = None, *, response: str):
     """Owner-only: add an autoreply. When anyone says the trigger, the bot replies.
 
-    Optionally restrict to a specific channel.
+    Leave channel blank (or omit) to reply in ALL channels.
     Use {mention} or {user} to ping the user in the response.
     Example (all channels):
       tugni;autoreply hello Hello there, {mention}!
@@ -2794,10 +2794,55 @@ async def autoreply(ctx: commands.Context, trigger: str, channel: discord.TextCh
         await ctx.reply("❌ Provide a response message.")
         return
     channel_id = channel.id if channel else None
-    autoreplies[trigger_norm] = {"response": response, "channel_id": channel_id}
+    # Preserve existing blocked_channels if updating an existing entry
+    existing_blocked = []
+    if trigger_norm in autoreplies and isinstance(autoreplies[trigger_norm], dict):
+        existing_blocked = autoreplies[trigger_norm].get("blocked_channels", [])
+    autoreplies[trigger_norm] = {"response": response, "channel_id": channel_id, "blocked_channels": existing_blocked}
     _save_autoreplies()
-    channel_note = f" in {channel.mention}" if channel else " in all channels"
+    channel_note = f" in {channel.mention}" if channel else " in **all channels**"
     await ctx.reply(f"✅ Autoreply set{channel_note}: `{trigger_norm}` → {response}")
+
+
+@bot.hybrid_command(name="blockarchannel", aliases=["bac", "silencear"], description="Owner-only: stop an autoreply from firing in a specific channel")
+@app_commands.describe(
+    trigger="The autoreply trigger to silence",
+    channel="Channel to block it in (leave blank = current channel)",
+)
+@commands.check(_is_owner)
+async def blockarchannel(ctx: commands.Context, trigger: str, channel: discord.TextChannel = None):
+    """Owner-only: prevent an autoreply trigger from firing in a specific channel.
+
+    The autoreply stays active in all other channels — only this one is silenced.
+    Run again with the same trigger + channel to unblock it.
+
+    Example:
+      tugni;blockarchannel hello           ← silences 'hello' in current channel
+      tugni;blockarchannel hello #general  ← silences 'hello' in #general
+    """
+    trigger_norm = trigger.strip().lower()
+    if trigger_norm not in autoreplies:
+        await ctx.reply(f"❌ No autoreply found for `{trigger_norm}`.")
+        return
+
+    target_channel = channel or ctx.channel
+    cid = target_channel.id
+
+    entry = autoreplies[trigger_norm]
+    if not isinstance(entry, dict):
+        entry = {"response": entry, "channel_id": None, "blocked_channels": []}
+    blocked = entry.setdefault("blocked_channels", [])
+
+    if cid in blocked:
+        blocked.remove(cid)
+        autoreplies[trigger_norm] = entry
+        _save_autoreplies()
+        await ctx.reply(f"✅ Autoreply `{trigger_norm}` **unblocked** in {target_channel.mention} — it will fire there again.")
+    else:
+        blocked.append(cid)
+        autoreplies[trigger_norm] = entry
+        _save_autoreplies()
+        await ctx.reply(f"✅ Autoreply `{trigger_norm}` **silenced** in {target_channel.mention} — it won't fire there anymore.")
 
 
 @bot.hybrid_command(name="removeautoreply", aliases=["rar", "deautoreply"], description="Owner-only: remove an autoreply trigger")
@@ -3289,7 +3334,12 @@ async def on_message(message: discord.Message):
         for trigger, entry in autoreplies.items():
             if trigger in content_lower:
                 ch_id = entry.get("channel_id") if isinstance(entry, dict) else None
+                blocked = entry.get("blocked_channels", []) if isinstance(entry, dict) else []
+                # Skip if restricted to a different channel
                 if ch_id is not None and message.channel.id != ch_id:
+                    continue
+                # Skip if this channel is explicitly blocked for this trigger
+                if message.channel.id in blocked:
                     continue
                 resp = entry.get("response", entry) if isinstance(entry, dict) else entry
                 reply = resp.replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
