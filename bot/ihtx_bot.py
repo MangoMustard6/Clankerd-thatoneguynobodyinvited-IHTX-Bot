@@ -40,6 +40,11 @@ try:
 except ImportError:
     _genai_client = None
 
+try:
+    import fal_client as _fal_client
+except ImportError:
+    _fal_client = None
+
 # ---------- Configuration & constants ----------
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -3257,6 +3262,53 @@ async def on_message(message: discord.Message):
             return
 
     await bot.process_commands(message)
+
+
+# ---------- Image-to-video (fal.ai HappyHorse) ----------
+
+@bot.command(name="imagevideo")
+async def imagevideo(ctx: commands.Context, *, prompt: str = "cinematic scene"):
+    """Generate a short video from an attached image using HappyHorse AI.
+
+    Usage: tugni;imagevideo [optional prompt]
+    Attach an image to the message.
+    """
+    if _fal_client is None:
+        await ctx.reply("❌ `fal-client` is not installed. Ask the bot owner to install it.")
+        return
+
+    if not ctx.message.attachments:
+        await ctx.reply("❌ Please attach an image to use with this command.")
+        return
+
+    fal_key = os.environ.get("FAL_KEY")
+    if not fal_key:
+        await ctx.reply("❌ `FAL_KEY` is not configured. Ask the bot owner to add it.")
+        return
+
+    image_url = ctx.message.attachments[0].url
+    status_msg = await ctx.reply("🎬 Generating video with HappyHorse AI… this may take a minute.")
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: _fal_client.subscribe(
+                "fal-ai/happyhorse-1.0/image-to-video",
+                arguments={
+                    "prompt": prompt,
+                    "image_url": image_url,
+                    "duration": 5,
+                },
+            ),
+        )
+
+        video_url = result["video"]["url"]
+        await status_msg.edit(content="✅ Done!")
+        await ctx.send(video_url)
+
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Error generating video:\n```\n{e}\n```")
 
 
 # ---------- Error handling & run ----------
