@@ -33,10 +33,11 @@ except ImportError:
     yt_dlp = None
 
 try:
-    import anthropic as _anthropic_lib
-    _anthropic_client = _anthropic_lib.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    from google import genai as _genai_lib
+    from google.genai import types as _genai_types
+    _genai_client = _genai_lib.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 except ImportError:
-    _anthropic_client = None
+    _genai_client = None
 
 # ---------- Configuration & constants ----------
 
@@ -2694,8 +2695,8 @@ _CHAT_MAX_HISTORY = 20
 @app_commands.describe(message="Your message to the AI")
 async def chat(ctx: commands.Context, *, message: str):
     """Chat with the IHTX AI assistant. Keeps conversation history per user."""
-    if _anthropic_client is None:
-        await ctx.reply("❌ AI chat is unavailable (missing `anthropic` package).")
+    if _genai_client is None:
+        await ctx.reply("❌ AI chat is unavailable (missing `google-genai` package).")
         return
 
     user_id = ctx.author.id
@@ -2704,9 +2705,9 @@ async def chat(ctx: commands.Context, *, message: str):
     system = _CHAT_SYSTEM_PROMPT
     persona = _OWNER_PERSONAS.get(user_id)
     if persona:
-        system += f"\n\nYou are currently speaking with the Creator ({persona['name']}). Be extra friendly."
+        system += f"\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
 
-    history.append({"role": "user", "content": message})
+    history.append({"role": "user", "parts": [{"text": message}]})
     if len(history) > _CHAT_MAX_HISTORY:
         history[:] = history[-_CHAT_MAX_HISTORY:]
 
@@ -2715,20 +2716,22 @@ async def chat(ctx: commands.Context, *, message: str):
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: _anthropic_client.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=1024,
-                    system=system,
-                    messages=history,
+                lambda: _genai_client.models.generate_content(
+                    model="gemini-2.5-flash-preview-05-20",
+                    contents=history,
+                    config=_genai_types.GenerateContentConfig(
+                        system_instruction=system,
+                        max_output_tokens=1024,
+                    ),
                 ),
             )
-            reply_text = response.content[0].text
+            reply_text = response.text
         except Exception as e:
             await ctx.reply(f"❌ AI error: {e}")
             history.pop()
             return
 
-    history.append({"role": "assistant", "content": reply_text})
+    history.append({"role": "model", "parts": [{"text": reply_text}]})
 
     if len(reply_text) > 1900:
         chunks = [reply_text[i:i+1900] for i in range(0, len(reply_text), 1900)]

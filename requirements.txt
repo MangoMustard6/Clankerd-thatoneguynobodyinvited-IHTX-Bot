@@ -9,3 +9,4 @@ aiohttp
 discord.py
 yt-dlp
 anthropic
+google-genai
