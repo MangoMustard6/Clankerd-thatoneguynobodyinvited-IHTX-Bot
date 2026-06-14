@@ -78,7 +78,7 @@ def _is_owner_by_id(user_id: int) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv"}
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -289,7 +289,7 @@ _load_autoreplies()
 
 # Autoreply2 (per-user auto-reply toggle)
 AUTOREPLY2_FILE = Path("bot/autoreply2.json")
-autoreply2: dict[int, str] = {}
+autoreply2: set[int] = set()
 
 
 def _load_autoreply2():
@@ -297,20 +297,45 @@ def _load_autoreply2():
     try:
         if AUTOREPLY2_FILE.exists():
             with AUTOREPLY2_FILE.open() as f:
-                autoreply2 = {int(k): v for k, v in json.load(f).items()}
+                autoreply2 = set(int(x) for x in json.load(f))
         else:
-            autoreply2 = {}
+            autoreply2 = set()
     except Exception:
-        autoreply2 = {}
+        autoreply2 = set()
 
 
 def _save_autoreply2():
     AUTOREPLY2_FILE.parent.mkdir(parents=True, exist_ok=True)
     with AUTOREPLY2_FILE.open("w") as f:
-        json.dump({str(k): v for k, v in autoreply2.items()}, f, indent=2)
+        json.dump(list(autoreply2), f, indent=2)
 
 
 _load_autoreply2()
+
+# Warnings
+WARNINGS_FILE = Path("bot/warnings.json")
+warnings_data: dict[int, list[dict]] = {}
+
+
+def _load_warnings():
+    global warnings_data
+    try:
+        if WARNINGS_FILE.exists():
+            with WARNINGS_FILE.open() as f:
+                warnings_data = {int(k): v for k, v in json.load(f).items()}
+        else:
+            warnings_data = {}
+    except Exception:
+        warnings_data = {}
+
+
+def _save_warnings():
+    WARNINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with WARNINGS_FILE.open("w") as f:
+        json.dump({str(k): v for k, v in warnings_data.items()}, f, indent=2)
+
+
+_load_warnings()
 
 # Tags (custom presets)
 TAGS_FILE = Path("bot/tags.json")
@@ -2777,42 +2802,102 @@ async def listautoreplies(ctx: commands.Context):
 
 # ---------- Autoreply2 ----------
 
-@bot.hybrid_command(name="autoreply2", aliases=["ar2"], description="Owner-only: toggle auto-reply to every message from a user")
-@app_commands.describe(user="The user to toggle auto-reply for", response="What the bot will reply to every message they send")
+@bot.hybrid_command(name="autoreply2", aliases=["ar2"], description="Owner-only: toggle AI auto-reply to every message from a user")
+@app_commands.describe(user="The user to toggle AI auto-reply for")
 @commands.check(_is_owner)
-async def autoreply2_cmd(ctx: commands.Context, user: discord.Member, *, response: str = ""):
-    """Owner-only: toggle per-user auto-reply.
+async def autoreply2_cmd(ctx: commands.Context, user: discord.Member):
+    """Owner-only: toggle per-user AI auto-reply.
 
-    If the user already has an autoreply2 set, running this command removes it (toggle off).
-    Otherwise sets it (toggle on).
+    When enabled, the bot responds to every message from that user using the AI (same as tugni;chat).
+    Run again on the same user to toggle off.
 
     Example:
-      tugni;autoreply2 @someone no way 💀
-      tugni;autoreply2 @someone   ← removes it
+      tugni;autoreply2 @someone   ← toggles on
+      tugni;autoreply2 @someone   ← toggles off
     """
     uid = user.id
     if uid in autoreply2:
-        del autoreply2[uid]
+        autoreply2.discard(uid)
         _save_autoreply2()
-        await ctx.reply(f"✅ Auto-reply2 **disabled** for {user.mention}.")
+        await ctx.reply(f"✅ AI auto-reply **disabled** for {user.mention}.")
     else:
-        if not response:
-            await ctx.reply("❌ Provide a response message to set auto-reply2.")
-            return
-        autoreply2[uid] = response
+        autoreply2.add(uid)
         _save_autoreply2()
-        await ctx.reply(f"✅ Auto-reply2 **enabled** for {user.mention}: {response}")
+        await ctx.reply(f"✅ AI auto-reply **enabled** for {user.mention}. The bot will reply to their messages using AI.")
 
 
-@bot.hybrid_command(name="autoreply2list", aliases=["ar2list"], description="Owner-only: list all per-user auto-replies")
+@bot.hybrid_command(name="autoreply2list", aliases=["ar2list"], description="Owner-only: list all users with AI auto-reply enabled")
 @commands.check(_is_owner)
 async def autoreply2list(ctx: commands.Context):
     """Owner-only: list all active autoreply2 targets."""
     if not autoreply2:
-        await ctx.reply("No autoreply2 targets set.")
+        await ctx.reply("No AI auto-reply targets set.")
         return
-    lines = [f"<@{uid}>: {resp}" for uid, resp in autoreply2.items()]
-    await ctx.reply("\n".join(lines))
+    lines = [f"<@{uid}>" for uid in autoreply2]
+    await ctx.reply("AI auto-reply enabled for:\n" + "\n".join(lines))
+
+
+# ---------- Warnings ----------
+
+@bot.hybrid_command(name="warn", description="Owner-only: warn a user")
+@app_commands.describe(user="The user to warn", reason="Reason for the warning")
+@commands.check(_is_owner)
+async def warn(ctx: commands.Context, user: discord.Member, *, reason: str = "No reason given."):
+    """Owner-only: warn a user and track their warning count."""
+    uid = user.id
+    entry = {"reason": reason, "timestamp": time.time(), "mod_id": ctx.author.id}
+    warnings_data.setdefault(uid, []).append(entry)
+    _save_warnings()
+    count = len(warnings_data[uid])
+    embed = discord.Embed(
+        title="⚠️ Warning Issued",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Warnings", value=f"{count}", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.set_footer(text=f"Warned by {ctx.author.display_name}")
+    await ctx.reply(embed=embed)
+    try:
+        await user.send(f"⚠️ You have been warned in **{ctx.guild.name}**.\n**Reason:** {reason}\n**Total warnings:** {count}")
+    except discord.HTTPException:
+        pass
+
+
+@bot.hybrid_command(name="warnings", aliases=["warncount", "warnlist"], description="Owner-only: check a user's warnings")
+@app_commands.describe(user="The user to check")
+@commands.check(_is_owner)
+async def warnings_cmd(ctx: commands.Context, user: discord.Member):
+    """Owner-only: view all warnings for a user."""
+    uid = user.id
+    user_warns = warnings_data.get(uid, [])
+    if not user_warns:
+        await ctx.reply(f"{user.mention} has no warnings.")
+        return
+    embed = discord.Embed(
+        title=f"⚠️ Warnings for {user.display_name}",
+        color=discord.Color.orange(),
+    )
+    for i, w in enumerate(user_warns, 1):
+        ts = int(w.get("timestamp", 0))
+        embed.add_field(
+            name=f"#{i} — <t:{ts}:R>",
+            value=w.get("reason", "No reason"),
+            inline=False,
+        )
+    embed.set_footer(text=f"Total: {len(user_warns)} warning(s)")
+    await ctx.reply(embed=embed)
+
+
+@bot.hybrid_command(name="clearwarn", aliases=["clearwarnings", "unwarn"], description="Owner-only: clear all warnings for a user")
+@app_commands.describe(user="The user to clear warnings for")
+@commands.check(_is_owner)
+async def clearwarn(ctx: commands.Context, user: discord.Member):
+    """Owner-only: clear all warnings for a user."""
+    uid = user.id
+    count = len(warnings_data.pop(uid, []))
+    _save_warnings()
+    await ctx.reply(f"✅ Cleared **{count}** warning(s) for {user.mention}.")
 
 
 # ---------- Owner: activity control ----------
@@ -3040,10 +3125,40 @@ async def on_message(message: discord.Message):
                 await message.reply(reply)
                 break
 
-        # Autoreply2 — per-user toggle
-        if message.author.id in autoreply2:
-            reply2 = autoreply2[message.author.id].replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
-            await message.reply(reply2)
+        # Autoreply2 — AI reply to every message from targeted users
+        if message.author.id in autoreply2 and _genai_client is not None:
+            ok2, _ = _check_heavy_limit(message.author.id)
+            if ok2:
+                uid2 = message.author.id
+                hist2 = _chat_histories.setdefault(uid2, [])
+                system2 = _CHAT_SYSTEM_PROMPT
+                if _OWNER_PERSONAS.get(uid2):
+                    system2 += f"\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
+                hist2.append({"role": "user", "parts": [{"text": message.content}]})
+                if len(hist2) > _CHAT_MAX_HISTORY:
+                    hist2[:] = hist2[-_CHAT_MAX_HISTORY:]
+                try:
+                    loop2 = asyncio.get_event_loop()
+                    resp2 = await loop2.run_in_executor(
+                        None,
+                        lambda: _genai_client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=hist2,
+                            config=_genai_types.GenerateContentConfig(
+                                system_instruction=system2,
+                                max_output_tokens=1024,
+                            ),
+                        ),
+                    )
+                    reply2_text = resp2.text
+                    hist2.append({"role": "model", "parts": [{"text": reply2_text}]})
+                    if len(reply2_text) > 1900:
+                        for chunk in [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]:
+                            await message.reply(chunk)
+                    else:
+                        await message.reply(reply2_text)
+                except Exception:
+                    pass
 
     # Always allow owners to manage the bot and allow all bot commands to run.
     if not _is_owner_by_id(message.author.id) and not message.content.startswith("tugni;"):
