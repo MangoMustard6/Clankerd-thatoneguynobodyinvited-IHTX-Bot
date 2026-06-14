@@ -279,6 +279,31 @@ def _save_autoreplies():
 
 _load_autoreplies()
 
+# Autoreply2 (per-user auto-reply toggle)
+AUTOREPLY2_FILE = Path("bot/autoreply2.json")
+autoreply2: dict[int, str] = {}
+
+
+def _load_autoreply2():
+    global autoreply2
+    try:
+        if AUTOREPLY2_FILE.exists():
+            with AUTOREPLY2_FILE.open() as f:
+                autoreply2 = {int(k): v for k, v in json.load(f).items()}
+        else:
+            autoreply2 = {}
+    except Exception:
+        autoreply2 = {}
+
+
+def _save_autoreply2():
+    AUTOREPLY2_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with AUTOREPLY2_FILE.open("w") as f:
+        json.dump({str(k): v for k, v in autoreply2.items()}, f, indent=2)
+
+
+_load_autoreply2()
+
 # Tags (custom presets)
 TAGS_FILE = Path("bot/tags.json")
 tags: dict[str, dict] = {}
