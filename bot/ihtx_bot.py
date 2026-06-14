@@ -3010,6 +3010,38 @@ async def clearchat(ctx: commands.Context):
 
 
 
+# ---------- Heavy limit usage check ----------
+
+@bot.hybrid_command(name="usage", aliases=["heavyusage", "limit", "checklimit"], description="Check how many heavy commands you've used today")
+async def usage(ctx: commands.Context):
+    """Check your heavy command usage for the current 24-hour window."""
+    user_id = ctx.author.id
+    now = time.time()
+    day_ago = now - 86400
+    used_timestamps = [t for t in heavy_usage.get(user_id, []) if t > day_ago]
+
+    if _is_owner_by_id(user_id):
+        limit = HEAVY_LIMIT_OWNER
+    else:
+        limit = heavy_limits.get(user_id, HEAVY_LIMIT_DEFAULT)
+
+    used = len(used_timestamps)
+    remaining = max(0, limit - used)
+
+    embed = discord.Embed(title="⚡ Heavy Command Usage", color=discord.Color.blurple())
+    embed.add_field(name="Used", value=str(used), inline=True)
+    embed.add_field(name="Remaining", value=str(remaining), inline=True)
+    embed.add_field(name="Limit", value=str(limit), inline=True)
+
+    if used_timestamps:
+        oldest = min(used_timestamps)
+        resets_at = int(oldest + 86400)
+        embed.add_field(name="Oldest resets", value=f"<t:{resets_at}:R>", inline=False)
+
+    embed.set_footer(text=f"Window: rolling 24h · Heavy commands: {', '.join(sorted(HEAVY_COMMANDS))}")
+    await ctx.reply(embed=embed)
+
+
 # ---------- Fun commands ----------
 
 _8BALL_RESPONSES = [
