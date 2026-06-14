@@ -2751,6 +2751,46 @@ async def listautoreplies(ctx: commands.Context):
         await ctx.reply(chunk)
 
 
+# ---------- Autoreply2 ----------
+
+@bot.hybrid_command(name="autoreply2", aliases=["ar2"], description="Owner-only: toggle auto-reply to every message from a user")
+@app_commands.describe(user="The user to toggle auto-reply for", response="What the bot will reply to every message they send")
+@commands.check(_is_owner)
+async def autoreply2_cmd(ctx: commands.Context, user: discord.Member, *, response: str = ""):
+    """Owner-only: toggle per-user auto-reply.
+
+    If the user already has an autoreply2 set, running this command removes it (toggle off).
+    Otherwise sets it (toggle on).
+
+    Example:
+      tugni;autoreply2 @someone no way 💀
+      tugni;autoreply2 @someone   ← removes it
+    """
+    uid = user.id
+    if uid in autoreply2:
+        del autoreply2[uid]
+        _save_autoreply2()
+        await ctx.reply(f"✅ Auto-reply2 **disabled** for {user.mention}.")
+    else:
+        if not response:
+            await ctx.reply("❌ Provide a response message to set auto-reply2.")
+            return
+        autoreply2[uid] = response
+        _save_autoreply2()
+        await ctx.reply(f"✅ Auto-reply2 **enabled** for {user.mention}: {response}")
+
+
+@bot.hybrid_command(name="autoreply2list", aliases=["ar2list"], description="Owner-only: list all per-user auto-replies")
+@commands.check(_is_owner)
+async def autoreply2list(ctx: commands.Context):
+    """Owner-only: list all active autoreply2 targets."""
+    if not autoreply2:
+        await ctx.reply("No autoreply2 targets set.")
+        return
+    lines = [f"<@{uid}>: {resp}" for uid, resp in autoreply2.items()]
+    await ctx.reply("\n".join(lines))
+
+
 # ---------- Owner: activity control ----------
 
 @bot.hybrid_command(name="setactivity", aliases=["activity", "presence"], description="Owner-only: change the bot's activity status")
@@ -2971,6 +3011,11 @@ async def on_message(message: discord.Message):
                 reply = response.replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
                 await message.reply(reply)
                 break
+
+        # Autoreply2 — per-user toggle
+        if message.author.id in autoreply2:
+            reply2 = autoreply2[message.author.id].replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
+            await message.reply(reply2)
 
     # Always allow owners to manage the bot and allow all bot commands to run.
     if not _is_owner_by_id(message.author.id) and not message.content.startswith("tugni;"):
