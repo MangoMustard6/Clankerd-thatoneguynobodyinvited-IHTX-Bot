@@ -27,8 +27,6 @@ import time
 from pathlib import Path
 import urllib.parse
 import base64
-import fal_client
-
 try:
     import yt_dlp
 except ImportError:
