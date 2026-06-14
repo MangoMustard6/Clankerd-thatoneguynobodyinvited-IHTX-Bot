@@ -2766,16 +2766,21 @@ async def imagine(ctx: commands.Context, *, prompt: str):
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: _genai_client.models.generate_images(
-                    model="imagen-3.0-generate-002",
-                    prompt=prompt,
-                    config=_genai_types.GenerateImagesConfig(
-                        number_of_images=1,
-                        aspect_ratio="1:1",
+                lambda: _genai_client.models.generate_content(
+                    model="gemini-2.0-flash-preview-image-generation",
+                    contents=prompt,
+                    config=_genai_types.GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"],
                     ),
                 ),
             )
-            image_bytes = response.generated_images[0].image.image_bytes
+            image_bytes = None
+            for part in response.candidates[0].content.parts:
+                if part.inline_data is not None:
+                    image_bytes = part.inline_data.data
+                    break
+            if image_bytes is None:
+                raise ValueError("No image returned by the model.")
         except Exception as e:
             await ctx.reply(f"❌ Image generation failed: {e}")
             return
