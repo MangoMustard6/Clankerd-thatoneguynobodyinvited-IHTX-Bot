@@ -16,3 +16,4 @@ anthropic
 discord.py
 google-genai
 yt-dlp
+fal-client
