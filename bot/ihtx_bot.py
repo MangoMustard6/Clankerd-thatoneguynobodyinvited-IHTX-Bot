@@ -2784,6 +2784,40 @@ async def removeautoreply(ctx: commands.Context, *, trigger: str):
     await ctx.reply(f"✅ Removed autoreply for `{trigger_norm}`.")
 
 
+@bot.hybrid_command(name="removearmentions", aliases=["rarm", "noarping"], description="Owner-only: strip {mention}/{user} pings from an autoreply response")
+@app_commands.describe(trigger="The autoreply trigger to remove mentions from")
+@commands.check(_is_owner)
+async def removearmentions(ctx: commands.Context, *, trigger: str):
+    """Owner-only: remove {mention} and {user} tokens from an autoreply's response.
+
+    Leaves the autoreply active but stops it from pinging users.
+    Example:
+      tugni;removearmentions hello
+    """
+    trigger_norm = trigger.strip().lower()
+    if trigger_norm not in autoreplies:
+        await ctx.reply(f"❌ No autoreply found for `{trigger_norm}`.")
+        return
+
+    entry = autoreplies[trigger_norm]
+    response = entry.get("response", "") if isinstance(entry, dict) else str(entry)
+
+    cleaned = response.replace("{mention}", "").replace("{user}", "").strip()
+    cleaned = re.sub(r"  +", " ", cleaned)
+
+    if cleaned == response:
+        await ctx.reply(f"ℹ️ Autoreply `{trigger_norm}` has no mention tokens to remove.")
+        return
+
+    if isinstance(entry, dict):
+        autoreplies[trigger_norm]["response"] = cleaned
+    else:
+        autoreplies[trigger_norm] = {"response": cleaned, "channel_id": None}
+
+    _save_autoreplies()
+    await ctx.reply(f"✅ Removed mention pings from `{trigger_norm}`.\nNew response: {cleaned}")
+
+
 @bot.hybrid_command(name="autoreplies", aliases=["listautoreplies", "arlist"], description="List all active autoreplies")
 async def listautoreplies(ctx: commands.Context):
     """List all active autoreply triggers and their responses."""
