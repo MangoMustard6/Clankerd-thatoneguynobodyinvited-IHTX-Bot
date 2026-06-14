@@ -162,7 +162,9 @@ _load_channel_blocks()
 
 # Per-channel keyword blocklist
 KEYWORD_BLOCK_FILE = Path("bot/keyword_blocks.json")
+KEYWORD_BLOCK_MSG_FILE = Path("bot/keyword_block_messages.json")
 keyword_blocks: dict[int, set[str]] = {}
+keyword_block_messages: dict[int, dict[str, str]] = {}
 
 
 def _normalize_keyword(keyword: str) -> str:
@@ -170,7 +172,7 @@ def _normalize_keyword(keyword: str) -> str:
 
 
 def _load_keyword_blocks():
-    global keyword_blocks
+    global keyword_blocks, keyword_block_messages
     try:
         if KEYWORD_BLOCK_FILE.exists():
             with KEYWORD_BLOCK_FILE.open() as f:
@@ -188,6 +190,22 @@ def _load_keyword_blocks():
     except Exception:
         keyword_blocks = {}
 
+    try:
+        if KEYWORD_BLOCK_MSG_FILE.exists():
+            with KEYWORD_BLOCK_MSG_FILE.open() as f:
+                raw = json.load(f)
+            keyword_block_messages = {
+                int(channel_id): {
+                    _normalize_keyword(keyword): msg
+                    for keyword, msg in msgs.items()
+                }
+                for channel_id, msgs in raw.items()
+            }
+        else:
+            keyword_block_messages = {}
+    except Exception:
+        keyword_block_messages = {}
+
 
 def _save_keyword_blocks():
     KEYWORD_BLOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -198,6 +216,16 @@ def _save_keyword_blocks():
     }
     with KEYWORD_BLOCK_FILE.open("w") as f:
         json.dump(serializable, f, indent=2)
+    # Also save messages
+    msg_serializable = {
+        str(channel_id): {
+            keyword: msg
+            for keyword, msg in msgs.items()
+        }
+        for channel_id, msgs in keyword_block_messages.items()
+    }
+    with KEYWORD_BLOCK_MSG_FILE.open("w") as f:
+        json.dump(msg_serializable, f, indent=2)
 
 
 def _blocked_keyword_for_message(channel_id: int, content: str) -> str | None:
@@ -209,6 +237,13 @@ def _blocked_keyword_for_message(channel_id: int, content: str) -> str | None:
         if keyword and keyword in normalized_content:
             return keyword
     return None
+
+def _blocked_keyword_message(channel_id: int, keyword: str, author_mention: str) -> str:
+    msgs = keyword_block_messages.get(channel_id, {})
+    msg = msgs.get(keyword)
+    if msg:
+        return msg.replace("{mention}", author_mention).replace("{user}", author_mention)
+    return f"{author_mention}, that keyword is blocked in this channel."
 
 _load_keyword_blocks()
 
@@ -855,7 +890,8 @@ def _apply_pipe_effects(
                 cmd.extend(["-c:a", "copy"])
             cmd.extend([
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-shortest", "-movflags", "+faststart", output_path,
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", output_path,
             ])
             ok, err = _run_ffmpeg_raw(cmd, timeout=180)
             if not ok:
@@ -2527,6 +2563,11 @@ async def keywordblockremove(ctx: commands.Context, keyword: str, channel: str =
     blocked.discard(normalized)
     if not blocked:
         keyword_blocks.pop(channel_id, None)
+    # Also clear custom message for this keyword
+    msgs = keyword_block_messages.get(channel_id, {})
+    msgs.pop(normalized, None)
+    if not msgs:
+        keyword_block_messages.pop(channel_id, None)
     _save_keyword_blocks()
     await ctx.reply(f"✅ Removed keyword block `{normalized}` from channel `{channel_id}`.")
 
@@ -2566,6 +2607,41 @@ async def sayembed(ctx: commands.Context, *, content: str):
             await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send embed: {e}")
+
+
+@bot.hybrid_command(name="keywordblockmsg", aliases=["kbmsg", "blockmsg"], description="Owner-only: set a custom message for a keyword block")
+@app_commands.describe(keyword="Keyword to customize message for", message="Message to send (use {mention} or {user} for user mention)", channel="Channel mention or ID (omit for current channel)")
+@commands.check(_is_owner)
+async def keywordblockmsg(ctx: commands.Context, keyword: str, message: str, channel: str = None):
+    """Owner-only: set a custom message for a keyword block.
+
+    Use {mention} or {user} to include the user's mention.
+    Example:
+      g!keywordblockmsg swearword "no swearing, {mention}!"
+      g!keywordblockmsg badword "dont say that, {user}"
+    """
+    normalized = _normalize_keyword(keyword)
+    if not normalized:
+        await ctx.reply("❌ Provide a keyword.")
+        return
+    if channel is None:
+        channel_id = ctx.channel.id
+    else:
+        try:
+            channel_id = _parse_digits(channel)
+        except ValueError:
+            await ctx.reply("❌ Invalid channel.")
+            return
+
+    blocked = keyword_blocks.get(channel_id, set())
+    if normalized not in blocked:
+        await ctx.reply(f"❌ Keyword `{normalized}` is not blocked in this channel. Block it first with `g!keywordblock`.")
+        return
+
+    msgs = keyword_block_messages.setdefault(channel_id, {})
+    msgs[normalized] = message
+    _save_keyword_blocks()
+    await ctx.reply(f"✅ Custom message set for keyword `{normalized}` in this channel.")
 
 
 # ---------- Owner: activity control ----------
@@ -2710,8 +2786,9 @@ async def on_message(message: discord.Message):
             except discord.HTTPException:
                 pass
             try:
+                msg = _blocked_keyword_message(message.channel.id, keyword, message.author.mention)
                 await message.channel.send(
-                    f"{message.author.mention}, that keyword is blocked in this channel.",
+                    msg,
                     delete_after=8,
                 )
             except discord.HTTPException:
