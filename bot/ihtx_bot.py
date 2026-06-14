@@ -254,6 +254,31 @@ def _blocked_keyword_message(channel_id: int, keyword: str, author_mention: str)
 
 _load_keyword_blocks()
 
+# Autoreplies
+AUTOREPLY_FILE = Path("bot/autoreplies.json")
+autoreplies: dict[str, str] = {}
+
+
+def _load_autoreplies():
+    global autoreplies
+    try:
+        if AUTOREPLY_FILE.exists():
+            with AUTOREPLY_FILE.open() as f:
+                autoreplies = json.load(f)
+        else:
+            autoreplies = {}
+    except Exception:
+        autoreplies = {}
+
+
+def _save_autoreplies():
+    AUTOREPLY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with AUTOREPLY_FILE.open("w") as f:
+        json.dump(autoreplies, f, indent=2)
+
+
+_load_autoreplies()
+
 # Tags (custom presets)
 TAGS_FILE = Path("bot/tags.json")
 tags: dict[str, dict] = {}
@@ -2644,6 +2669,63 @@ async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
     await ctx.reply(f"✅ Custom message set for keyword `{normalized}` in this channel.")
 
 
+# ---------- Autoreplies ----------
+
+@bot.hybrid_command(name="autoreply", aliases=["ar"], description="Owner-only: add an autoreply trigger")
+@app_commands.describe(trigger="Word or phrase that triggers the reply", response="What the bot replies (use {mention} for user)")
+@commands.check(_is_owner)
+async def autoreply(ctx: commands.Context, trigger: str, *, response: str):
+    """Owner-only: add an autoreply. When anyone says the trigger, the bot replies.
+
+    Use {mention} or {user} to ping the user in the response.
+    Example:
+      tugni;autoreply hello Hello there, {mention}!
+      tugni;autoreply goodnight Sweet dreams 🌙
+    """
+    trigger_norm = trigger.strip().lower()
+    if not trigger_norm:
+        await ctx.reply("❌ Provide a trigger word or phrase.")
+        return
+    autoreplies[trigger_norm] = response
+    _save_autoreplies()
+    await ctx.reply(f"✅ Autoreply set: `{trigger_norm}` → {response}")
+
+
+@bot.hybrid_command(name="removeautoreply", aliases=["rar", "deautoreply"], description="Owner-only: remove an autoreply trigger")
+@app_commands.describe(trigger="The trigger to remove")
+@commands.check(_is_owner)
+async def removeautoreply(ctx: commands.Context, *, trigger: str):
+    """Owner-only: remove an autoreply trigger."""
+    trigger_norm = trigger.strip().lower()
+    if trigger_norm not in autoreplies:
+        await ctx.reply(f"❌ No autoreply for `{trigger_norm}`.")
+        return
+    del autoreplies[trigger_norm]
+    _save_autoreplies()
+    await ctx.reply(f"✅ Removed autoreply for `{trigger_norm}`.")
+
+
+@bot.hybrid_command(name="autoreplies", aliases=["listautoreplies", "arlist"], description="List all active autoreplies")
+async def listautoreplies(ctx: commands.Context):
+    """List all active autoreply triggers and their responses."""
+    if not autoreplies:
+        await ctx.reply("No autoreplies set.")
+        return
+    lines = [f"`{trigger}` → {response}" for trigger, response in autoreplies.items()]
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 1900:
+            chunks.append(current)
+            current = line
+        else:
+            current = (current + "\n" + line).strip()
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await ctx.reply(chunk)
+
+
 # ---------- Owner: activity control ----------
 
 @bot.hybrid_command(name="setactivity", aliases=["activity", "presence"], description="Owner-only: change the bot's activity status")
@@ -2856,8 +2938,17 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # Autoreplies (check before keyword blocks, skip commands)
+    if not message.content.startswith("tugni;"):
+        content_lower = message.content.lower()
+        for trigger, response in autoreplies.items():
+            if trigger in content_lower:
+                reply = response.replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
+                await message.reply(reply)
+                break
+
     # Always allow owners to manage the bot and allow all bot commands to run.
-    if not _is_owner_by_id(message.author.id) and not message.content.startswith("g!"):
+    if not _is_owner_by_id(message.author.id) and not message.content.startswith("tugni;"):
         keyword = _blocked_keyword_for_message(message.channel.id, message.content)
         if keyword:
             try:
