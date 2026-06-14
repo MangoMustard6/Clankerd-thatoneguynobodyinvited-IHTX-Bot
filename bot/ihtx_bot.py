@@ -322,6 +322,31 @@ def _save_autoreply2():
 
 _load_autoreply2()
 
+# Autoreply2 no-mention set (users whose ar2 replies skip the ping)
+AUTOREPLY2_NO_MENTION_FILE = Path("bot/autoreply2_no_mention.json")
+autoreply2_no_mention: set[int] = set()
+
+
+def _load_autoreply2_no_mention():
+    global autoreply2_no_mention
+    try:
+        if AUTOREPLY2_NO_MENTION_FILE.exists():
+            with AUTOREPLY2_NO_MENTION_FILE.open() as f:
+                autoreply2_no_mention = set(int(x) for x in json.load(f))
+        else:
+            autoreply2_no_mention = set()
+    except Exception:
+        autoreply2_no_mention = set()
+
+
+def _save_autoreply2_no_mention():
+    AUTOREPLY2_NO_MENTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with AUTOREPLY2_NO_MENTION_FILE.open("w") as f:
+        json.dump(list(autoreply2_no_mention), f, indent=2)
+
+
+_load_autoreply2_no_mention()
+
 # Warnings
 WARNINGS_FILE = Path("bot/warnings.json")
 warnings_data: dict[int, list[dict]] = {}
