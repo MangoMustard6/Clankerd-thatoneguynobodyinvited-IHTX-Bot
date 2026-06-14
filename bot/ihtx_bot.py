@@ -3270,62 +3270,51 @@ async def on_message(message: discord.Message):
 
 # ---------- Image-to-video (fal.ai HappyHorse) ----------
 
-@bot.hybrid_command(name="imagevideo", aliases=["iv", "vidgen"], description="Generate a video from an image using HappyHorse AI")
-@app_commands.describe(
-    prompt="Description of the motion/scene (default: cinematic scene)",
-    duration="Video duration in seconds (default: 10)",
-    image_url="Image URL to use instead of an attachment",
-    attachment="Image file to generate video from",
-)
-async def imagevideo(
-    ctx: commands.Context,
-    duration: int = 10,
+async def _imagevideo_core(
+    send_fn,
+    reply_fn,
+    fetch_ref_fn,
+    message_attachments: list,
+    message_reference,
+    prompt: str,
+    duration: int,
     image_url: str = None,
     attachment: discord.Attachment = None,
-    *,
-    prompt: str = "cinematic scene",
 ):
-    """Generate a short video from an image using HappyHorse AI via fal.ai.
-
-    Usage: tugni;imagevideo [duration] [image_url] [prompt]
-    You can attach an image, pass a URL, or reply to a message with an image.
-    """
+    """Shared logic for imagevideo prefix and slash commands."""
     if _fal_client is None:
-        await ctx.reply("❌ `fal-client` is not installed. Ask the bot owner to install it.")
+        await reply_fn("❌ `fal-client` is not installed. Ask the bot owner to install it.")
         return
-
     if not os.environ.get("FAL_KEY"):
-        await ctx.reply("❌ `FAL_KEY` is not configured. Ask the bot owner to add it.")
+        await reply_fn("❌ `FAL_KEY` is not configured. Ask the bot owner to add it.")
         return
 
-    # Clamp duration to fal's supported range
     duration = max(1, min(duration, 30))
 
-    # Resolve image: explicit URL > slash attachment param > message attachment > replied message attachment
     resolved_url = image_url
     if resolved_url is None:
         if attachment is not None:
             resolved_url = attachment.url
-        elif ctx.message and ctx.message.attachments:
-            resolved_url = ctx.message.attachments[0].url
-        elif ctx.message and ctx.message.reference:
+        elif message_attachments:
+            resolved_url = message_attachments[0].url
+        elif message_reference:
             try:
-                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                ref = await fetch_ref_fn(message_reference.message_id)
                 if ref.attachments:
                     resolved_url = ref.attachments[0].url
             except Exception:
                 pass
 
     if not resolved_url:
-        await ctx.reply(
+        await reply_fn(
             "❌ No image found. Please:\n"
             "• Attach an image to your message, or\n"
-            "• Pass an image URL: `tugni;imagevideo <duration> <url> <prompt>`, or\n"
+            "• Pass an image URL via the `image_url` option, or\n"
             "• Reply to a message that contains an image."
         )
         return
 
-    status_msg = await ctx.reply(f"🎬 Generating {duration}s video with HappyHorse AI… this may take a minute.")
+    status_msg = await reply_fn(f"🎬 Generating {duration}s video with HappyHorse AI… this may take a minute.")
 
     try:
         loop = asyncio.get_event_loop()
@@ -3333,83 +3322,116 @@ async def imagevideo(
             None,
             lambda: _fal_client.subscribe(
                 "fal-ai/happyhorse-1.0/image-to-video",
-                arguments={
-                    "prompt": prompt,
-                    "image_url": resolved_url,
-                    "duration": duration,
-                },
+                arguments={"prompt": prompt, "image_url": resolved_url, "duration": duration},
             ),
         )
-
         video_url = result["video"]["url"]
         await status_msg.edit(content="✅ Done!")
-        await ctx.send(video_url)
-
+        await send_fn(video_url)
     except Exception as e:
         await status_msg.edit(content=f"❌ Error generating video:\n```\n{e}\n```")
 
 
-# ---------- Text/image-to-video (Replicate Seedance 2.0) ----------
+@bot.command(name="imagevideo", aliases=["iv", "vidgen"])
+async def imagevideo_prefix(ctx: commands.Context, duration: int = 10, image_url: str = None, *, prompt: str = "cinematic scene"):
+    """Generate a video from an attached image using HappyHorse AI.
+    Usage: tugni;imagevideo [duration] [image_url] [prompt]
+    """
+    await _imagevideo_core(
+        send_fn=ctx.send,
+        reply_fn=ctx.reply,
+        fetch_ref_fn=ctx.channel.fetch_message,
+        message_attachments=ctx.message.attachments,
+        message_reference=ctx.message.reference,
+        prompt=prompt,
+        duration=duration,
+        image_url=image_url,
+    )
 
-@bot.hybrid_command(name="video", aliases=["vid", "seedance"], description="Generate a video from a prompt or image using Seedance 2.0")
+
+@bot.tree.command(name="imagevideo", description="Generate a video from an image using HappyHorse AI")
 @app_commands.describe(
-    prompt="What to generate (default: cinematic video)",
-    duration="Duration in seconds, 4–15 (default: 5)",
-    resolution="Output resolution: 480p, 720p, or 1080p (default: 720p)",
-    aspect_ratio="Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)",
-    image_url="Image URL for image-to-video mode",
-    attachment="Image attachment for image-to-video mode",
+    prompt="Description of the motion/scene (default: cinematic scene)",
+    duration="Video duration in seconds, 1–30 (default: 10)",
+    image_url="Image URL to use instead of an attachment",
+    attachment="Image file to generate video from",
 )
-async def seedance_video(
-    ctx: commands.Context,
-    duration: int = 5,
-    resolution: str = "720p",
-    aspect_ratio: str = "16:9",
+async def imagevideo_slash(
+    interaction: discord.Interaction,
+    duration: int = 10,
     image_url: str = None,
     attachment: discord.Attachment = None,
-    *,
-    prompt: str = "cinematic video",
+    prompt: str = "cinematic scene",
 ):
-    """Generate a video using Seedance 2.0 via Replicate.
+    await interaction.response.defer()
 
-    Usage: tugni;video [duration] [prompt]
-    Attach an image (or pass a URL) to switch to image-to-video mode.
-    Reply to a message with an image to use that as the source.
-    """
+    async def reply_fn(content):
+        return await interaction.followup.send(content)
+
+    async def send_fn(content):
+        await interaction.followup.send(content)
+
+    async def fetch_ref_fn(message_id):
+        return await interaction.channel.fetch_message(message_id)
+
+    await _imagevideo_core(
+        send_fn=send_fn,
+        reply_fn=reply_fn,
+        fetch_ref_fn=fetch_ref_fn,
+        message_attachments=[],
+        message_reference=None,
+        prompt=prompt,
+        duration=duration,
+        image_url=image_url,
+        attachment=attachment,
+    )
+
+
+# ---------- Text/image-to-video (Replicate Seedance 2.0) ----------
+
+async def _video_core(
+    send_fn,
+    reply_fn,
+    fetch_ref_fn,
+    message_attachments: list,
+    message_reference,
+    prompt: str,
+    duration: int,
+    resolution: str,
+    aspect_ratio: str,
+    image_url: str = None,
+    attachment: discord.Attachment = None,
+):
+    """Shared logic for video prefix and slash commands."""
     if _replicate is None:
-        await ctx.reply("❌ `replicate` is not installed. Ask the bot owner to install it.")
+        await reply_fn("❌ `replicate` is not installed. Ask the bot owner to install it.")
         return
-
     if not os.environ.get("REPLICATE_API_TOKEN"):
-        await ctx.reply("❌ `REPLICATE_API_TOKEN` is not configured. Ask the bot owner to add it.")
+        await reply_fn("❌ `REPLICATE_API_TOKEN` is not configured. Ask the bot owner to add it.")
         return
 
-    # Clamp & validate
     duration = max(4, min(duration, 15))
     if resolution not in ("480p", "720p", "1080p"):
         resolution = "720p"
     if aspect_ratio not in ("16:9", "9:16", "1:1"):
         aspect_ratio = "16:9"
 
-    # Resolve image source: URL arg > slash attachment > message attachment > replied message
     resolved_image = image_url
     if resolved_image is None:
         if attachment is not None:
             resolved_image = attachment.url
-        elif ctx.message and ctx.message.attachments:
-            resolved_image = ctx.message.attachments[0].url
-        elif ctx.message and ctx.message.reference:
+        elif message_attachments:
+            resolved_image = message_attachments[0].url
+        elif message_reference:
             try:
-                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                ref = await fetch_ref_fn(message_reference.message_id)
                 if ref.attachments:
                     resolved_image = ref.attachments[0].url
             except Exception:
                 pass
 
     mode = "image-to-video" if resolved_image else "text-to-video"
-    status_msg = await ctx.reply(
-        f"🎬 Generating {duration}s {resolution} video ({mode})… this may take a few minutes."
-    )
+    status_msg = await reply_fn(f"🎬 Generating {duration}s {resolution} video ({mode})… this may take a few minutes.")
 
     try:
         input_data = {
@@ -3428,16 +3450,75 @@ async def seedance_video(
             lambda: _replicate.run("bytedance/seedance-2.0", input=input_data),
         )
 
-        if isinstance(output, list):
-            video_url = str(output[0])
-        else:
-            video_url = str(output)
-
+        video_url = str(output[0]) if isinstance(output, list) else str(output)
         await status_msg.edit(content="✅ Done!")
-        await ctx.send(video_url)
-
+        await send_fn(video_url)
     except Exception as e:
         await status_msg.edit(content=f"❌ Error generating video:\n```\n{e}\n```")
+
+
+@bot.command(name="video", aliases=["vid", "seedance"])
+async def video_prefix(ctx: commands.Context, duration: int = 5, resolution: str = "720p", aspect_ratio: str = "16:9", image_url: str = None, *, prompt: str = "cinematic video"):
+    """Generate a video using Seedance 2.0 via Replicate.
+    Usage: tugni;video [duration] [resolution] [aspect_ratio] [image_url] [prompt]
+    Attach an image or reply to one to use image-to-video mode.
+    """
+    await _video_core(
+        send_fn=ctx.send,
+        reply_fn=ctx.reply,
+        fetch_ref_fn=ctx.channel.fetch_message,
+        message_attachments=ctx.message.attachments,
+        message_reference=ctx.message.reference,
+        prompt=prompt,
+        duration=duration,
+        resolution=resolution,
+        aspect_ratio=aspect_ratio,
+        image_url=image_url,
+    )
+
+
+@bot.tree.command(name="video", description="Generate a video from a prompt or image using Seedance 2.0")
+@app_commands.describe(
+    prompt="What to generate (default: cinematic video)",
+    duration="Duration in seconds, 4–15 (default: 5)",
+    resolution="Output resolution: 480p, 720p, or 1080p (default: 720p)",
+    aspect_ratio="Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)",
+    image_url="Image URL for image-to-video mode",
+    attachment="Image attachment for image-to-video mode",
+)
+async def video_slash(
+    interaction: discord.Interaction,
+    duration: int = 5,
+    resolution: str = "720p",
+    aspect_ratio: str = "16:9",
+    image_url: str = None,
+    attachment: discord.Attachment = None,
+    prompt: str = "cinematic video",
+):
+    await interaction.response.defer()
+
+    async def reply_fn(content):
+        return await interaction.followup.send(content)
+
+    async def send_fn(content):
+        await interaction.followup.send(content)
+
+    async def fetch_ref_fn(message_id):
+        return await interaction.channel.fetch_message(message_id)
+
+    await _video_core(
+        send_fn=send_fn,
+        reply_fn=reply_fn,
+        fetch_ref_fn=fetch_ref_fn,
+        message_attachments=[],
+        message_reference=None,
+        prompt=prompt,
+        duration=duration,
+        resolution=resolution,
+        aspect_ratio=aspect_ratio,
+        image_url=image_url,
+        attachment=attachment,
+    )
 
 
 # ---------- Error handling & run ----------
