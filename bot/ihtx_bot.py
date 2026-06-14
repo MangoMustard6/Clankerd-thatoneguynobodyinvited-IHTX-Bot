@@ -15,6 +15,7 @@ import asyncio
 import json
 import math
 import os
+import random
 import re
 import shlex
 import tempfile
@@ -652,6 +653,42 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         )
         return f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
     if name == "swirl":
+        # Named preset options (1-4 or by name)
+        _swirl_presets = {
+            "1": "maximumclockwise",
+            "maximumclockwise": "maximumclockwise",
+            "2": "maximumcounterclockwise",
+            "maximumcounterclockwise": "maximumcounterclockwise",
+            "3": "mediumclockwise",
+            "mediumclockwise": "mediumclockwise",
+            "4": "mediumcounterclockwise",
+            "mediumcounterclockwise": "mediumcounterclockwise",
+        }
+        _cx0 = "W*(0.5+(0))"
+        _cy0 = "H*(0.5+(0))"
+        _r0 = "min(W,H)*(0.5*1)"
+        _hyp = f"hypot(X-{_cx0},Y-{_cy0})+1e-6"
+        _ang = f"atan2(Y-{_cy0},X-{_cx0})"
+        def _swirl_preset_filter(mul: str) -> str:
+            ang_factor = f"(({mul}*PI*-255)/180*PI)"
+            falloff = f"(if(lt({_hyp},{_r0}),1-{_hyp}/{_r0},0)^2)"
+            geq = (
+                f"p({_cx0}+{_hyp}*cos(({_ang})+{ang_factor}*{falloff}),"
+                f"{_cy0}+{_hyp}*sin(({_ang})+{ang_factor}*{falloff}))"
+            )
+            return f"format=yuv444p,scale=ih:ih,geq='{geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
+
+        preset_key = (params[0].lower() if params else "").strip()
+        if preset_key in _swirl_presets:
+            preset_name = _swirl_presets[preset_key]
+            mul_map = {
+                "maximumclockwise": "1",
+                "maximumcounterclockwise": "-1",
+                "mediumclockwise": "0.5",
+                "mediumcounterclockwise": "-.5",
+            }
+            return _swirl_preset_filter(mul_map[preset_name])
+
         angle = params[0] if len(params) > 0 else "180"
         radius = params[1] if len(params) > 1 else "0.5"
         cx = params[2] if len(params) > 2 else "0.5"
@@ -2474,6 +2511,132 @@ async def sayembed(ctx: commands.Context, *, content: str):
             await ctx.message.add_reaction("✅")
     except Exception as e:
         await ctx.reply(f"❌ Failed to send embed: {e}")
+
+
+# ---------- Owner: activity control ----------
+
+@bot.hybrid_command(name="setactivity", aliases=["activity", "presence"], description="Owner-only: change the bot's activity status")
+@app_commands.describe(
+    activity_type="Type of activity: watching or listening",
+    text="The activity text to display"
+)
+@commands.check(_is_owner)
+async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
+    """Owner-only: change the bot's activity (watching/listening).
+
+    Usage:
+      g!setactivity watching some cool video
+      g!setactivity listening lo-fi beats
+    """
+    activity_type = activity_type.lower().strip()
+    if activity_type in ("watching", "watch", "w"):
+        activity = discord.Activity(type=discord.ActivityType.watching, name=text)
+        label = "Watching"
+    elif activity_type in ("listening", "listen", "l"):
+        activity = discord.Activity(type=discord.ActivityType.listening, name=text)
+        label = "Listening to"
+    else:
+        await ctx.reply("❌ Activity type must be `watching` or `listening`.")
+        return
+    await bot.change_presence(activity=activity)
+    if ctx.message:
+        await ctx.message.add_reaction("✅")
+    await ctx.reply(f"✅ Activity set to **{label}** {text}", ephemeral=True)
+
+
+# ---------- Fun commands ----------
+
+_8BALL_RESPONSES = [
+    "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes, definitely.",
+    "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+    "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+    "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+    "Don't count on it.", "My reply is no.", "My sources say no.",
+    "Outlook not so good.", "Very doubtful.",
+]
+
+@bot.hybrid_command(name="8ball", aliases=["eightball"], description="Ask the magic 8-ball a question")
+@app_commands.describe(question="The question to ask")
+async def eightball(ctx: commands.Context, *, question: str):
+    """Ask the magic 8-ball a yes/no question."""
+    response = random.choice(_8BALL_RESPONSES)
+    embed = discord.Embed(
+        description=f"🎱 **{response}**",
+        color=discord.Color.dark_blue()
+    )
+    embed.set_footer(text=f'"{question}"')
+    await ctx.reply(embed=embed)
+
+
+@bot.hybrid_command(name="coinflip", aliases=["flip", "coin"], description="Flip a coin")
+async def coinflip(ctx: commands.Context):
+    """Flip a coin — heads or tails."""
+    result = random.choice(["Heads 🪙", "Tails 🪙"])
+    await ctx.reply(f"**{result}**!")
+
+
+@bot.hybrid_command(name="roll", aliases=["dice", "d"], description="Roll a die (default: d6)")
+@app_commands.describe(sides="Number of sides on the die (default 6)")
+async def roll(ctx: commands.Context, sides: int = 6):
+    """Roll a die with the given number of sides."""
+    if sides < 2:
+        await ctx.reply("❌ Die must have at least 2 sides.")
+        return
+    if sides > 1000000:
+        await ctx.reply("❌ That's too many sides.")
+        return
+    result = random.randint(1, sides)
+    await ctx.reply(f"🎲 You rolled a **d{sides}** and got **{result}**!")
+
+
+@bot.hybrid_command(name="rps", aliases=["rockpaperscissors"], description="Play rock, paper, scissors")
+@app_commands.describe(choice="Your choice: rock, paper, or scissors")
+async def rps(ctx: commands.Context, choice: str):
+    """Play rock, paper, scissors against the bot."""
+    choice = choice.lower().strip()
+    alias_map = {"r": "rock", "p": "paper", "s": "scissors", "✊": "rock", "✋": "paper", "✌️": "scissors"}
+    choice = alias_map.get(choice, choice)
+    if choice not in ("rock", "paper", "scissors"):
+        await ctx.reply("❌ Choose `rock`, `paper`, or `scissors`.")
+        return
+    bot_choice = random.choice(["rock", "paper", "scissors"])
+    icons = {"rock": "✊", "paper": "✋", "scissors": "✌️"}
+    wins_against = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+    if choice == bot_choice:
+        result = "It's a tie! 🤝"
+        color = discord.Color.greyple()
+    elif wins_against[choice] == bot_choice:
+        result = "You win! 🎉"
+        color = discord.Color.green()
+    else:
+        result = "You lose! 💀"
+        color = discord.Color.red()
+    embed = discord.Embed(
+        description=f"{icons[choice]} **{choice.capitalize()}** vs **{bot_choice.capitalize()}** {icons[bot_choice]}\n\n{result}",
+        color=color
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.hybrid_command(name="choose", aliases=["pick"], description="Choose between options (separate with |)")
+@app_commands.describe(options="Options separated by | (e.g. pizza | burgers | tacos)")
+async def choose(ctx: commands.Context, *, options: str):
+    """Pick one option from a pipe-separated list."""
+    choices = [o.strip() for o in options.split("|") if o.strip()]
+    if len(choices) < 2:
+        await ctx.reply("❌ Give me at least 2 options separated by `|`.")
+        return
+    picked = random.choice(choices)
+    await ctx.reply(f"🎯 I choose: **{picked}**")
+
+
+@bot.hybrid_command(name="rate", description="Rate anything out of 10")
+@app_commands.describe(thing="What to rate")
+async def rate(ctx: commands.Context, *, thing: str):
+    """Rate something out of 10."""
+    score = (hash(thing.lower()) % 11 + 11) % 11
+    bar = "█" * score + "░" * (10 - score)
+    await ctx.reply(f"**{thing}**: {bar} **{score}/10**")
 
 
 # ---------- Message filtering ----------
