@@ -46,6 +46,11 @@ try:
 except ImportError:
     _fal_client = None
 
+try:
+    import replicate as _replicate
+except ImportError:
+    _replicate = None
+
 # ---------- Configuration & constants ----------
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -3339,6 +3344,97 @@ async def imagevideo(
         )
 
         video_url = result["video"]["url"]
+        await status_msg.edit(content="✅ Done!")
+        await ctx.send(video_url)
+
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Error generating video:\n```\n{e}\n```")
+
+
+# ---------- Text/image-to-video (Replicate Seedance 2.0) ----------
+
+@bot.hybrid_command(name="video", aliases=["vid", "seedance"], description="Generate a video from a prompt or image using Seedance 2.0")
+@app_commands.describe(
+    prompt="What to generate (default: cinematic video)",
+    duration="Duration in seconds, 4–15 (default: 5)",
+    resolution="Output resolution: 480p, 720p, or 1080p (default: 720p)",
+    aspect_ratio="Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)",
+    image_url="Image URL for image-to-video mode",
+    attachment="Image attachment for image-to-video mode",
+)
+async def seedance_video(
+    ctx: commands.Context,
+    duration: int = 5,
+    resolution: str = "720p",
+    aspect_ratio: str = "16:9",
+    image_url: str = None,
+    attachment: discord.Attachment = None,
+    *,
+    prompt: str = "cinematic video",
+):
+    """Generate a video using Seedance 2.0 via Replicate.
+
+    Usage: tugni;video [duration] [prompt]
+    Attach an image (or pass a URL) to switch to image-to-video mode.
+    Reply to a message with an image to use that as the source.
+    """
+    if _replicate is None:
+        await ctx.reply("❌ `replicate` is not installed. Ask the bot owner to install it.")
+        return
+
+    if not os.environ.get("REPLICATE_API_TOKEN"):
+        await ctx.reply("❌ `REPLICATE_API_TOKEN` is not configured. Ask the bot owner to add it.")
+        return
+
+    # Clamp & validate
+    duration = max(4, min(duration, 15))
+    if resolution not in ("480p", "720p", "1080p"):
+        resolution = "720p"
+    if aspect_ratio not in ("16:9", "9:16", "1:1"):
+        aspect_ratio = "16:9"
+
+    # Resolve image source: URL arg > slash attachment > message attachment > replied message
+    resolved_image = image_url
+    if resolved_image is None:
+        if attachment is not None:
+            resolved_image = attachment.url
+        elif ctx.message and ctx.message.attachments:
+            resolved_image = ctx.message.attachments[0].url
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    resolved_image = ref.attachments[0].url
+            except Exception:
+                pass
+
+    mode = "image-to-video" if resolved_image else "text-to-video"
+    status_msg = await ctx.reply(
+        f"🎬 Generating {duration}s {resolution} video ({mode})… this may take a few minutes."
+    )
+
+    try:
+        input_data = {
+            "prompt": prompt,
+            "duration": duration,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": True,
+        }
+        if resolved_image:
+            input_data["image"] = resolved_image
+
+        loop = asyncio.get_event_loop()
+        output = await loop.run_in_executor(
+            None,
+            lambda: _replicate.run("bytedance/seedance-2.0", input=input_data),
+        )
+
+        if isinstance(output, list):
+            video_url = str(output[0])
+        else:
+            video_url = str(output)
+
         await status_msg.edit(content="✅ Done!")
         await ctx.send(video_url)
 
