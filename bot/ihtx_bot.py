@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 import urllib.parse
+import base64
 
 try:
     import yt_dlp
@@ -2951,24 +2952,63 @@ Personality:
 _chat_histories: dict[int, list[dict]] = {}
 _CHAT_MAX_HISTORY = 20
 
+_GEMINI_MIME_MAP = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+    ".mp4": "video/mp4", ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo", ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+}
+_GEMINI_MAX_ATTACH_BYTES = 20 * 1024 * 1024  # 20 MB
 
-@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="Chat with the AI assistant")
-@app_commands.describe(message="Your message to the AI")
-async def chat(ctx: commands.Context, *, message: str):
-    """Chat with the IHTX AI assistant. Keeps conversation history per user."""
+
+async def _build_gemini_parts(text: str, attachments) -> list[dict]:
+    """Build Gemini content parts from text + Discord attachments."""
+    parts = []
+    for att in attachments:
+        ext = Path(att.filename).suffix.lower()
+        mime = _GEMINI_MIME_MAP.get(ext)
+        if mime and att.size <= _GEMINI_MAX_ATTACH_BYTES:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(att.url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            parts.append({
+                                "inline_data": {
+                                    "data": base64.b64encode(data).decode(),
+                                    "mime_type": mime,
+                                }
+                            })
+            except Exception:
+                pass
+    if text:
+        parts.append({"text": text})
+    if not parts:
+        parts.append({"text": ""})
+    return parts
+
+
+@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="Chat with the AI assistant (attach images/videos too)")
+@app_commands.describe(message="Your message to the AI (optional if attaching media)")
+async def chat(ctx: commands.Context, *, message: str = ""):
+    """Chat with the IHTX AI assistant. Attach images or videos and the bot will see them."""
     if _genai_client is None:
         await ctx.reply("❌ AI chat is unavailable (missing `google-genai` package).")
+        return
+    if not message and not ctx.message.attachments:
+        await ctx.reply("❌ Send a message or attach an image/video.")
         return
 
     user_id = ctx.author.id
     history = _chat_histories.setdefault(user_id, [])
 
     system = _CHAT_SYSTEM_PROMPT
-    persona = _OWNER_PERSONAS.get(user_id)
-    if persona:
+    if _OWNER_PERSONAS.get(user_id):
         system += f"\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
 
-    history.append({"role": "user", "parts": [{"text": message}]})
+    parts = await _build_gemini_parts(message, ctx.message.attachments)
+    history.append({"role": "user", "parts": parts})
     if len(history) > _CHAT_MAX_HISTORY:
         history[:] = history[-_CHAT_MAX_HISTORY:]
 
@@ -2992,6 +3032,9 @@ async def chat(ctx: commands.Context, *, message: str):
             history.pop()
             return
 
+    # Strip inline_data from stored history to save memory — keep only text
+    text_only = [p for p in parts if "text" in p] or [{"text": "[media]"}]
+    history[-1] = {"role": "user", "parts": text_only}
     history.append({"role": "model", "parts": [{"text": reply_text}]})
 
     if len(reply_text) > 1900:
@@ -3166,7 +3209,8 @@ async def on_message(message: discord.Message):
                 system2 = _CHAT_SYSTEM_PROMPT
                 if _OWNER_PERSONAS.get(uid2):
                     system2 += f"\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
-                hist2.append({"role": "user", "parts": [{"text": message.content}]})
+                parts2 = await _build_gemini_parts(message.content, message.attachments)
+                hist2.append({"role": "user", "parts": parts2})
                 if len(hist2) > _CHAT_MAX_HISTORY:
                     hist2[:] = hist2[-_CHAT_MAX_HISTORY:]
                 try:
@@ -3183,6 +3227,8 @@ async def on_message(message: discord.Message):
                         ),
                     )
                     reply2_text = resp2.text
+                    text_only2 = [p for p in parts2 if "text" in p] or [{"text": "[media]"}]
+                    hist2[-1] = {"role": "user", "parts": text_only2}
                     hist2.append({"role": "model", "parts": [{"text": reply2_text}]})
                     if len(reply2_text) > 1900:
                         for chunk in [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]:
