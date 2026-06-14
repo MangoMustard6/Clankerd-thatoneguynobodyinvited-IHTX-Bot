@@ -25,6 +25,7 @@ import aiohttp
 import sys
 import time
 from pathlib import Path
+import urllib.parse
 
 try:
     import yt_dlp
@@ -70,7 +71,7 @@ def _is_owner_by_id(user_id: int) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "tvsim", "tv", "ihtxsync", "download", "dl"}
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -534,7 +535,7 @@ PIPE_EFFECT_NAMES = {
     "ccshue", "brightness", "contrast", "saturation", "swapuv", "mirror",
     "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
     "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
-    "channelblend", "huehsv", "multipitch", "mp", "multi", "tvsim", "tv",
+    "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio",
 }
 
@@ -548,8 +549,8 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
 
     Effects are separated with semicolons. Each effect can be written as
     ``name=value`` or ``name value``. Parameters can be separated with spaces,
-    commas, semicolons, or pipes, so forms like ``tvsim=0.5,2,true`` and
-    ``tvsim 0.5 2 true`` both work.
+    commas, semicolons, or pipes, so forms like ``swirl=1`` or
+    ``lut=https://example.com/lut.cube`` both work.
     """
     effects = []
     current_name = None
@@ -579,7 +580,7 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
             current_params = _split_effect_params(tokens[1]) if len(tokens) > 1 else []
         elif current_name is not None:
             # Treat semicolon fragments after an effect as additional params,
-            # e.g. tvsim=0.5;2;true.
+            # e.g. lut=https://example.com/lut.cube
             current_params.extend(_split_effect_params(part))
         else:
             current_name = possible_name
@@ -792,15 +793,38 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # TV simulator
-            if name in ("tvsim", "tv"):
-                line_sync = float(params[0]) if len(params) > 0 else 0.25
-                zoom_grill = float(params[1]) if len(params) > 1 else 1.0
-                vertical = params[2].lower() in ("1", "true", "t", "y", "yes", "+", "on") if len(params) > 2 else False
+            # LUT / 3D LUT via lut3d filter
+            if name == "lut":
+                lut_url = params[0] if len(params) > 0 else ""
+                if not lut_url:
+                    return False, "lut effect requires a URL parameter."
                 out = os.path.join(tmpdir, f"pipe_{i}.mp4")
-                ok, err = _run_tvsim(current, out, line_sync, zoom_grill, vertical)
+                lut_path = os.path.join(tmpdir, f"lut_{i}.cube")
+                try:
+                    # Download with SSL verification
+                    import urllib.request
+                    import ssl
+                    ssl_ctx = ssl.create_default_context()
+                    req = urllib.request.Request(
+                        lut_url,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot)"}
+                    )
+                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=60) as resp:
+                        with open(lut_path, "wb") as f:
+                            f.write(resp.read())
+                except Exception as e:
+                    return False, f"Failed to download LUT from {lut_url}: {e}"
+                cmd = [
+                    "ffmpeg", "-y", "-i", current,
+                    "-vf", f"lut3d={lut_path},format=yuv420p",
+                    "-c:a", "copy",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-shortest", "-movflags", "+faststart",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
-                    return False, err
+                    return False, f"lut3d failed: {err}"
                 current = out
                 continue
 
@@ -825,10 +849,13 @@ def _apply_pipe_effects(
                 cmd.extend(["-vf", ",".join(ffmpeg_vf_parts)])
             if ffmpeg_af_parts:
                 cmd.extend(["-af", ",".join(ffmpeg_af_parts)])
+                cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+            else:
+                # Video-only filters: copy audio to avoid re-encode drift
+                cmd.extend(["-c:a", "copy"])
             cmd.extend([
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", output_path,
+                "-shortest", "-movflags", "+faststart", output_path,
             ])
             ok, err = _run_ffmpeg_raw(cmd, timeout=180)
             if not ok:
@@ -1154,84 +1181,78 @@ def _run_syncaudio(
     Default mode: adjust video speed (setpts) to match audio duration.
     Alt mode: adjust audio speed (atempo) to match video duration.
 
+    Uses itsoffset + -shortest to avoid any audio/video drift.
+
     Returns (ok, info_string_or_error).
     """
-    # Extract video-only and audio-only streams
-    with tempfile.TemporaryDirectory() as tmpdir:
-        v_only = os.path.join(tmpdir, "v.mp4")
-        a_only = os.path.join(tmpdir, "a.wav")
+    # Get durations from the original file
+    vd = _ffprobe_duration(input_path)
+    ad_out = _ffprobe(input_path, "-select_streams", "a:0",
+                       "-show_entries", "format=duration",
+                       "-of", "csv=p=0")
+    try:
+        ad = float(ad_out)
+    except (ValueError, TypeError):
+        ad = 0.0
 
-        # Extract video without audio
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-an", v_only]
-        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
-        if not ok:
-            return False, f"Failed to extract video stream: {err}"
+    # Also try audio-specific duration
+    if ad <= 0:
+        ad_out2 = _ffprobe(input_path, "-select_streams", "a:0",
+                           "-show_entries", "stream=duration",
+                           "-of", "csv=p=0")
+        try:
+            ad = float(ad_out2)
+        except (ValueError, TypeError):
+            ad = 0.0
 
-        # Extract audio as WAV
-        cmd = ["ffmpeg", "-y", "-i", input_path, a_only]
-        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
-        if not ok:
-            return False, f"Failed to extract audio stream: {err}"
+    if vd <= 0 or ad <= 0:
+        return False, f"Could not determine durations (video={vd:.3f}s, audio={ad:.3f}s)"
 
-        # Get durations
-        vd = _ffprobe_duration(v_only)
-        ad = _ffprobe_duration(a_only)
-
-        # Get frame rate
-        fr_out = _ffprobe(v_only, "-select_streams", "v:0",
+    if alt_mode:
+        # Alt mode: adjust audio speed (atempo) to match video duration
+        speed = ad / vd
+        atempo_filter = _build_atempo_chain(speed)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-af", atempo_filter,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        # Default mode: adjust video speed (setpts) to match audio duration
+        speed = vd / ad
+        # Get frame rate for FPS passthrough
+        fr_out = _ffprobe(input_path, "-select_streams", "v:0",
                           "-show_entries", "stream=r_frame_rate",
                           "-of", "default=nokey=1:noprint_wrappers=1")
+        fps_filter = f"setpts=1/({speed})*PTS"
+        if fr_out:
+            fps_filter += f",fps={fr_out}"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-vf", fps_filter,
+            "-c:a", "copy",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ]
 
-        if vd <= 0 or ad <= 0:
-            return False, f"Could not determine durations (video={vd:.3f}s, audio={ad:.3f}s)"
+    ok, err = _run_ffmpeg_raw(cmd, timeout=300)
+    if not ok:
+        return False, f"Sync failed: {err}"
 
-        if alt_mode:
-            # Alt mode: adjust audio speed (atempo) to match video duration
-            speed = ad / vd
-            # FFmpeg atempo supports 0.5–100.0; chain if needed
-            atempo_filter = _build_atempo_chain(speed)
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", v_only,
-                "-stream_loop", "-1", "-i", a_only,
-                "-af", atempo_filter,
-                "-map", "0:v", "-map", "1:a",
-                "-t", str(vd),
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path,
-            ]
-        else:
-            # Default mode: adjust video speed (setpts) to match audio duration
-            speed = vd / ad
-            # Use setpts to change video speed, keep original frame rate
-            fps_filter = f"setpts=1/({speed})*PTS"
-            if fr_out:
-                fps_filter += f",fps={fr_out}"
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", v_only,
-                "-stream_loop", "-1", "-i", a_only,
-                "-vf", fps_filter,
-                "-map", "0:v", "-map", "1:a",
-                "-t", str(max(vd, ad)),
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path,
-            ]
-
-        ok, err = _run_ffmpeg_raw(cmd, timeout=300)
-        if not ok:
-            return False, f"Sync failed: {err}"
-
-        diff = vd - ad
-        info = (
-            f"Video: {vd:.3f}s\n"
-            f"Audio: {ad:.3f}s\n\n"
-            f"Speed Used: {speed:.6f}\n"
-            f"Diff: {diff:.6f}"
-        )
-        return True, info
+    diff = vd - ad
+    info = (
+        f"Video: {vd:.3f}s\n"
+        f"Audio: {ad:.3f}s\n\n"
+        f"Speed Used: {speed:.6f}\n"
+        f"Diff: {diff:.6f}"
+    )
+    return True, info
 
 # ---------- Preview1280 (TV-simulator montage) ----------
 
@@ -1658,9 +1679,25 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
             return
 
+        # Store last export for lexg
         if is_preset:
+            _last_exports[ctx.author.id] = {
+                "type": "preset",
+                "preset": preset,
+                "label": preset,
+            }
             out_filename = f"ihtx_{preset}_{Path(attachment.filename).stem}{out_ext}"
         else:
+            _last_exports[ctx.author.id] = {
+                "type": "custom",
+                "exports": str(exports),
+                "duration": duration_expr,
+                "no_trim": no_trim,
+                "export_format": export_format,
+                "output_format": output_format,
+                "pipe_effects": pipe_effects,
+                "label": "custom",
+            }
             out_filename = f"ihtx_custom_{Path(attachment.filename).stem}{out_ext}"
 
         try:
@@ -2104,7 +2141,7 @@ async def help_command(ctx: commands.Context):
         "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
     )
     distortion_effects = (
-        "pinch&punch|p&p=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lockaspectratio, tvsim=line_sync;zoom_grill;vertical, "
+        "pinch&punch|p&p=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lockaspectratio, "
         "zoom=<amount>, mirror=<degrees>, gm91deform"
     )
     audio_effects = "multipitch=<semitones> (pipe-sep: 25|5|8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
@@ -2128,10 +2165,9 @@ async def help_command(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
-        name="g!tvsim [line_sync] [zoom_grill] [vertical]",
-        value="TV simulator with displacement mapping.\n"
-              "Defaults: line_sync=0.25, zoom=1, vertical=False\n"
-              "Aliases: `g!tv`",
+        name="g!lexg",
+        value="Re-apply the last IHTX export with the same effect chain.\n"
+              "Aliases: `g!lastexportgrab`",
         inline=False,
     )
     embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
@@ -2156,96 +2192,20 @@ async def help_command(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
-# ---------- TV Simulator (tvsim) ----------
+# ---------- Last Export Grab ----------
 
-def _run_tvsim(
-    input_path: str,
-    output_path: str,
-    line_sync: float = 0.25,
-    zoom_grill: float = 1.0,
-    vertical: bool = False,
-) -> tuple[bool, str]:
-    """Apply TV simulator effect using displacement map.
+# Track the last IHTX export for each user so they can re-run with g!lexg
+_last_exports: dict[int, dict[str, str]] = {}
 
-    Parameters:
-      line_sync: 0-1, controls the scanline sync effect. Default 0.25.
-      zoom_grill: scales the displacement map crop. Default 1.0.
-      vertical: True = vertical orientation, False = horizontal.
+@bot.hybrid_command(name="lexg", aliases=["lastexportgrab"], description="Re-apply the last IHTX export to a new attachment")
+@app_commands.describe(attachment="New video or image to re-apply the last effect to")
+async def lexg_command(ctx: commands.Context, attachment: discord.Attachment = None):
+    """Re-apply the last IHTX export to a new attachment.
+
+    Stores the last IHTX custom/preset run per user.
     """
-    line_sync = max(0.0, min(1.0, line_sync))
-    zoom_grill = max(0.1, zoom_grill)
-    contrast = (1 - line_sync) * 2.366666
+    uid = ctx.author.id
 
-    # Download displacement map if needed
-    disp_url = "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
-    disp_path = os.path.join(os.path.dirname(output_path), "disp_map.mov")
-    if not os.path.exists(disp_path):
-        try:
-            import urllib.request
-            urllib.request.urlretrieve(disp_url, disp_path)
-        except Exception:
-            return False, f"Failed to download displacement map from {disp_url}"
-
-    # Get input dimensions
-    w, h = 0, 0
-    info = _ffprobe_video_info(input_path)
-    w, h = info.get("width", 0), info.get("height", 0)
-    if w == 0 or h == 0:
-        return False, "Could not read input dimensions."
-
-    # Build filter_complex
-    if vertical:
-        # Vertical mode: [00][y][x]displace
-        fc = (
-            f"[0]scale=854:854,format=bgr32[00];"
-            f"[1]crop=iw:ih/{zoom_grill}:0:0,transpose=2,scale=854:854,"
-            f"eq=contrast={contrast},format=bgr32,hue=b=-0.033[x];"
-            f"color=s=854x854:c=#808080,format=bgr32[y];"
-            f"[00][y][x]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
-        )
-    else:
-        # Horizontal mode: [00][x][y]displace
-        fc = (
-            f"[0]scale=854:854,format=bgr32[00];"
-            f"[1]crop=iw:ih/{zoom_grill}:0:0,scale=854:854,"
-            f"eq=contrast={contrast},format=bgr32,hue=b=-0.033[x];"
-            f"color=s=854x854:c=#808080,format=bgr32[y];"
-            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
-        )
-
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-stream_loop", "-1", "-i", disp_path,
-        "-filter_complex", fc,
-        "-shortest", "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", output_path,
-    ]
-    return _run_ffmpeg_raw(cmd, timeout=300)
-
-
-@bot.hybrid_command(name="tvsim", aliases=["tv", "tvsimulator"], description="Apply TV simulator displacement effect")
-@app_commands.describe(
-    line_sync="Scanline sync value 0-1 (default: 0.25)",
-    zoom_grill="Zoom grill factor (default: 1)",
-    vertical="Use vertical orientation (default: False)",
-    attachment="Video to apply TV simulator effect"
-)
-async def tvsim_command(
-    ctx: commands.Context,
-    line_sync: float = 0.25,
-    zoom_grill: float = 1.0,
-    vertical: bool = False,
-    attachment: discord.Attachment = None,
-):
-    """Apply TV simulator effect to an attached video.
-
-    Usage:
-      g!tvsim                     — default settings (0.25, 1, False)
-      g!tvsim 0.5 2 True          — custom: line_sync=0.5, zoom=2, vertical
-      g!tvsim 0.75                — line_sync=0.75, defaults for rest
-    """
     # Resolve attachment
     if attachment is None:
         if ctx.message and ctx.message.attachments:
@@ -2258,17 +2218,13 @@ async def tvsim_command(
             except Exception:
                 pass
 
+    last = _last_exports.get(uid)
+    if not last:
+        await ctx.reply("\u274c No IHTX export found. Run a custom or preset IHTX first, then use `g!lexg`.")
+        return
+
     if not attachment:
-        await ctx.reply(
-            "**IHTX TV Simulator**\n"
-            "Attach a video and use `g!tvsim [line_sync] [zoom_grill] [vertical]`.\n\n"
-            "Parameters:\n"
-            "- `line_sync`: 0-1 (default: 0.25)\n"
-            "- `zoom_grill`: factor (default: 1)\n"
-            "- `vertical`: True/False (default: False)\n\n"
-            "Example: `g!tvsim 0.5 2 True`\n"
-            "Aliases: `g!tv`"
-        )
+        await ctx.reply("**g!lexg** — Attach a video/image and re-apply the last IHTX export.\n" "Aliases: `g!lastexportgrab`")
         return
 
     if attachment.size > MAX_FILE_SIZE:
@@ -2276,52 +2232,151 @@ async def tvsim_command(
         return
 
     suffix = Path(attachment.filename).suffix.lower()
-    if suffix not in VIDEO_EXTENSIONS:
-        await ctx.reply(f"TV Simulator requires a video file. Got `{suffix}`.")
+    if suffix not in SUPPORTED_EXTENSIONS:
+        await ctx.reply(f"Unsupported file type `{suffix}`.")
         return
 
-    # Clamp values
-    if line_sync < 0 or line_sync > 1:
-        await ctx.reply("`line_sync` must be between 0 and 1.")
-        return
-
-    status_msg = await ctx.reply(
-        f"\u2699\ufe0f Applying **TV Simulator** (sync={line_sync}, zoom={zoom_grill}, vertical={vertical})..."
-    )
+    is_video = suffix in VIDEO_EXTENSIONS
+    out_ext = get_output_ext(suffix, is_video)
+    status_msg = await ctx.reply(f"\u2699\ufe0f Re-applying **{last['label']}**...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, "output_tvsim.mp4")
-
+        output_path = os.path.join(tmpdir, f"output{out_ext}")
         try:
             await download_attachment(attachment, input_path)
         except Exception as e:
-            await status_msg.edit(content=f"\u274c Failed to download your file: {e}")
+            await status_msg.edit(content=f"\u274c Failed to download: {e}")
             return
 
         loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(
-            None, _run_tvsim, input_path, output_path, line_sync, zoom_grill, vertical
-        )
+        if last["type"] == "preset":
+            ok, err = await loop.run_in_executor(
+                None, run_ffmpeg, input_path, output_path, last["preset"], is_video
+            )
+        else:
+            ok, err = await loop.run_in_executor(
+                None, _run_ihtx_tagscript_workflow,
+                input_path, output_path,
+                last["exports"], last["duration"], last["no_trim"],
+                last["export_format"], last["output_format"], last["pipe_effects"]
+            )
 
         if not ok:
-            await status_msg.edit(content=f"\u274c TV Simulator failed:\n```\n{err[-1500:]}\n```")
+            await status_msg.edit(content=f"\u274c Lexg failed:\n```\n{err[-1500:]}\n```")
             return
 
         out_size = os.path.getsize(output_path)
         if out_size > MAX_FILE_SIZE:
-            await status_msg.edit(content="\u274c Output file too large for Discord (>25 MB). Try a shorter clip.")
+            await status_msg.edit(content="\u274c Output too large for Discord (>25 MB).")
             return
 
-        out_filename = f"tvsim_{line_sync}_{zoom_grill}_{vertical}_{Path(attachment.filename).stem}.mp4"
+        out_filename = f"lexg_{last['label']}_{Path(attachment.filename).stem}{out_ext}"
         try:
             await ctx.reply(
-                content=f"\u2705 **IHTX TV Simulator** (sync={line_sync}, zoom={zoom_grill}, vertical={vertical}) applied!",
+                content=f"\u2705 **Lexg** re-applied `{last['label']}`!",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
         except discord.HTTPException as e:
-            await status_msg.edit(content=f"\u274c Failed to upload result: {e}")
+            await status_msg.edit(content=f"\u274c Failed to upload: {e}")
+
+
+# ---------- Download video ----------
+
+@bot.hybrid_command(name="dl", aliases=["dv", "download", "dlv"], description="Download a video or image from a URL")
+@app_commands.describe(url="URL to download from", attachment="Optional file to include in the message")
+async def dl_command(ctx: commands.Context, url: str = "", attachment: discord.Attachment = None):
+    """Download a video or image from a URL.
+
+    Works with:
+    - Direct video/image links
+    - YouTube, TikTok, etc (via yt-dlp if available)
+    - Images too
+    """
+    # If no URL provided, try to get one from message content
+    if not url:
+        if ctx.message:
+            # Try to find a URL in the message content
+            parts = ctx.message.content.split()
+            for p in parts[1:]:  # Skip command name
+                if p.startswith("http://") or p.startswith("https://"):
+                    url = p
+                    break
+
+    if not url:
+        await ctx.reply(
+            "**g!dl** — Download a video or image from a URL.\n\n"
+            "Usage:\n"
+            "`g!dl <url>`\n"
+            "`g!dlv https://youtube.com/watch?v=...`\n"
+            "`g!dl https://example.com/image.png`\n\n"
+            "Aliases: `g!dv`, `g!dlv`, `g!download`"
+        )
+        return
+
+    status_msg = await ctx.reply(f"\u2699\ufe0f Downloading from URL...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Try yt-dlp first if it's a video URL
+        if yt_dlp and re.search(r"(youtube|youtu\.be|tiktok|x\.com|twitter|instagram|reddit|vimeo|twitch|fb\.watch|facebook|bilibili)", url, re.I):
+            try:
+                output_path = os.path.join(tmpdir, "downloaded")
+                ydl_opts = {
+                    "format": "best[filesize<25M]/bestvideo[height<=720][filesize<25M]+bestaudio/best[filesize<25M]/best",
+                    "outtmpl": output_path + ".%(ext)s",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "max_filesize": MAX_FILE_SIZE,
+                    "cookiefile": None,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    downloaded = ydl.prepare_filename(info)
+                    if os.path.exists(downloaded):
+                        out_size = os.path.getsize(downloaded)
+                        if out_size > MAX_FILE_SIZE:
+                            await status_msg.edit(content="\u274c Downloaded file too large (>25 MB).")
+                            return
+                        filename = os.path.basename(downloaded)
+                        await ctx.reply(
+                            content=f"\u2705 Downloaded via yt-dlp: `{info.get('title', 'Untitled')}`",
+                            file=discord.File(downloaded, filename=filename),
+                        )
+                        await status_msg.delete()
+                        return
+            except Exception as e:
+                # Fall back to direct download
+                pass
+
+        # Direct download
+        try:
+            import urllib.request
+            import ssl
+            ssl_ctx = ssl.create_default_context()
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            # Try to guess extension from URL
+            parsed = urllib.parse.urlparse(url)
+            ext = Path(parsed.path).suffix or ".mp4"
+            output_path = os.path.join(tmpdir, f"downloaded{ext}")
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as resp:
+                with open(output_path, "wb") as f:
+                    f.write(resp.read())
+            out_size = os.path.getsize(output_path)
+            if out_size > MAX_FILE_SIZE:
+                await status_msg.edit(content="\u274c Downloaded file too large (>25 MB).")
+                return
+            filename = os.path.basename(output_path)
+            await ctx.reply(
+                content=f"\u2705 Downloaded from URL!",
+                file=discord.File(output_path, filename=filename),
+            )
+            await status_msg.delete()
+        except Exception as e:
+            await status_msg.edit(content=f"\u274c Failed to download: {e}")
 
 
 # ---------- Owner-only moderation / utility commands ----------
