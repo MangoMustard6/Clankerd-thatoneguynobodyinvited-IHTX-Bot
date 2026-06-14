@@ -281,7 +281,7 @@ _load_tags()
 # Intents and bot
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="g!", intents=intents)
+bot = commands.Bot(command_prefix="tugni;", intents=intents)
 
 # Runtime stats
 _bot_start_time: float = time.time()
@@ -2752,45 +2752,6 @@ async def clearchat(ctx: commands.Context):
     _chat_histories.pop(ctx.author.id, None)
     await ctx.reply("🧹 Your conversation history has been cleared.")
 
-
-@bot.hybrid_command(name="imagine", aliases=["img", "gen", "generate"], description="Generate an image from a text prompt")
-@app_commands.describe(prompt="Describe the image you want to generate")
-async def imagine(ctx: commands.Context, *, prompt: str):
-    """Generate an image using AI from a text description."""
-    if _genai_client is None:
-        await ctx.reply("❌ Image generation is unavailable (missing `google-genai` package).")
-        return
-
-    async with ctx.typing():
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: _genai_client.models.generate_content(
-                    model="gemini-2.0-flash-preview-image-generation",
-                    contents=prompt,
-                    config=_genai_types.GenerateContentConfig(
-                        response_modalities=["IMAGE", "TEXT"],
-                    ),
-                ),
-            )
-            image_bytes = None
-            for part in response.candidates[0].content.parts:
-                if part.inline_data is not None:
-                    image_bytes = part.inline_data.data
-                    break
-            if image_bytes is None:
-                raise ValueError("No image returned by the model.")
-        except Exception as e:
-            await ctx.reply(f"❌ Image generation failed: {e}")
-            return
-
-    import io
-    file = discord.File(fp=io.BytesIO(image_bytes), filename="imagine.png")
-    embed = discord.Embed(description=f"🎨 **{prompt}**", color=discord.Color.og_blurple())
-    embed.set_image(url="attachment://imagine.png")
-    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
-    await ctx.reply(embed=embed, file=file)
 
 
 # ---------- Fun commands ----------
