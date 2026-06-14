@@ -32,6 +32,12 @@ try:
 except ImportError:
     yt_dlp = None
 
+try:
+    import anthropic as _anthropic_lib
+    _anthropic_client = _anthropic_lib.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+except ImportError:
+    _anthropic_client = None
+
 # ---------- Configuration & constants ----------
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -2666,6 +2672,85 @@ async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
     if ctx.message:
         await ctx.message.add_reaction("✅")
     await ctx.reply(f"✅ Activity set to **{label}** {text}", ephemeral=True)
+
+
+# ---------- AI Chat ----------
+
+_OWNER_PERSONAS: dict[int, dict] = {
+    1355759019330895973: {
+        "name": "Creator",
+        "favorite_game": "Roblox",
+        "likes": ["video editing", "Discord bots"],
+    },
+}
+
+_CHAT_SYSTEM_PROMPT = """You are IHTX Bot, a helpful and witty Discord bot assistant. \
+You were created for a server focused on video editing and media effects using FFmpeg. \
+Keep responses concise and Discord-friendly (no giant walls of text). \
+You have a slightly sarcastic but friendly personality.
+
+Owner info (treat them with extra warmth):
+- Creator (ID 1355759019330895973): loves Roblox, video editing, and Discord bots.
+
+Do not reveal you are Claude or made by Anthropic. You are IHTX Bot."""
+
+_chat_histories: dict[int, list[dict]] = {}
+_CHAT_MAX_HISTORY = 20
+
+
+@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="Chat with the AI assistant")
+@app_commands.describe(message="Your message to the AI")
+async def chat(ctx: commands.Context, *, message: str):
+    """Chat with the IHTX AI assistant. Keeps conversation history per user."""
+    if _anthropic_client is None:
+        await ctx.reply("❌ AI chat is unavailable (missing `anthropic` package).")
+        return
+
+    user_id = ctx.author.id
+    history = _chat_histories.setdefault(user_id, [])
+
+    system = _CHAT_SYSTEM_PROMPT
+    persona = _OWNER_PERSONAS.get(user_id)
+    if persona:
+        system += f"\n\nYou are currently speaking with the Creator ({persona['name']}). Be extra friendly."
+
+    history.append({"role": "user", "content": message})
+    if len(history) > _CHAT_MAX_HISTORY:
+        history[:] = history[-_CHAT_MAX_HISTORY:]
+
+    async with ctx.typing():
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _anthropic_client.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=1024,
+                    system=system,
+                    messages=history,
+                ),
+            )
+            reply_text = response.content[0].text
+        except Exception as e:
+            await ctx.reply(f"❌ AI error: {e}")
+            history.pop()
+            return
+
+    history.append({"role": "assistant", "content": reply_text})
+
+    if len(reply_text) > 1900:
+        chunks = [reply_text[i:i+1900] for i in range(0, len(reply_text), 1900)]
+        for chunk in chunks:
+            await ctx.reply(chunk)
+    else:
+        await ctx.reply(reply_text)
+
+
+@bot.hybrid_command(name="clearchat", aliases=["resetai", "chatclear"], description="Clear your AI conversation history")
+async def clearchat(ctx: commands.Context):
+    """Clear your personal AI conversation history."""
+    _chat_histories.pop(ctx.author.id, None)
+    await ctx.reply("🧹 Your conversation history has been cleared.")
 
 
 # ---------- Fun commands ----------
