@@ -2610,28 +2610,21 @@ async def sayembed(ctx: commands.Context, *, content: str):
 
 
 @bot.hybrid_command(name="keywordblockmsg", aliases=["kbmsg", "blockmsg"], description="Owner-only: set a custom message for a keyword block")
-@app_commands.describe(keyword="Keyword to customize message for", message="Message to send (use {mention} or {user} for user mention)", channel="Channel mention or ID (omit for current channel)")
+@app_commands.describe(keyword="Keyword to customize message for", message="Message to send (use {mention} or {user} for user mention)")
 @commands.check(_is_owner)
-async def keywordblockmsg(ctx: commands.Context, keyword: str, message: str, channel: str = None):
+async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
     """Owner-only: set a custom message for a keyword block.
 
-    Use {mention} or {user} to include the user's mention.
+    Everything after the keyword is the message. Use {mention} or {user} for user mention.
     Example:
-      g!keywordblockmsg swearword "no swearing, {mention}!"
-      g!keywordblockmsg badword "dont say that, {user}"
+      g!keywordblockmsg swearword no swearing, {mention}!
+      g!keywordblockmsg badword dont say that, {user}
     """
     normalized = _normalize_keyword(keyword)
     if not normalized:
         await ctx.reply("❌ Provide a keyword.")
         return
-    if channel is None:
-        channel_id = ctx.channel.id
-    else:
-        try:
-            channel_id = _parse_digits(channel)
-        except ValueError:
-            await ctx.reply("❌ Invalid channel.")
-            return
+    channel_id = ctx.channel.id
 
     blocked = keyword_blocks.get(channel_id, set())
     if normalized not in blocked:
