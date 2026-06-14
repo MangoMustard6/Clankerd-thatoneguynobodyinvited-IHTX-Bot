@@ -3266,28 +3266,62 @@ async def on_message(message: discord.Message):
 
 # ---------- Image-to-video (fal.ai HappyHorse) ----------
 
-@bot.command(name="imagevideo")
-async def imagevideo(ctx: commands.Context, *, prompt: str = "cinematic scene"):
-    """Generate a short video from an attached image using HappyHorse AI.
+@bot.hybrid_command(name="imagevideo", aliases=["iv", "vidgen"], description="Generate a video from an image using HappyHorse AI")
+@app_commands.describe(
+    prompt="Description of the motion/scene (default: cinematic scene)",
+    duration="Video duration in seconds (default: 10)",
+    image_url="Image URL to use instead of an attachment",
+    attachment="Image file to generate video from",
+)
+async def imagevideo(
+    ctx: commands.Context,
+    duration: int = 10,
+    image_url: str = None,
+    attachment: discord.Attachment = None,
+    *,
+    prompt: str = "cinematic scene",
+):
+    """Generate a short video from an image using HappyHorse AI via fal.ai.
 
-    Usage: tugni;imagevideo [optional prompt]
-    Attach an image to the message.
+    Usage: tugni;imagevideo [duration] [image_url] [prompt]
+    You can attach an image, pass a URL, or reply to a message with an image.
     """
     if _fal_client is None:
         await ctx.reply("❌ `fal-client` is not installed. Ask the bot owner to install it.")
         return
 
-    if not ctx.message.attachments:
-        await ctx.reply("❌ Please attach an image to use with this command.")
-        return
-
-    fal_key = os.environ.get("FAL_KEY")
-    if not fal_key:
+    if not os.environ.get("FAL_KEY"):
         await ctx.reply("❌ `FAL_KEY` is not configured. Ask the bot owner to add it.")
         return
 
-    image_url = ctx.message.attachments[0].url
-    status_msg = await ctx.reply("🎬 Generating video with HappyHorse AI… this may take a minute.")
+    # Clamp duration to fal's supported range
+    duration = max(1, min(duration, 30))
+
+    # Resolve image: explicit URL > slash attachment param > message attachment > replied message attachment
+    resolved_url = image_url
+    if resolved_url is None:
+        if attachment is not None:
+            resolved_url = attachment.url
+        elif ctx.message and ctx.message.attachments:
+            resolved_url = ctx.message.attachments[0].url
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    resolved_url = ref.attachments[0].url
+            except Exception:
+                pass
+
+    if not resolved_url:
+        await ctx.reply(
+            "❌ No image found. Please:\n"
+            "• Attach an image to your message, or\n"
+            "• Pass an image URL: `tugni;imagevideo <duration> <url> <prompt>`, or\n"
+            "• Reply to a message that contains an image."
+        )
+        return
+
+    status_msg = await ctx.reply(f"🎬 Generating {duration}s video with HappyHorse AI… this may take a minute.")
 
     try:
         loop = asyncio.get_event_loop()
@@ -3297,8 +3331,8 @@ async def imagevideo(ctx: commands.Context, *, prompt: str = "cinematic scene"):
                 "fal-ai/happyhorse-1.0/image-to-video",
                 arguments={
                     "prompt": prompt,
-                    "image_url": image_url,
-                    "duration": 5,
+                    "image_url": resolved_url,
+                    "duration": duration,
                 },
             ),
         )
