@@ -11,3 +11,8 @@ discord.py
 yt-dlp
 anthropic
 google-genai
+aiohttp
+anthropic
+discord.py
+google-genai
+yt-dlp
