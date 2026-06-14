@@ -48,6 +48,9 @@ try:
     import replicate as _replicate
 except ImportError:
     _replicate = None
+    
+    print("Discord token found:", bool(DISCORD_TOKEN))
+print("Replicate token found:", bool(REPLICATE_API_TOKEN))
 
 # ---------- Configuration & constants ----------
 
