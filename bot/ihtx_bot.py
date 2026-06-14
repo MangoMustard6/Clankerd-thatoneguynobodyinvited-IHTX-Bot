@@ -264,7 +264,15 @@ def _load_autoreplies():
     try:
         if AUTOREPLY_FILE.exists():
             with AUTOREPLY_FILE.open() as f:
-                autoreplies = json.load(f)
+                raw = json.load(f)
+            # Migrate old flat format {"trigger": "response"} → new format
+            migrated = {}
+            for k, v in raw.items():
+                if isinstance(v, dict):
+                    migrated[k] = v
+                else:
+                    migrated[k] = {"response": v, "channel_id": None}
+            autoreplies = migrated
         else:
             autoreplies = {}
     except Exception:
@@ -2696,24 +2704,35 @@ async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
 
 # ---------- Autoreplies ----------
 
-@bot.hybrid_command(name="autoreply", aliases=["ar"], description="Owner-only: add an autoreply trigger")
-@app_commands.describe(trigger="Word or phrase that triggers the reply", response="What the bot replies (use {mention} for user)")
+@bot.hybrid_command(name="autoreply", aliases=["ar"], description="Owner-only: add an autoreply trigger (optionally channel-specific)")
+@app_commands.describe(
+    trigger="Word or phrase that triggers the reply",
+    channel="Optional: only reply in this channel (leave blank for all channels)",
+    response="What the bot replies (use {mention} for user)",
+)
 @commands.check(_is_owner)
-async def autoreply(ctx: commands.Context, trigger: str, *, response: str):
+async def autoreply(ctx: commands.Context, trigger: str, channel: discord.TextChannel = None, *, response: str):
     """Owner-only: add an autoreply. When anyone says the trigger, the bot replies.
 
+    Optionally restrict to a specific channel.
     Use {mention} or {user} to ping the user in the response.
-    Example:
+    Example (all channels):
       tugni;autoreply hello Hello there, {mention}!
-      tugni;autoreply goodnight Sweet dreams 🌙
+    Example (specific channel):
+      tugni;autoreply hello #general Hello there, {mention}!
     """
     trigger_norm = trigger.strip().lower()
     if not trigger_norm:
         await ctx.reply("❌ Provide a trigger word or phrase.")
         return
-    autoreplies[trigger_norm] = response
+    if not response:
+        await ctx.reply("❌ Provide a response message.")
+        return
+    channel_id = channel.id if channel else None
+    autoreplies[trigger_norm] = {"response": response, "channel_id": channel_id}
     _save_autoreplies()
-    await ctx.reply(f"✅ Autoreply set: `{trigger_norm}` → {response}")
+    channel_note = f" in {channel.mention}" if channel else " in all channels"
+    await ctx.reply(f"✅ Autoreply set{channel_note}: `{trigger_norm}` → {response}")
 
 
 @bot.hybrid_command(name="removeautoreply", aliases=["rar", "deautoreply"], description="Owner-only: remove an autoreply trigger")
@@ -2736,7 +2755,12 @@ async def listautoreplies(ctx: commands.Context):
     if not autoreplies:
         await ctx.reply("No autoreplies set.")
         return
-    lines = [f"`{trigger}` → {response}" for trigger, response in autoreplies.items()]
+    lines = []
+    for trigger, entry in autoreplies.items():
+        resp = entry.get("response", entry) if isinstance(entry, dict) else entry
+        ch_id = entry.get("channel_id") if isinstance(entry, dict) else None
+        ch_note = f" (<#{ch_id}>)" if ch_id else " (all channels)"
+        lines.append(f"`{trigger}`{ch_note} → {resp}")
     chunks = []
     current = ""
     for line in lines:
@@ -3006,9 +3030,13 @@ async def on_message(message: discord.Message):
     # Autoreplies (check before keyword blocks, skip commands)
     if not message.content.startswith("tugni;"):
         content_lower = message.content.lower()
-        for trigger, response in autoreplies.items():
+        for trigger, entry in autoreplies.items():
             if trigger in content_lower:
-                reply = response.replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
+                ch_id = entry.get("channel_id") if isinstance(entry, dict) else None
+                if ch_id is not None and message.channel.id != ch_id:
+                    continue
+                resp = entry.get("response", entry) if isinstance(entry, dict) else entry
+                reply = resp.replace("{mention}", message.author.mention).replace("{user}", message.author.mention)
                 await message.reply(reply)
                 break
 
