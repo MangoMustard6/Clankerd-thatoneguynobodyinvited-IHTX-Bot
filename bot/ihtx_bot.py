@@ -2352,6 +2352,19 @@ async def help_command(ctx: commands.Context):
         value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
         inline=False,
     )
+    embed.add_field(
+        name="g!img2vid [duration] <prompt>  (aliases: i2v)",
+        value="Generate a video from a text prompt (+ optional image attachment) using Sora.\n"
+              "Model auto-selected: `sora-2` (default), `sora-2-pro` (cinematic), `sora-image-1` (image+fast).\n"
+              "Example: `g!img2vid 5 a cyberpunk city at night`",
+        inline=False,
+    )
+    embed.add_field(
+        name="g!catbox  (aliases: cb, upload)",
+        value="Upload an attached file (or replied-to attachment) to catbox.moe and return a direct link.\n"
+              "Supports any file type up to 200 MB.",
+        inline=False,
+    )
     embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
     await ctx.reply(embed=embed)
 
@@ -3731,6 +3744,51 @@ async def img2vid(ctx: commands.Context, duration: int = 5, *, prompt: str = "ci
     image_url = ctx.message.attachments[0].url if ctx.message.attachments else None
     status_msg = await ctx.reply("⏳ starting generation…")
     asyncio.create_task(_run_img2vid(ctx, prompt, duration, image_url, status_msg))
+
+
+# ---------- Catbox upload ----------
+
+@bot.hybrid_command(name="catbox", aliases=["cb", "upload"], description="Upload a file to catbox.moe and get a direct link")
+@app_commands.describe(attachment="File to upload (or reply to a message with an attachment)")
+async def catbox_upload(ctx: commands.Context, attachment: discord.Attachment = None):
+    """Upload any file to catbox.moe and return a permanent direct link.
+
+      tugni;catbox   (with file attached, or reply to a message with a file)
+    """
+    src = attachment
+    if src is None and ctx.message.attachments:
+        src = ctx.message.attachments[0]
+    if src is None and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                src = ref.attachments[0]
+        except Exception:
+            pass
+    if src is None:
+        await ctx.reply("📎 attach a file or reply to a message with a file to upload it to catbox.moe")
+        return
+
+    status_msg = await ctx.reply(f"⬆️ uploading `{src.filename}` to catbox.moe…")
+    try:
+        file_bytes = await src.read()
+        data = aiohttp.FormData()
+        data.add_field("reqtype", "fileupload")
+        data.add_field(
+            "fileToUpload",
+            file_bytes,
+            filename=src.filename,
+            content_type=src.content_type or "application/octet-stream",
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://catbox.moe/user/api.php", data=data, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                result = await r.text()
+        if result.startswith("https://"):
+            await status_msg.edit(content=f"✅ {result.strip()}")
+        else:
+            await status_msg.edit(content=f"❌ catbox error: {result[:300]}")
+    except Exception as e:
+        await status_msg.edit(content=f"❌ upload failed: {e}")
 
 
 # ---------- Error handling & run ----------
