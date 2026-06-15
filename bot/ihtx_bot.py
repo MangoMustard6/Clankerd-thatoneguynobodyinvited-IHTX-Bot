@@ -3675,9 +3675,9 @@ def _tikhub_generate(prompt: str, duration: int, image_url: str | None) -> tuple
     api_key = os.environ.get("TIKHUB_API_KEY")
     client = _OpenAI(api_key=api_key, base_url="https://ai.tikhub.io/v1")
     model = _tikhub_pick_model(prompt, image_url is not None)
-    kwargs = dict(model=model, prompt=prompt, n=1, duration=duration)
+    kwargs = dict(model=model, prompt=prompt, n=1, extra_body={"duration": duration})
     if image_url:
-        kwargs["image"] = image_url
+        kwargs["extra_body"]["image"] = image_url
     response = client.images.generate(**kwargs)
     return response.data[0].url, model
 
