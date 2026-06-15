@@ -3655,66 +3655,67 @@ async def video_slash(
     )
 
 
-# ---------- img2vid (Stable Video Diffusion via HuggingFace) ----------
+# ---------- img2vid (TikHub / Sora) ----------
 
-_HF_SVD_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-video-diffusion-img2vid"
-_HF_MAX_RETRIES = 8
-
-
-async def _hf_svd_call(image_bytes: bytes) -> bytes:
-    """POST image bytes to HF SVD; retries on model-loading responses. Returns video bytes."""
-    hf_token = os.environ.get("HF_TOKEN")
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    async with aiohttp.ClientSession() as session:
-        for attempt in range(_HF_MAX_RETRIES):
-            async with session.post(_HF_SVD_URL, headers=headers, data=image_bytes) as r:
-                body = await r.read()
-                if r.status == 200:
-                    return body
-                text = body.decode(errors="replace")
-                if "loading" in text.lower() or r.status == 503:
-                    wait = 8 + attempt * 4
-                    await asyncio.sleep(wait)
-                    continue
-                raise RuntimeError(f"HF API error {r.status}: {text[:400]}")
-    raise RuntimeError("Model still loading after max retries — try again in a minute 😭")
+try:
+    from openai import OpenAI as _OpenAI
+except ImportError:
+    _OpenAI = None
 
 
-async def _run_img2vid(ctx: commands.Context, image_bytes: bytes, status_msg: discord.Message):
-    """Runs a single img2vid generation and updates status_msg throughout."""
+def _tikhub_pick_model(prompt: str, has_image: bool) -> str:
+    p = prompt.lower()
+    if has_image:
+        return "sora-image-1" if "fast" in p else "sora-2"
+    return "sora-2-pro" if "cinematic" in p else "sora-2"
+
+
+def _tikhub_generate(prompt: str, duration: int, image_url: str | None) -> tuple[str | None, str]:
+    """Synchronous TikHub call — run in executor."""
+    api_key = os.environ.get("TIKHUB_API_KEY")
+    client = _OpenAI(api_key=api_key, base_url="https://ai.tikhub.io/v1")
+    model = _tikhub_pick_model(prompt, image_url is not None)
+    kwargs = dict(model=model, prompt=prompt, n=1, duration=duration)
+    if image_url:
+        kwargs["image"] = image_url
+    response = client.images.generate(**kwargs)
+    return response.data[0].url, model
+
+
+async def _run_img2vid(ctx: commands.Context, prompt: str, duration: int,
+                       image_url: str | None, status_msg: discord.Message):
     try:
-        await status_msg.edit(content="⚡ generating… this can take a minute 🙏")
-        video_bytes = await _hf_svd_call(image_bytes)
-        out_path = f"img2vid_{ctx.message.id}.mp4"
-        with open(out_path, "wb") as f:
-            f.write(video_bytes)
-        await status_msg.edit(content="✅ done!")
-        await ctx.send(file=discord.File(out_path))
-        try:
-            os.remove(out_path)
-        except OSError:
-            pass
+        await status_msg.edit(content="🎬 generating video… 🙏")
+        loop = asyncio.get_event_loop()
+        video_url, model = await loop.run_in_executor(
+            None, lambda: _tikhub_generate(prompt, duration, image_url)
+        )
+        await status_msg.edit(content=f"✅ model: `{model}` | duration: `{duration}s`")
+        await ctx.send(video_url)
     except Exception as e:
         await status_msg.edit(content=f"❌ failed: {e}")
 
 
-@bot.hybrid_command(name="img2vid", aliases=["i2v"], description="Convert an image to a short video using Stable Video Diffusion")
-@app_commands.describe(attachment="Image to animate (JPG or PNG)")
-async def img2vid(ctx: commands.Context, attachment: discord.Attachment = None):
-    """Animate an image into a short video via Stable Video Diffusion.
+@bot.hybrid_command(name="img2vid", aliases=["i2v"], description="Generate a video from a prompt (and optional image) using Sora")
+@app_commands.describe(
+    duration="Video length in seconds (default 5)",
+    prompt="Describe the video you want",
+)
+async def img2vid(ctx: commands.Context, duration: int = 5, *, prompt: str = "cinematic scene"):
+    """Generate a video via TikHub's Sora models.
 
-    Attach an image (JPG/PNG) and the bot will generate a short video from it.
+    Optionally attach an image to animate it.
 
-      tugni;img2vid   (with image attached)
+      tugni;img2vid 5 a cyberpunk city at night
+      tugni;img2vid 8 anime girl walking  (with image attached)
     """
-    src = attachment or (ctx.message.attachments[0] if ctx.message.attachments else None)
-    if src is None:
-        await ctx.reply("📸 attach an image (JPG or PNG) to use `img2vid`")
+    if _OpenAI is None:
+        await ctx.reply("❌ `openai` package not installed.")
         return
 
-    image_bytes = await src.read()
+    image_url = ctx.message.attachments[0].url if ctx.message.attachments else None
     status_msg = await ctx.reply("⏳ starting generation…")
-    asyncio.create_task(_run_img2vid(ctx, image_bytes, status_msg))
+    asyncio.create_task(_run_img2vid(ctx, prompt, duration, image_url, status_msg))
 
 
 # ---------- Error handling & run ----------
