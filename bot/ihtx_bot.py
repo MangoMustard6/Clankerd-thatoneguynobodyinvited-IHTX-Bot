@@ -3671,21 +3671,36 @@ def _tikhub_pick_model(prompt: str, has_image: bool) -> str:
 
 
 def _tikhub_generate(prompt: str, duration: int, image_url: str | None) -> tuple[str | None, str]:
-    """Synchronous TikHub call — run in executor."""
+    """Synchronous TikHub call — run in executor. Retries on transient 503 channel errors."""
+    import time as _time
     api_key = os.environ.get("TIKHUB_API_KEY")
     client = _OpenAI(api_key=api_key, base_url="https://ai.tikhub.io/v1")
     model = _tikhub_pick_model(prompt, image_url is not None)
     kwargs = dict(model=model, prompt=prompt, n=1, extra_body={"duration": duration})
     if image_url:
         kwargs["extra_body"]["image"] = image_url
-    response = client.images.generate(**kwargs)
-    return response.data[0].url, model
+    last_err = None
+    for attempt in range(5):
+        try:
+            response = client.images.generate(**kwargs)
+            return response.data[0].url, model
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            # Retry on transient "no available channel" / 503 / overload errors
+            if any(x in msg for x in ("503", "no available channel", "overload", "rate limit", "529")):
+                wait = 6 + attempt * 5
+                _time.sleep(wait)
+                continue
+            raise
+    raise last_err
 
 
 async def _run_img2vid(ctx: commands.Context, prompt: str, duration: int,
                        image_url: str | None, status_msg: discord.Message):
     try:
-        await status_msg.edit(content="🎬 generating video… 🙏")
+        model = _tikhub_pick_model(prompt, image_url is not None)
+        await status_msg.edit(content=f"🎬 generating with `{model}`… 🙏 (may take a minute)")
         loop = asyncio.get_event_loop()
         video_url, model = await loop.run_in_executor(
             None, lambda: _tikhub_generate(prompt, duration, image_url)
