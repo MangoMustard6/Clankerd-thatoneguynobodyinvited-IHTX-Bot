@@ -350,6 +350,9 @@ def _save_autoreply2_no_mention():
 
 _load_autoreply2_no_mention()
 
+# ---------- img2vid queue ----------
+_img2vid_queue: asyncio.Queue = asyncio.Queue()
+
 # Warnings
 WARNINGS_FILE = Path("bot/warnings.json")
 warnings_data: dict[int, list[dict]] = {}
@@ -1727,6 +1730,7 @@ async def on_ready():
         type=discord.ActivityType.watching,
         name="Meet the Sparkles! ✨👗 | Sparkles Magical Market Full Episode | Cartoons for Kids"
     ))
+    asyncio.create_task(_img2vid_worker())
 
 
 @bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
@@ -3653,6 +3657,66 @@ async def video_slash(
         image_url=image_url,
         attachment=attachment,
     )
+
+
+# ---------- img2vid (Stable Video Diffusion via HuggingFace) ----------
+
+_HF_SVD_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-video-diffusion-img2vid"
+_HF_MAX_RETRIES = 5
+
+
+async def _hf_svd_call(image_bytes: bytes) -> bytes | None:
+    """POST image bytes to HF SVD; retries on model-loading responses. Returns video bytes or None."""
+    hf_token = os.environ.get("HF_TOKEN")
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(_HF_MAX_RETRIES):
+            async with session.post(_HF_SVD_URL, headers=headers, data=image_bytes) as r:
+                body = await r.read()
+                if r.status == 200:
+                    return body
+                text = body.decode(errors="replace")
+                if "loading" in text.lower():
+                    await asyncio.sleep(5)
+                    continue
+                raise RuntimeError(f"HF API error {r.status}: {text[:300]}")
+    raise RuntimeError("Model still loading after max retries — try again in a minute.")
+
+
+async def _img2vid_worker():
+    """Background worker that processes img2vid requests one at a time."""
+    while True:
+        ctx, image_bytes, status_msg = await _img2vid_queue.get()
+        try:
+            await status_msg.edit(content="⚡ generating video… this can take a minute 🙏")
+            video_bytes = await _hf_svd_call(image_bytes)
+            with open("img2vid_output.mp4", "wb") as f:
+                f.write(video_bytes)
+            await ctx.send(file=discord.File("img2vid_output.mp4"))
+            await status_msg.edit(content="✅ done!")
+        except Exception as e:
+            await status_msg.edit(content=f"❌ failed: {e}")
+        finally:
+            _img2vid_queue.task_done()
+
+
+@bot.hybrid_command(name="img2vid", aliases=["i2v"], description="Convert an image to a short video using Stable Video Diffusion")
+@app_commands.describe(attachment="Image to animate (JPG or PNG)")
+async def img2vid(ctx: commands.Context, attachment: discord.Attachment = None):
+    """Animate an image into a short video via Stable Video Diffusion.
+
+    Attach an image (JPG/PNG) and the bot will queue it for generation.
+
+      tugni;img2vid   (with image attached)
+    """
+    src = attachment or (ctx.message.attachments[0] if ctx.message.attachments else None)
+    if src is None:
+        await ctx.reply("📸 attach an image (JPG or PNG) to use `img2vid`")
+        return
+
+    image_bytes = await src.read()
+    status_msg = await ctx.reply("📥 added to queue…")
+    await _img2vid_queue.put((ctx, image_bytes, status_msg))
 
 
 # ---------- Error handling & run ----------
