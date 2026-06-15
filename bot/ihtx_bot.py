@@ -48,9 +48,6 @@ try:
     import replicate as _replicate
 except ImportError:
     _replicate = None
-    
-    print("Discord token found:", bool(DISCORD_TOKEN))
-print("Replicate token found:", bool(REPLICATE_API_TOKEN))
 
 # ---------- Configuration & constants ----------
 
@@ -3581,10 +3578,13 @@ async def _video_core(
         if resolved_image:
             input_data["image"] = resolved_image
 
+        replicate_token = os.environ.get("REPLICATE_API_TOKEN")
         loop = asyncio.get_event_loop()
         output = await loop.run_in_executor(
             None,
-            lambda: _replicate.run("bytedance/seedance-2.0", input=input_data),
+            lambda: _replicate.Client(api_token=replicate_token).run(
+                "bytedance/seedance-2.0", input=input_data
+            ),
         )
 
         video_url = str(output[0]) if isinstance(output, list) else str(output)
