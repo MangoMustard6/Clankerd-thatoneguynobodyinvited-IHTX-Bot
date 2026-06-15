@@ -27,8 +27,6 @@ import time
 from pathlib import Path
 import urllib.parse
 import base64
-import fal_client
-
 try:
     import yt_dlp
 except ImportError:
@@ -3580,10 +3578,13 @@ async def _video_core(
         if resolved_image:
             input_data["image"] = resolved_image
 
+        replicate_token = os.environ.get("REPLICATE_API_TOKEN")
         loop = asyncio.get_event_loop()
         output = await loop.run_in_executor(
             None,
-            lambda: _replicate.run("bytedance/seedance-2.0", input=input_data),
+            lambda: _replicate.Client(api_token=replicate_token).run(
+                "bytedance/seedance-2.0", input=input_data
+            ),
         )
 
         video_url = str(output[0]) if isinstance(output, list) else str(output)
