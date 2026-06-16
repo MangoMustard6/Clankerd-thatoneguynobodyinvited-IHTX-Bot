@@ -947,7 +947,7 @@ def _run_r3multipitch(
         return False, "No pitches provided for r3multipitch."
     n = len(pitches)
     fc_parts = [
-        f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:formant=preserved:channels=together:smoothing=on[a{j}]"
+        f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:channels=together:smoothing=on[a{j}]"
         for j, p in enumerate(pitches)
     ]
     mix = "".join(f"[a{j}]" for j in range(n))
@@ -1980,7 +1980,7 @@ def _run_ihtxcustom_workflow(
                 pitches = [p.strip() for p in re.split(r'[|,;]', r3mp_m.group(1)) if p.strip()]
                 n = len(pitches) or 1
                 fc_parts = [
-                    f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:formant=preserved:channels=together:smoothing=on[a{j}]"
+                    f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:channels=together:smoothing=on[a{j}]"
                     for j, p in enumerate(pitches)
                 ]
                 mix = "".join(f"[a{j}]" for j in range(n))
@@ -2050,14 +2050,20 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
     """HEAVY COMMAND: Powers-based ihtxcustom filter stacker.
 
     Applies a filter powers times progressively and concatenates all iterations.
+    Optionally runs a pipe-effect chain on the final concatenated output.
 
     Usage:
-      t!ihtxcustom <powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]
+      t!ihtxcustom <powers> <duration> [VIDEO: <vf>] [AUDIO: <af>] [PIPE: effect;effect]
 
     Examples:
       t!ihtxcustom 4 1.5 VIDEO: hflip AUDIO: volume=2
       t!ihtxcustom 3 2.0 VIDEO: negate
       t!ihtxcustom 5 1.0 VIDEO: hue=h=90:s=2 AUDIO: vibrato=f=5:d=0.5
+      t!ihtxcustom 3 2.0 VIDEO: hflip PIPE: negate;r3multipitch=-4|5
+      t!ihtxcustom 4 1.0 PIPE: huehsv=0.3;r3multipitch=-7|0|7
+
+    PIPE: runs the full t!ihtx pipe-effect chain on the concatenated output
+    after all powers iterations are done (VIDEO:/AUDIO: still apply per-step).
 
     Each iteration is one more application of the filter on top of the last,
     and all iterations are concatenated into the final video.
@@ -2065,11 +2071,13 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
     """
     vf = ""
     af = ""
+    pipe_raw = ""
+    pipe_effects: list[tuple[str, list[str]]] = []
     powers = 0
     duration = 1.0
 
     try:
-        pre = re.split(r'VIDEO:|AUDIO:', args, flags=re.IGNORECASE)[0].strip()
+        pre = re.split(r'VIDEO:|AUDIO:|PIPE:', args, flags=re.IGNORECASE)[0].strip()
         pre_parts = pre.split()
         if len(pre_parts) >= 2:
             powers = int(pre_parts[0])
@@ -2077,20 +2085,24 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
         elif len(pre_parts) == 1:
             powers = int(pre_parts[0])
 
-        vf_m = re.search(r'VIDEO:\s*(.*?)(?=\bAUDIO:|$)', args, re.IGNORECASE | re.DOTALL)
-        af_m = re.search(r'AUDIO:\s*(.*?)(?=\bVIDEO:|$)', args, re.IGNORECASE | re.DOTALL)
+        vf_m = re.search(r'VIDEO:\s*(.*?)(?=\bAUDIO:|\bPIPE:|$)', args, re.IGNORECASE | re.DOTALL)
+        af_m = re.search(r'AUDIO:\s*(.*?)(?=\bVIDEO:|\bPIPE:|$)', args, re.IGNORECASE | re.DOTALL)
+        pipe_m = re.search(r'PIPE:\s*(.*?)(?=\bVIDEO:|\bAUDIO:|$)', args, re.IGNORECASE | re.DOTALL)
         if vf_m:
             vf = vf_m.group(1).strip()
         if af_m:
             af = af_m.group(1).strip()
+        if pipe_m:
+            pipe_raw = pipe_m.group(1).strip()
+            pipe_effects = _parse_pipe_effects(pipe_raw)
     except (ValueError, IndexError):
         pass
 
-    if powers < 1 or (not vf and not af):
+    if powers < 1 or (not vf and not af and not pipe_effects):
         await ctx.reply(
             "❌ Invalid syntax.\n"
-            "**Usage:** `t!ihtxcustom <powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]`\n"
-            "**Example:** `t!ihtxcustom 4 1.5 VIDEO: hflip AUDIO: volume=2`"
+            "**Usage:** `t!ihtxcustom <powers> <duration> [VIDEO: <vf>] [AUDIO: <af>] [PIPE: effect;effect]`\n"
+            "**Example:** `t!ihtxcustom 4 1.5 VIDEO: hflip PIPE: negate;r3multipitch=-4|5`"
         )
         return
 
@@ -2121,7 +2133,14 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
         await ctx.reply(f"❌ `ihtxcustom` requires a video file. Got `{suffix}`.")
         return
 
-    filter_desc = (f"VIDEO: `{vf}`" if vf else "") + (" " if vf and af else "") + (f"AUDIO: `{af}`" if af else "")
+    filter_parts = []
+    if vf:
+        filter_parts.append(f"VIDEO: `{vf}`")
+    if af:
+        filter_parts.append(f"AUDIO: `{af}`")
+    if pipe_raw:
+        filter_parts.append(f"PIPE: `{pipe_raw}`")
+    filter_desc = " | ".join(filter_parts)
     status_msg = await ctx.reply(
         f"⚙️ **ihtxcustom** — `{powers}` power(s) × `{duration}s` | {filter_desc} … this may take a moment."
     )
@@ -2148,6 +2167,17 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
         if not ok:
             await status_msg.edit(content=f"❌ ihtxcustom failed: {err}")
             return
+
+        if pipe_effects:
+            pipe_out = os.path.join(tmpdir, "ihtx_custom_pipe.mov")
+            ok, err = await loop.run_in_executor(
+                None,
+                lambda: _apply_pipe_effects(output_path, pipe_out, pipe_effects),
+            )
+            if not ok:
+                await status_msg.edit(content=f"❌ ihtxcustom pipe step failed: {err}")
+                return
+            output_path = pipe_out
 
         out_size = os.path.getsize(output_path)
         if out_size > MAX_FILE_SIZE:
