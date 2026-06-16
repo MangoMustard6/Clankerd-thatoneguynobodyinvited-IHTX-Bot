@@ -699,6 +699,7 @@ PIPE_EFFECT_NAMES = {
     "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
     "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
+    "r3multipitch", "r3mp", "rbmp",
     "syncaudio",
 }
 
@@ -932,15 +933,45 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
     return None
 
 
+def _run_r3multipitch(
+    input_path: str,
+    output_path: str,
+    pitches: list[str],
+) -> tuple[bool, str]:
+    """Apply rubberband r3 multi-pitch using filter_complex.
+
+    Each semitone value produces one pitch-shifted copy; all are amixed.
+    Requires FFmpeg built with --enable-librubberband (ffmpeg-full).
+    """
+    if not pitches:
+        return False, "No pitches provided for r3multipitch."
+    n = len(pitches)
+    fc_parts = [
+        f"[0:a]rubberband=pitch=2^({p}/12):engine=r3[a{j}]"
+        for j, p in enumerate(pitches)
+    ]
+    mix = "".join(f"[a{j}]" for j in range(n))
+    fc_parts.append(f"{mix}amix=inputs={n},volume={n}[outa]")
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+        "-i", input_path,
+        "-filter_complex", ";".join(fc_parts),
+        "-map", "0:v", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "pcm_s16le",
+        output_path,
+    ]
+    return _run_ffmpeg_raw(cmd, timeout=180)
+
+
 def _apply_pipe_effects(
     input_path: str,
     output_path: str,
     effects: list[tuple[str, list[str]]],
 ) -> tuple[bool, str]:
-    """Apply pipe effects sequentially.
-
-    Each effect is applied to the output of the previous one.
-    Effects: huehsv (ImageMagick), multipitch (SoX), or FFmpeg filters.
+    """Apply pipe effects sequentially — each effect is rendered individually
+    before the next begins (no filter batching).
     """
     if not effects:
         ok, err = _run_ffmpeg_raw(["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path], timeout=60)
@@ -948,14 +979,14 @@ def _apply_pipe_effects(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         current = input_path
-        ffmpeg_vf_parts = []
-        ffmpeg_af_parts = []
 
         for i, (name, params) in enumerate(effects):
-            # ImageMagick effect
+            is_last = (i == len(effects) - 1)
+            out = output_path if is_last else os.path.join(tmpdir, f"pipe_{i}.mp4")
+
+            # ImageMagick huehsv
             if name == "huehsv":
                 val = float(params[0]) if params else 0.5
-                out = os.path.join(tmpdir, f"pipe_{i}.mp4")
                 ok, err = _run_huehsv(current, out, val)
                 if not ok:
                     return False, err
@@ -964,8 +995,15 @@ def _apply_pipe_effects(
 
             # SoX multipitch
             if name in ("multipitch", "mp", "multi"):
-                out = os.path.join(tmpdir, f"pipe_{i}.mp4")
                 ok, err = _run_multipitch(current, out, params)
+                if not ok:
+                    return False, err
+                current = out
+                continue
+
+            # Rubberband r3 multipitch
+            if name in ("r3multipitch", "r3mp", "rbmp"):
+                ok, err = _run_r3multipitch(current, out, params)
                 if not ok:
                     return False, err
                 current = out
@@ -976,10 +1014,8 @@ def _apply_pipe_effects(
                 lut_url = params[0] if len(params) > 0 else ""
                 if not lut_url:
                     return False, "lut effect requires a URL parameter."
-                out = os.path.join(tmpdir, f"pipe_{i}.mp4")
                 lut_path = os.path.join(tmpdir, f"lut_{i}.cube")
                 try:
-                    # Download with SSL verification
                     import urllib.request
                     import ssl
                     ssl_ctx = ssl.create_default_context()
@@ -1006,53 +1042,70 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # FFmpeg video filter
+            # Raw VIDEO:/AUDIO: filters — each rendered immediately
+            if name == "__rawvf__":
+                vf_str = params[0] if params else ""
+                if vf_str:
+                    cmd = [
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current, "-vf", vf_str,
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy", out,
+                    ]
+                    ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                    if not ok:
+                        return False, f"Video filter failed: {err}"
+                    current = out
+                continue
+
+            if name == "__rawaf__":
+                af_str = params[0] if params else ""
+                if af_str:
+                    cmd = [
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current, "-af", af_str,
+                        "-c:v", "copy", "-c:a", "pcm_s16le", out,
+                    ]
+                    ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                    if not ok:
+                        return False, f"Audio filter failed: {err}"
+                    current = out
+                continue
+
+            # Named audio filters — rendered immediately
+            if name in ("volume", "vibrato", "areverse"):
+                af = _build_ffmpeg_pipe_vf(name, params)
+                if af:
+                    cmd = [
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current, "-af", af,
+                        "-c:v", "copy", "-c:a", "pcm_s16le", out,
+                    ]
+                    ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                    if not ok:
+                        return False, f"Audio filter '{name}' failed: {err}"
+                    current = out
+                    continue
+
+            # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
             if vf:
-                ffmpeg_vf_parts.append(vf)
-                continue
-
-            # FFmpeg audio filter
-            af = _build_ffmpeg_pipe_vf(name, params)
-            if af and name in ("volume", "vibrato", "areverse"):
-                ffmpeg_af_parts.append(af)
-                continue
-
-            # Raw filters from VIDEO:/AUDIO: syntax
-            if name == "__rawvf__":
-                if params:
-                    ffmpeg_vf_parts.append(params[0])
-                continue
-            if name == "__rawaf__":
-                if params:
-                    ffmpeg_af_parts.append(params[0])
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-vf", vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"Filter '{name}' failed: {err}"
+                current = out
                 continue
 
             return False, f"Unknown pipe effect: {name}"
 
-        # Apply collected FFmpeg filters in one pass
-        if ffmpeg_vf_parts or ffmpeg_af_parts:
-            cmd = ["ffmpeg", "-y", "-i", current]
-            if ffmpeg_vf_parts:
-                cmd.extend(["-vf", ",".join(ffmpeg_vf_parts)])
-            if ffmpeg_af_parts:
-                cmd.extend(["-af", ",".join(ffmpeg_af_parts)])
-                cmd.extend(["-c:a", "aac", "-b:a", "128k"])
-            else:
-                # Video-only filters: copy audio to avoid re-encode drift
-                cmd.extend(["-c:a", "copy"])
-            cmd.extend([
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", output_path,
-            ])
-            ok, err = _run_ffmpeg_raw(cmd, timeout=180)
-            if not ok:
-                return False, f"FFmpeg pipe filter failed: {err}"
-        else:
-            # No FFmpeg filters; copy to final output
-            if current != output_path:
-                shutil.copyfile(current, output_path)
+        if current != output_path:
+            shutil.copyfile(current, output_path)
 
     return True, ""
 
@@ -1921,6 +1974,30 @@ def _run_ihtxcustom_workflow(
 
         def apply_step(src: str, dst: str) -> tuple[bool, str]:
             cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y", "-i", src]
+            # r3multipitch needs filter_complex + special mapping
+            r3mp_m = re.match(r'^r3multipitch[=\s]+(.*)', af.strip(), re.IGNORECASE) if af else None
+            if r3mp_m:
+                pitches = [p.strip() for p in re.split(r'[|,;]', r3mp_m.group(1)) if p.strip()]
+                n = len(pitches) or 1
+                fc_parts = [
+                    f"[0:a]rubberband=pitch=2^({p}/12):engine=r3[a{j}]"
+                    for j, p in enumerate(pitches)
+                ]
+                mix = "".join(f"[a{j}]" for j in range(n))
+                fc_parts.append(f"{mix}amix=inputs={n},volume={n}[outa]")
+                if vf:
+                    cmd.extend(["-vf", vf])
+                if duration > 0:
+                    cmd.extend(["-t", str(duration)])
+                cmd += [
+                    "-filter_complex", ";".join(fc_parts),
+                    "-map", "0:v", "-map", "[outa]",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-ac", "2", "-ar", "44100", "-c:a", "mp2", "-b:a", "192k",
+                    "-bsf:v", "h264_mp4toannexb", dst,
+                ]
+                return _run_ffmpeg_raw(cmd, timeout=180)
+            # Normal path
             if vf:
                 cmd.extend(["-vf", vf])
             if af:
@@ -1928,8 +2005,6 @@ def _run_ihtxcustom_workflow(
             if duration > 0:
                 cmd.extend(["-t", str(duration)])
             cmd.extend([
-                # mp2 audio is native to MPEG-TS; avoids AAC channel-config corruption
-                # across iteration boundaries. Normalize to stereo/44100 first.
                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                 "-ac", "2", "-ar", "44100",
                 "-c:a", "mp2", "-b:a", "192k",
