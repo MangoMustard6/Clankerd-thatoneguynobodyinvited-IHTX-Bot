@@ -947,7 +947,7 @@ def _run_r3multipitch(
         return False, "No pitches provided for r3multipitch."
     n = len(pitches)
     fc_parts = [
-        f"[0:a]rubberband=pitch=2^({p}/12):engine=r3[a{j}]"
+        f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:formant=preserved:channels=together:smoothing=on[a{j}]"
         for j, p in enumerate(pitches)
     ]
     mix = "".join(f"[a{j}]" for j in range(n))
@@ -1980,7 +1980,7 @@ def _run_ihtxcustom_workflow(
                 pitches = [p.strip() for p in re.split(r'[|,;]', r3mp_m.group(1)) if p.strip()]
                 n = len(pitches) or 1
                 fc_parts = [
-                    f"[0:a]rubberband=pitch=2^({p}/12):engine=r3[a{j}]"
+                    f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:formant=preserved:channels=together:smoothing=on[a{j}]"
                     for j, p in enumerate(pitches)
                 ]
                 mix = "".join(f"[a{j}]" for j in range(n))
