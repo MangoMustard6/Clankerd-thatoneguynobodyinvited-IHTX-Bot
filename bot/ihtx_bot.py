@@ -616,7 +616,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
                 "ffmpeg", "-y", "-i", input_path,
                 "-filter_complex", cfg["complex"],
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy",
+                "-c:a", "pcm_s16le",
                 "-t", "30",
                 output_path
             ]
@@ -625,7 +625,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
                 "ffmpeg", "-y", "-i", input_path,
                 "-vf", cfg["vf"],
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy",
+                "-c:a", "pcm_s16le",
                 "-t", "30",
                 output_path
             ]
@@ -654,7 +654,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
 
 
 def get_output_ext(input_ext: str, is_video: bool) -> str:
-    return ".mp4" if is_video else ".gif"
+    return ".mov" if is_video else ".gif"
 
 # ---------- HueHSV (ImageMagick haldclut) ----------
 
@@ -1928,8 +1928,11 @@ def _run_ihtxcustom_workflow(
             if duration > 0:
                 cmd.extend(["-t", str(duration)])
             cmd.extend([
+                # mp2 audio is native to MPEG-TS; avoids AAC channel-config corruption
+                # across iteration boundaries. Normalize to stereo/44100 first.
                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
+                "-ac", "2", "-ar", "44100",
+                "-c:a", "mp2", "-b:a", "192k",
                 "-bsf:v", "h264_mp4toannexb",
                 dst,
             ])
@@ -1946,14 +1949,14 @@ def _run_ihtxcustom_workflow(
             if not ok:
                 return False, f"Step {i + 1} failed: {err}"
 
-        # Concatenate 1.ts through powers.ts (powers+1.ts is discarded, matching original)
+        # Concatenate 1.ts through powers.ts into .mov with h264 + pcm_s16le
         concat_str = "|".join(ts(i) for i in range(1, powers + 1))
         concat_cmd = [
             "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
             "-i", f"concat:{concat_str}",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "192k",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "pcm_s16le",
             output_path,
         ]
         ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
@@ -2050,7 +2053,7 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, "ihtx_custom.mp4")
+        output_path = os.path.join(tmpdir, "ihtx_custom.mov")
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -2076,7 +2079,7 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
             await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Try fewer powers or a shorter duration.")
             return
 
-        out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mp4"
+        out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mov"
         try:
             await ctx.reply(
                 content=f"✅ **ihtxcustom** done! `{powers}` power(s), `{duration}s` each.\n⚠️ Use `t!syncaudio` if audio seems off.",
