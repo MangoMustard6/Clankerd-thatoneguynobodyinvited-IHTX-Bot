@@ -1,7 +1,7 @@
 """
 IHTX Bot — I Hate The X FFmpeg Discord Bot
 
-Full implementation with preset effects, custom effect chaining (g!ihtx),
+Full implementation with preset effects, custom effect chaining (t!ihtx),
 and the preview1280 TV-simulator montage command.
 
 Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp,
@@ -88,7 +88,7 @@ def _is_owner_by_id(user_id: int) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "preview1280", "p1280", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -402,7 +402,7 @@ _load_tags()
 # Intents and bot
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="tugni;", intents=intents)
+bot = commands.Bot(command_prefix="t!", intents=intents)
 
 # Runtime stats
 _bot_start_time: float = time.time()
@@ -477,7 +477,7 @@ HELP_TEXT = """\
 **I Hate The X — IHTX Bot**
 One command, pipe-style syntax:
 
-`g!ihtx effect=value,effect=value,...`
+`t!ihtx effect=value,effect=value,...`
 
 (Full help included in repository's README/help text.)
 """
@@ -715,6 +715,21 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
     commas, semicolons, or pipes, so forms like ``swirl=1`` or
     ``lut=https://example.com/lut.cube`` both work.
     """
+    # VIDEO: <vf_filter> AUDIO: <af_filter> raw format — pass directly to FFmpeg
+    if re.search(r'\b(VIDEO|AUDIO):', pipe_str, re.IGNORECASE):
+        effects: list[tuple[str, list[str]]] = []
+        vf_m = re.search(r'VIDEO:\s*(.*?)(?=\bAUDIO:|$)', pipe_str, re.IGNORECASE | re.DOTALL)
+        af_m = re.search(r'AUDIO:\s*(.*?)(?=\bVIDEO:|$)', pipe_str, re.IGNORECASE | re.DOTALL)
+        if vf_m:
+            vf = vf_m.group(1).strip()
+            if vf:
+                effects.append(("__rawvf__", [vf]))
+        if af_m:
+            af = af_m.group(1).strip()
+            if af:
+                effects.append(("__rawaf__", [af]))
+        return effects
+
     effects = []
     current_name = None
     current_params: list[str] = []
@@ -1001,6 +1016,16 @@ def _apply_pipe_effects(
             af = _build_ffmpeg_pipe_vf(name, params)
             if af and name in ("volume", "vibrato", "areverse"):
                 ffmpeg_af_parts.append(af)
+                continue
+
+            # Raw filters from VIDEO:/AUDIO: syntax
+            if name == "__rawvf__":
+                if params:
+                    ffmpeg_vf_parts.append(params[0])
+                continue
+            if name == "__rawaf__":
+                if params:
+                    ffmpeg_af_parts.append(params[0])
                 continue
 
             return False, f"Unknown pipe effect: {name}"
@@ -1737,8 +1762,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
     Apply an IHTX FFmpeg effect to an attached video or image.
 
     Usage:
-      g!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
-      g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>   — custom TagScript workflow
+      t!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
+      t!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>   — custom TagScript workflow
     """
     # Parse arguments: preset name or TagScript-style custom icf+ workflow.
     parts = args.split()
@@ -1753,9 +1778,9 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset or invalid custom IHTX syntax. Available presets: {preset_list}\n"
-            f"Custom syntax: `g!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>`\n"
-            f"Example: `g!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
-            f"Use `g!ihtxhelp` for full usage."
+            f"Custom syntax: `t!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>`\n"
+            f"Example: `t!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
+            f"Use `t!ihtxhelp` for full usage."
         )
         return
 
@@ -1776,15 +1801,15 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"**I HATE THE X — IHTX Bot**\n"
-            f"Attach a video or image and use `g!ihtx [preset]` or the custom IHTX syntax.\n\n"
+            f"Attach a video or image and use `t!ihtx [preset]` or the custom IHTX syntax.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom IHTX:** `g!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
-            f"Use `g!ihtxhelp` for full usage.\n\n"
+            f"**Custom IHTX:** `t!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
+            f"Use `t!ihtxhelp` for full usage.\n\n"
             f"Examples:\n"
-            f"`g!ihtx chaos`\n"
-            f"`g!ihtx glitch`\n"
-            f"`g!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=25|5|8.5`\n"
-            f"`g!ihtx 5 0.25 - mp4 default multipitch=1|2|3|4`"
+            f"`t!ihtx chaos`\n"
+            f"`t!ihtx glitch`\n"
+            f"`t!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=25|5|8.5`\n"
+            f"`t!ihtx 5 0.25 - mp4 default multipitch=1|2|3|4`"
         )
         return
 
@@ -1866,7 +1891,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
         try:
             await ctx.reply(
-                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!\n⚠️ Make sure you use `g!syncaudio` or `g!syncaudio alt` afterwards to make sure the video is synced to the audio.",
+                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!\n⚠️ Make sure you use `t!syncaudio` or `t!syncaudio alt` afterwards to make sure the video is synced to the audio.",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -1874,12 +1899,200 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+def _run_ihtxcustom_workflow(
+    input_path: str,
+    output_path: str,
+    powers: int,
+    duration: float,
+    vf: str,
+    af: str,
+) -> tuple[bool, str]:
+    """Powers-based IHTX custom workflow.
+
+    Applies vf/af filters `powers` times progressively (each iteration feeds
+    into the next), then concatenates all iterations (1× through powers×) via
+    the .ts concat protocol — matching the original ihtxcustom script logic.
+    """
+    powers = min(max(powers, 1), 20)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        def ts(n: int) -> str:
+            return os.path.join(tmpdir, f"{n}.ts")
+
+        def apply_step(src: str, dst: str) -> tuple[bool, str]:
+            cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y", "-i", src]
+            if vf:
+                cmd.extend(["-vf", vf])
+            if af:
+                cmd.extend(["-af", af])
+            if duration > 0:
+                cmd.extend(["-t", str(duration)])
+            cmd.extend([
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-bsf:v", "h264_mp4toannexb",
+                dst,
+            ])
+            return _run_ffmpeg_raw(cmd, timeout=180)
+
+        # Step 0 → 1.ts
+        ok, err = apply_step(input_path, ts(1))
+        if not ok:
+            return False, f"Step 1 failed: {err}"
+
+        # Steps 1.ts→2.ts, 2.ts→3.ts, ..., powers.ts→(powers+1).ts
+        for i in range(1, powers + 1):
+            ok, err = apply_step(ts(i), ts(i + 1))
+            if not ok:
+                return False, f"Step {i + 1} failed: {err}"
+
+        # Concatenate 1.ts through powers.ts (powers+1.ts is discarded, matching original)
+        concat_str = "|".join(ts(i) for i in range(1, powers + 1))
+        concat_cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", f"concat:{concat_str}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            output_path,
+        ]
+        ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
+        if not ok:
+            return False, f"Concat failed: {err}"
+
+    return True, ""
+
+
+@bot.hybrid_command(name="ihtxcustom", aliases=["icustom"], description="HEAVY COMMAND: apply a filter stack powers times then concatenate")
+@app_commands.describe(
+    args="<powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]",
+    attachment="Video to process",
+)
+async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
+    """HEAVY COMMAND: Powers-based ihtxcustom filter stacker.
+
+    Applies a filter powers times progressively and concatenates all iterations.
+
+    Usage:
+      t!ihtxcustom <powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]
+
+    Examples:
+      t!ihtxcustom 4 1.5 VIDEO: hflip AUDIO: volume=2
+      t!ihtxcustom 3 2.0 VIDEO: negate
+      t!ihtxcustom 5 1.0 VIDEO: hue=h=90:s=2 AUDIO: vibrato=f=5:d=0.5
+
+    Each iteration is one more application of the filter on top of the last,
+    and all iterations are concatenated into the final video.
+    ⚠️ Run t!syncaudio afterwards if audio drifts.
+    """
+    vf = ""
+    af = ""
+    powers = 0
+    duration = 1.0
+
+    try:
+        pre = re.split(r'VIDEO:|AUDIO:', args, flags=re.IGNORECASE)[0].strip()
+        pre_parts = pre.split()
+        if len(pre_parts) >= 2:
+            powers = int(pre_parts[0])
+            duration = float(pre_parts[1])
+        elif len(pre_parts) == 1:
+            powers = int(pre_parts[0])
+
+        vf_m = re.search(r'VIDEO:\s*(.*?)(?=\bAUDIO:|$)', args, re.IGNORECASE | re.DOTALL)
+        af_m = re.search(r'AUDIO:\s*(.*?)(?=\bVIDEO:|$)', args, re.IGNORECASE | re.DOTALL)
+        if vf_m:
+            vf = vf_m.group(1).strip()
+        if af_m:
+            af = af_m.group(1).strip()
+    except (ValueError, IndexError):
+        pass
+
+    if powers < 1 or (not vf and not af):
+        await ctx.reply(
+            "❌ Invalid syntax.\n"
+            "**Usage:** `t!ihtxcustom <powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]`\n"
+            "**Example:** `t!ihtxcustom 4 1.5 VIDEO: hflip AUDIO: volume=2`"
+        )
+        return
+
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
+
+    if not attachment:
+        await ctx.reply(
+            "❌ Attach a video.\n"
+            "**Usage:** `t!ihtxcustom <powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"❌ File too large (max 25 MB).")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"❌ `ihtxcustom` requires a video file. Got `{suffix}`.")
+        return
+
+    filter_desc = (f"VIDEO: `{vf}`" if vf else "") + (" " if vf and af else "") + (f"AUDIO: `{af}`" if af else "")
+    status_msg = await ctx.reply(
+        f"⚙️ **ihtxcustom** — `{powers}` power(s) × `{duration}s` | {filter_desc} … this may take a moment."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "ihtx_custom.mp4")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(attachment.url) as resp:
+                    with open(input_path, "wb") as f:
+                        f.write(await resp.read())
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Download failed: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None,
+            lambda: _run_ihtxcustom_workflow(input_path, output_path, powers, duration, vf, af),
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ ihtxcustom failed: {err}")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Try fewer powers or a shorter duration.")
+            return
+
+        out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mp4"
+        try:
+            await ctx.reply(
+                content=f"✅ **ihtxcustom** done! `{powers}` power(s), `{duration}s` each.\n⚠️ Use `t!syncaudio` if audio seems off.",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload: {e}")
+
+
 @bot.hybrid_command(name="preview1280", aliases=["p1280", "preview", "pv1280"], description="Create a 12-segment TV-simulator preview montage")
 @app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)", attachment="Video file to preview")
 async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85, attachment: discord.Attachment = None):
     """Create a 12-segment TV-simulator preview montage from an attached video.
 
-    Usage: g!preview1280 [start_offset] [segment_duration]
+    Usage: t!preview1280 [start_offset] [segment_duration]
     Default: start=1.85, duration=0.85
     """
     # Resolve attachment: slash commands pass it as a parameter;
@@ -1898,11 +2111,11 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
     if not attachment:
         await ctx.reply(
             "**IHTX Preview1280**\n"
-            "Attach a video and use `g!preview1280 [start] [duration]`.\n\n"
+            "Attach a video and use `t!preview1280 [start] [duration]`.\n\n"
             "Creates a 12-segment TV-simulator montage with hue shifts, "
             "displacement mapping, and pitch variations.\n\n"
             "Defaults: start=1.85s, duration=0.85s per segment.\n"
-            "Example: `g!preview1280 2.0 1.0`"
+            "Example: `t!preview1280 2.0 1.0`"
         )
         return
 
@@ -1972,20 +2185,20 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
     """Apply multi-voice pitch shifting to an attached video using SoX pitch.
 
     Usage:
-      g!multipitch <pitch_values>     — pipe-separated semitone values
-      g!mp 25|5|8.5                    — aliases
-      g!multi -3|0|5                  — negative values supported
+      t!multipitch <pitch_values>     — pipe-separated semitone values
+      t!mp 25|5|8.5                    — aliases
+      t!multi -3|0|5                  — negative values supported
 
-    Example: g!multipitch 25|5|8.5
+    Example: t!multipitch 25|5|8.5
     """
     if not args:
         await ctx.reply(
             "**IHTX Multipitch**\n"
-            "Attach a video and use `g!multipitch <pitches>`.\n\n"
+            "Attach a video and use `t!multipitch <pitches>`.\n\n"
             "Pitches are pipe-separated semitone values.\n"
             "Each pitch creates a separate shifted voice, then they are mixed together.\n\n"
-            "Example: `g!multipitch 25|5|8.5`\n"
-            "Aliases: `g!mp`, `g!multi`"
+            "Example: `t!multipitch 25|5|8.5`\n"
+            "Aliases: `t!mp`, `t!multi`"
         )
         return
 
@@ -2010,8 +2223,8 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
 
     if not attachment:
         await ctx.reply(
-            "Attach a video and use `g!multipitch <pitches>`.\n"
-            "Example: `g!multipitch 25|5|8.5`"
+            "Attach a video and use `t!multipitch <pitches>`.\n"
+            "Example: `t!multipitch 25|5|8.5`"
         )
         return
 
@@ -2073,8 +2286,8 @@ async def huehsv_command(ctx: commands.Context, hue: float = 0.5, attachment: di
     """Apply hue shift using ImageMagick haldclut + FFmpeg.
 
     Usage:
-      g!huehsv <hue>          — shift hue, default 0.5
-      g!hhsv <hue>            — alias
+      t!huehsv <hue>          — shift hue, default 0.5
+      t!hhsv <hue>            — alias
 
     Internally: magick hald:6 -modulate 100,100,<hue*200+100> hsv.ppm
     Then: ffmpeg -vf "movie=hsv.ppm,[in]haldclut,format=rgba" -pix_fmt yuv420p
@@ -2094,10 +2307,10 @@ async def huehsv_command(ctx: commands.Context, hue: float = 0.5, attachment: di
     if not attachment:
         await ctx.reply(
             "**IHTX HueHSV**\n"
-            "Attach a video or image and use `g!huehsv <hue>`.\n\n"
+            "Attach a video or image and use `t!huehsv <hue>`.\n\n"
             "Applies hue shift via ImageMagick haldclut.\n"
-            "Example: `g!huehsv 0.5`\n"
-            "Aliases: `g!hhsv`"
+            "Example: `t!huehsv 0.5`\n"
+            "Aliases: `t!hhsv`"
         )
         return
 
@@ -2161,10 +2374,10 @@ async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: d
     Alt mode: adjusts audio speed to match video.
 
     Usage:
-      g!syncaudio         — adjust video speed to match audio
-      g!syncaudio alt     — adjust audio speed to match video
-      g!sa                — alias
-      g!sync alt          — alias
+      t!syncaudio         — adjust video speed to match audio
+      t!syncaudio alt     — adjust audio speed to match video
+      t!sa                — alias
+      t!sync alt          — alias
     """
     alt_mode = mode.lower().strip() == "alt"
 
@@ -2185,15 +2398,15 @@ async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: d
         mode_desc = "adjusts **video speed** to match audio" if not alt_mode else "adjusts **audio speed** to match video"
         await ctx.reply(
             "**IHTX Syncaudio**\n"
-            f"Attach a video and use `g!syncaudio [alt]`.\n\n"
+            f"Attach a video and use `t!syncaudio [alt]`.\n\n"
             f"Default: {mode_desc}\n"
             "Alt mode (`alt`): adjusts the other stream instead.\n\n"
             "Examples:\n"
             "```\n"
-            "g!syncaudio         — video speed → match audio\n"
-            "g!syncaudio alt     — audio speed → match video\n"
+            "t!syncaudio         — video speed → match audio\n"
+            "t!syncaudio alt     — audio speed → match video\n"
             "```\n"
-            "Aliases: `g!sa`, `g!sync`"
+            "Aliases: `t!sa`, `t!sync`"
         )
         return
 
@@ -2257,7 +2470,7 @@ async def presets_command(ctx: commands.Context):
     )
     embed.add_field(
         name="Usage",
-        value="Attach a video or image and run:\n`g!ihtx [preset]`\n\nDefault preset: `chaos`",
+        value="Attach a video or image and run:\n`t!ihtx [preset]`\n\nDefault preset: `chaos`",
         inline=False,
     )
     embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
@@ -2271,30 +2484,30 @@ async def help_command(ctx: commands.Context):
         color=discord.Color.dark_red(),
     )
     embed.add_field(
-        name="g!ihtx [preset]",
+        name="t!ihtx [preset]",
         value="Apply a preset effect to an attached video/image.\nDefault preset: `chaos`",
         inline=False,
     )
     embed.add_field(
-        name="g!ihtx effect=value,effect=value [rep] [dur]",
+        name="t!ihtx effect=value,effect=value [rep] [dur]",
         value="Chain custom effects. Params use `=`, sub-params use `;`.\n"
-              "Example: `g!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`",
+              "Example: `t!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`",
         inline=False,
     )
     embed.add_field(
-        name="g!preview1280 [start] [dur]",
+        name="t!preview1280 [start] [dur]",
         value="12-segment TV-simulator montage.\nDefaults: start=1.85, dur=0.85",
         inline=False,
     )
     embed.add_field(
-        name="g!multipitch <pitches>  (aliases: mp, multi)",
+        name="t!multipitch <pitches>  (aliases: mp, multi)",
         value="Multi-voice pitch shift via SoX pitch.\n"
-              "Pipe-separated semitones: `g!multipitch 25|5|8.5`\n"
-              "Can also be chained: `g!ihtx huehsv 0.5;negate;multipitch=25|5|8.5`",
+              "Pipe-separated semitones: `t!multipitch 25|5|8.5`\n"
+              "Can also be chained: `t!ihtx huehsv 0.5;negate;multipitch=25|5|8.5`",
         inline=False,
     )
     embed.add_field(
-        name="g!presets",
+        name="t!presets",
         value="List all available effect presets.",
         inline=False,
     )
@@ -2312,33 +2525,33 @@ async def help_command(ctx: commands.Context):
     lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
 
     embed.add_field(
-        name="g!huehsv <hue>",
+        name="t!huehsv <hue>",
         value="Apply hue shift via ImageMagick haldclut.\n"
-              "Example: `g!huehsv 0.5`\n"
-              "Aliases: `g!hhsv`",
+              "Example: `t!huehsv 0.5`\n"
+              "Aliases: `t!hhsv`",
         inline=False,
     )
     embed.add_field(name="Video Effects", value=video_effects, inline=False)
     embed.add_field(name="Distortion", value=distortion_effects, inline=False)
     embed.add_field(name="Audio", value=audio_effects, inline=False)
     embed.add_field(
-        name="g!syncaudio [alt]",
+        name="t!syncaudio [alt]",
         value="Sync video & audio durations by adjusting playback speed.\n"
               "Default: video speed → match audio. `alt`: audio speed → match video.\n"
-              "Aliases: `g!sa`, `g!sync`",
+              "Aliases: `t!sa`, `t!sync`",
         inline=False,
     )
     embed.add_field(
-        name="g!lexg",
+        name="t!lexg",
         value="Re-apply the last IHTX export with the same effect chain.\n"
-              "Aliases: `g!lastexportgrab`",
+              "Aliases: `t!lastexportgrab`",
         inline=False,
     )
     embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
     embed.add_field(
         name="Owner moderation",
-        value="`g!keywordblock <keyword> [channel]` blocks a keyword only in that channel.\n"
-              "`g!keywordblockremove <keyword> [channel]` removes that channel keyword block.",
+        value="`t!keywordblock <keyword> [channel]` blocks a keyword only in that channel.\n"
+              "`t!keywordblockremove <keyword> [channel]` removes that channel keyword block.",
         inline=False,
     )
 
@@ -2353,14 +2566,14 @@ async def help_command(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
-        name="g!img2vid [duration] <prompt>  (aliases: i2v)",
+        name="t!img2vid [duration] <prompt>  (aliases: i2v)",
         value="Generate a video from a text prompt (+ optional image attachment) using Sora.\n"
               "Model auto-selected: `sora-2` (default), `sora-2-pro` (cinematic), `sora-image-1` (image+fast).\n"
-              "Example: `g!img2vid 5 a cyberpunk city at night`",
+              "Example: `t!img2vid 5 a cyberpunk city at night`",
         inline=False,
     )
     embed.add_field(
-        name="g!catbox  (aliases: cb, upload)",
+        name="t!catbox  (aliases: cb, upload)",
         value="Upload an attached file (or replied-to attachment) to catbox.moe and return a direct link.\n"
               "Supports any file type up to 200 MB.",
         inline=False,
@@ -2371,7 +2584,7 @@ async def help_command(ctx: commands.Context):
 
 # ---------- Last Export Grab ----------
 
-# Track the last IHTX export for each user so they can re-run with g!lexg
+# Track the last IHTX export for each user so they can re-run with t!lexg
 _last_exports: dict[int, dict[str, str]] = {}
 
 @bot.hybrid_command(name="lexg", aliases=["lastexportgrab"], description="Re-apply the last IHTX export to a new attachment")
@@ -2397,11 +2610,11 @@ async def lexg_command(ctx: commands.Context, attachment: discord.Attachment = N
 
     last = _last_exports.get(uid)
     if not last:
-        await ctx.reply("\u274c No IHTX export found. Run a custom or preset IHTX first, then use `g!lexg`.")
+        await ctx.reply("\u274c No IHTX export found. Run a custom or preset IHTX first, then use `t!lexg`.")
         return
 
     if not attachment:
-        await ctx.reply("**g!lexg** — Attach a video/image and re-apply the last IHTX export.\n" "Aliases: `g!lastexportgrab`")
+        await ctx.reply("**t!lexg** — Attach a video/image and re-apply the last IHTX export.\n" "Aliases: `t!lastexportgrab`")
         return
 
     if attachment.size > MAX_FILE_SIZE:
@@ -2483,12 +2696,12 @@ async def dl_command(ctx: commands.Context, url: str = "", attachment: discord.A
 
     if not url:
         await ctx.reply(
-            "**g!dl** — Download a video or image from a URL.\n\n"
+            "**t!dl** — Download a video or image from a URL.\n\n"
             "Usage:\n"
-            "`g!dl <url>`\n"
-            "`g!dlv https://youtube.com/watch?v=...`\n"
-            "`g!dl https://example.com/image.png`\n\n"
-            "Aliases: `g!dv`, `g!dlv`, `g!download`"
+            "`t!dl <url>`\n"
+            "`t!dlv https://youtube.com/watch?v=...`\n"
+            "`t!dl https://example.com/image.png`\n\n"
+            "Aliases: `t!dv`, `t!dlv`, `t!download`"
         )
         return
 
@@ -2734,7 +2947,7 @@ async def sayembed(ctx: commands.Context, *, content: str):
     Owner-only: send an embed.
     If `content` contains a '|' it will split into title|description, otherwise content is used as description.
     Example:
-      g!sayembed Title | This is the embed body
+      t!sayembed Title | This is the embed body
     """
     try:
         if "|" in content:
@@ -2758,8 +2971,8 @@ async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
 
     Everything after the keyword is the message. Use {mention} or {user} for user mention.
     Example:
-      g!keywordblockmsg swearword no swearing, {mention}!
-      g!keywordblockmsg badword dont say that, {user}
+      t!keywordblockmsg swearword no swearing, {mention}!
+      t!keywordblockmsg badword dont say that, {user}
     """
     normalized = _normalize_keyword(keyword)
     if not normalized:
@@ -2769,7 +2982,7 @@ async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
 
     blocked = keyword_blocks.get(channel_id, set())
     if normalized not in blocked:
-        await ctx.reply(f"❌ Keyword `{normalized}` is not blocked in this channel. Block it first with `g!keywordblock`.")
+        await ctx.reply(f"❌ Keyword `{normalized}` is not blocked in this channel. Block it first with `t!keywordblock`.")
         return
 
     msgs = keyword_block_messages.setdefault(channel_id, {})
@@ -2793,9 +3006,9 @@ async def autoreply(ctx: commands.Context, trigger: str, channel: discord.TextCh
     Leave channel blank (or omit) to reply in ALL channels.
     Use {mention} or {user} to ping the user in the response.
     Example (all channels):
-      tugni;autoreply hello Hello there, {mention}!
+      t!autoreply hello Hello there, {mention}!
     Example (specific channel):
-      tugni;autoreply hello #general Hello there, {mention}!
+      t!autoreply hello #general Hello there, {mention}!
     """
     trigger_norm = trigger.strip().lower()
     if not trigger_norm:
@@ -2828,8 +3041,8 @@ async def blockarchannel(ctx: commands.Context, trigger: str, channel: discord.T
     Run again with the same trigger + channel to unblock it.
 
     Example:
-      tugni;blockarchannel hello           ← silences 'hello' in current channel
-      tugni;blockarchannel hello #general  ← silences 'hello' in #general
+      t!blockarchannel hello           ← silences 'hello' in current channel
+      t!blockarchannel hello #general  ← silences 'hello' in #general
     """
     trigger_norm = trigger.strip().lower()
     if trigger_norm not in autoreplies:
@@ -2878,7 +3091,7 @@ async def removearmentions(ctx: commands.Context, *, trigger: str):
 
     Leaves the autoreply active but stops it from pinging users.
     Example:
-      tugni;removearmentions hello
+      t!removearmentions hello
     """
     trigger_norm = trigger.strip().lower()
     if trigger_norm not in autoreplies:
@@ -2941,8 +3154,8 @@ async def autoreply2_cmd(ctx: commands.Context):
     Run again to toggle off.
 
     Example:
-      tugni;autoreply2   ← toggles on in current channel
-      tugni;autoreply2   ← toggles off
+      t!autoreply2   ← toggles on in current channel
+      t!autoreply2   ← toggles off
     """
     cid = ctx.channel.id
     if cid in autoreply2:
@@ -2976,8 +3189,8 @@ async def removear2mentions(ctx: commands.Context, user: discord.Member):
     Run again on the same user to re-enable pings.
 
     Example:
-      tugni;removear2mentions @someone   ← disables pings for them
-      tugni;removear2mentions @someone   ← re-enables pings
+      t!removear2mentions @someone   ← disables pings for them
+      t!removear2mentions @someone   ← re-enables pings
     """
     uid = user.id
     if uid in autoreply2_no_mention:
@@ -3065,8 +3278,8 @@ async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
     """Owner-only: change the bot's activity (watching/listening).
 
     Usage:
-      g!setactivity watching some cool video
-      g!setactivity listening lo-fi beats
+      t!setactivity watching some cool video
+      t!setactivity listening lo-fi beats
     """
     activity_type = activity_type.lower().strip()
     if activity_type in ("watching", "watch", "w"):
@@ -3337,7 +3550,7 @@ async def on_message(message: discord.Message):
         return
 
     # Autoreplies (check before keyword blocks, skip commands)
-    if not message.content.startswith("tugni;"):
+    if not message.content.startswith("t!"):
         content_lower = message.content.lower()
         for trigger, entry in autoreplies.items():
             if trigger in content_lower:
@@ -3392,7 +3605,7 @@ async def on_message(message: discord.Message):
                     pass
 
     # Always allow owners to manage the bot and allow all bot commands to run.
-    if not _is_owner_by_id(message.author.id) and not message.content.startswith("tugni;"):
+    if not _is_owner_by_id(message.author.id) and not message.content.startswith("t!"):
         keyword = _blocked_keyword_for_message(message.channel.id, message.content)
         if keyword:
             try:
@@ -3479,7 +3692,7 @@ async def _imagevideo_core(
 @bot.command(name="imagevideo", aliases=["iv", "vidgen"])
 async def imagevideo_prefix(ctx: commands.Context, duration: int = 10, image_url: str = None, *, prompt: str = "cinematic scene"):
     """Generate a video from an attached image using HappyHorse AI.
-    Usage: tugni;imagevideo [duration] [image_url] [prompt]
+    Usage: t!imagevideo [duration] [image_url] [prompt]
     """
     await _imagevideo_core(
         send_fn=ctx.send,
@@ -3607,7 +3820,7 @@ async def _video_core(
 @bot.command(name="video", aliases=["vid", "seedance"])
 async def video_prefix(ctx: commands.Context, duration: int = 5, resolution: str = "720p", aspect_ratio: str = "16:9", image_url: str = None, *, prompt: str = "cinematic video"):
     """Generate a video using Seedance 2.0 via Replicate.
-    Usage: tugni;video [duration] [resolution] [aspect_ratio] [image_url] [prompt]
+    Usage: t!video [duration] [resolution] [aspect_ratio] [image_url] [prompt]
     Attach an image or reply to one to use image-to-video mode.
     """
     await _video_core(
@@ -3734,8 +3947,8 @@ async def img2vid(ctx: commands.Context, duration: int = 5, *, prompt: str = "ci
 
     Optionally attach an image to animate it.
 
-      tugni;img2vid 5 a cyberpunk city at night
-      tugni;img2vid 8 anime girl walking  (with image attached)
+      t!img2vid 5 a cyberpunk city at night
+      t!img2vid 8 anime girl walking  (with image attached)
     """
     if _OpenAI is None:
         await ctx.reply("❌ `openai` package not installed.")
@@ -3753,7 +3966,7 @@ async def img2vid(ctx: commands.Context, duration: int = 5, *, prompt: str = "ci
 async def catbox_upload(ctx: commands.Context, attachment: discord.Attachment = None):
     """Upload any file to catbox.moe and return a permanent direct link.
 
-      tugni;catbox   (with file attached, or reply to a message with a file)
+      t!catbox   (with file attached, or reply to a message with a file)
     """
     src = attachment
     if src is None and ctx.message.attachments:
@@ -3798,7 +4011,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply(f"Missing argument: `{error.param.name}`. Use `g!ihtxhelp` for usage.")
+        await ctx.reply(f"Missing argument: `{error.param.name}`. Use `t!ihtxhelp` for usage.")
         return
     # Permission errors from owner-only commands
     if isinstance(error, commands.CheckFailure):
