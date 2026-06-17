@@ -1862,6 +1862,14 @@ async def on_ready():
         await bot.change_presence(activity=_default_activity)
     if not _process_pending_resets.is_running():
         _process_pending_resets.start()
+    # Load tag system cog (once)
+    if "Tags" not in bot.cogs:
+        try:
+            from bot.tags import setup as _tags_setup
+            await _tags_setup(bot)
+            print("Tag system loaded.")
+        except Exception as _tags_exc:
+            print(f"Warning: tag system failed to load — {_tags_exc}")
 
 
 @bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
