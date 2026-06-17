@@ -991,9 +991,9 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # SoX multipitch
+            # Rubber Band R3 multipitch
             if name in ("multipitch", "mp", "multi"):
-                ok, err = _run_multipitch(current, out, params)
+                ok, err = _run_multipitch_rb3(current, out, params)
                 if not ok:
                     return False, err
                 current = out
@@ -1280,125 +1280,145 @@ def _run_ihtx_tagscript_workflow(
     return True, ""
 
 
-# ---------- Multipitch (SoX pitch-shift pipeline) ----------
+# ---------- Multipitch (Rubber Band R3 pitch-shift pipeline) ----------
 
-def _run_multipitch(
+MAX_PITCHES = 20
+
+
+def _run_multipitch_rb3(
     input_path: str,
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using SoX pitch shifting + ffmpeg re-merge.
+    """Run the multipitch pipeline using Rubber Band R3 pitch shifting + FFmpeg re-merge.
 
-    Pipeline per pitch voice:
-      1. ffmpeg -i input -c:a pcm_s16le -preset ultrafast a0.mp4  (export segment)
-      2. ffmpeg -i a0.mp4 b0.wav                                   (extract WAV)
-      3. sox b0.wav 1{i}.wav pitch -q {semitones*100} 25 5 8.5     (SoX pitch shift)
-      4. Single pitch: ffmpeg -i a0.mp4 -i 10.wav -filter_complex "[1:a]highpass=10[a]"
-         -map 0:v -map "[a]" -c:a pcm_s16le output
-         Multiple pitches: ffmpeg -i a0.mp4 -i 10.wav -i 11.wav ...
-         -filter_complex "[1][2]...amix=N:normalize=0,highpass=7.5"
-         -c:a pcm_s16le -preset ultrafast output
+    Pipeline:
+      1. ffmpeg: extract PCM WAV audio from input (vn strip)
+      2. For each semitone value:
+           rubberband -3 -p <semitones> base.wav pitched_N.wav
+      3. ffmpeg: mix all pitched WAVs via amix → mixed.wav
+      4. ffmpeg: remux mixed audio back with the original video stream (if present),
+                 or encode audio-only output when no video stream exists.
 
-    SoX pitch effect syntax: pitch -q cents 25 5 8.5
-      where cents = semitones * 100
+    Accepts | and ; as pitch separators within each pitch_values entry.
     """
-    # Flatten pitch values: support both | and ; separators
-    flattened = []
+    # Flatten: support both ; and | separators within entries
+    flattened: list[str] = []
     for pv in pitch_values:
-        if "|" in pv:
-            flattened.extend([v.strip() for v in pv.split("|") if v.strip()])
-        elif ";" in pv:
+        if ";" in pv:
             flattened.extend([v.strip() for v in pv.split(";") if v.strip()])
+        elif "|" in pv:
+            flattened.extend([v.strip() for v in pv.split("|") if v.strip()])
         else:
-            flattened.append(pv.strip())
+            s = pv.strip()
+            if s:
+                flattened.append(s)
     pitch_values = flattened
 
     if not pitch_values:
         return False, "No pitch values provided."
 
-    n = len(pitch_values)
+    if len(pitch_values) > MAX_PITCHES:
+        return False, f"Too many pitches (max {MAX_PITCHES}). Got {len(pitch_values)}."
 
-    # Validate pitch values
+    # Validate: each must be a finite float
+    semitones: list[float] = []
     for pv in pitch_values:
         try:
-            float(pv)
+            val = float(pv)
         except ValueError:
-            return False, f"Invalid pitch value: {pv!r}"
+            return False, f"Invalid pitch value: {pv!r} — must be a number (semitones)."
+        if not math.isfinite(val):
+            return False, f"Pitch value must be finite, got: {pv!r}"
+        semitones.append(val)
+
+    n = len(semitones)
+
+    # Detect whether input has a video stream
+    has_video = bool(_ffprobe(
+        input_path,
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=nw=1:nk=1",
+    ).strip())
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Step 1: Export base video with pcm_s16le audio
-        base_mp4 = os.path.join(tmpdir, "a0.mp4")
-        cmd = [
+        # Step 1: Extract PCM WAV audio
+        base_wav = os.path.join(tmpdir, "base.wav")
+        ok, err = _run_ffmpeg_raw([
             "ffmpeg", "-y", "-i", input_path,
-            "-c:a", "pcm_s16le", "-preset", "ultrafast",
-            base_mp4,
-        ]
-        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
-        if not ok:
-            return False, f"Step 1 (export base) failed: {err}"
-
-        # Step 2: Extract WAV audio from base
-        base_wav = os.path.join(tmpdir, "b0.wav")
-        cmd = [
-            "ffmpeg", "-y", "-i", base_mp4,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "44100",
             base_wav,
-        ]
-        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        ], timeout=120)
         if not ok:
-            return False, f"Step 2 (extract WAV) failed: {err}"
+            return False, f"Audio extraction failed: {err}"
 
-        # Step 3: SoX pitch shift for each voice
-        pitched_wavs = []
-        for i, pitch_val in enumerate(pitch_values):
-            cents = int(float(pitch_val) * 100)
-            out_wav = os.path.join(tmpdir, f"1{i}.wav")
+        # Step 2: Rubber Band R3 pitch shift per voice
+        pitched_wavs: list[str] = []
+        for i, st in enumerate(semitones):
+            out_wav = os.path.join(tmpdir, f"pitched_{i}.wav")
             cmd = [
-                "sox", base_wav, out_wav,
-                "pitch", "-q", str(cents), "25", "5", "8.5",
+                "rubberband", "-3",
+                "-p", str(st),
+                base_wav, out_wav,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             if result.returncode != 0:
-                return False, f"SoX pitch shift for voice {i+1} failed: {result.stderr}"
+                return False, (
+                    f"Rubber Band R3 failed for voice {i + 1} "
+                    f"({st:+.2f} st): {result.stderr[-1000:]}"
+                )
             pitched_wavs.append(out_wav)
 
-        # Step 4: Re-merge with video
-        # apad pads SoX-shortened audio back to at least video length;
-        # -shortest then clamps output to the video duration so audio
-        # length drift never compounds across repeated iterations.
+        # Step 3: Mix all pitched WAVs together
         if n == 1:
-            # Single pitch: ffmpeg -i a0.mp4 -i 10.wav -filter_complex "[1:a]highpass=10,apad[a]"
-            #   -map 0:v -map "[a]" -c:a pcm_s16le -shortest output
-            cmd = [
+            mixed_wav = pitched_wavs[0]
+        else:
+            mixed_wav = os.path.join(tmpdir, "mixed.wav")
+            mix_cmd = ["ffmpeg", "-y"]
+            for wav in pitched_wavs:
+                mix_cmd.extend(["-i", wav])
+            mix_inputs = "".join(f"[{i}:a]" for i in range(n))
+            mix_cmd.extend([
+                "-filter_complex",
+                f"{mix_inputs}amix={n}:normalize=0,highpass=7.5,apad[a]",
+                "-map", "[a]",
+                "-acodec", "pcm_s16le",
+                mixed_wav,
+            ])
+            ok, err = _run_ffmpeg_raw(mix_cmd, timeout=180)
+            if not ok:
+                return False, f"Audio mix failed: {err}"
+
+        # Step 4: Remux with original video stream (preserved), or output audio-only
+        if has_video:
+            ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
-                "-i", base_mp4,
-                "-i", pitched_wavs[0],
-                "-filter_complex", "[1:a]highpass=10,apad[a]",
-                "-map", "0:v", "-map", "[a]",
+                "-i", input_path,
+                "-i", mixed_wav,
+                "-map", "0:v",
+                "-map", "1:a",
+                "-c:v", "copy",
                 "-c:a", "pcm_s16le",
                 "-shortest",
                 output_path,
-            ]
+            ], timeout=300)
         else:
-            # Multiple pitches: ffmpeg -i a0.mp4 -i 10.wav -i 11.wav ...
-            #   -filter_complex "[1][2]...[N]amix=N:normalize=0,highpass=7.5,apad[a]"
-            #   -c:a pcm_s16le -preset ultrafast -shortest output
-            cmd = ["ffmpeg", "-y", "-i", base_mp4]
-            for wav in pitched_wavs:
-                cmd.extend(["-i", wav])
-
-            # Build filter_complex: [1][2]...[N]amix=N:normalize=0,highpass=7.5,apad[a]
-            mix_inputs = "".join(f"[{i+1}]" for i in range(n))
-            filter_complex = f"{mix_inputs}amix={n}:normalize=0,highpass=7.5,apad[a]"
-
-            cmd.extend([
-                "-filter_complex", filter_complex,
-                "-map", "0:v", "-map", "[a]",
-                "-c:a", "pcm_s16le", "-preset", "ultrafast",
-                "-shortest",
+            ok, err = _run_ffmpeg_raw([
+                "ffmpeg", "-y",
+                "-i", mixed_wav,
+                "-c:a", "aac", "-b:a", "192k",
                 output_path,
-            ])
+            ], timeout=180)
 
-        return _run_ffmpeg_raw(cmd, timeout=300)
+        if not ok:
+            return False, f"Remux failed: {err}"
+
+    return True, ""
+
+
+# Keep the old name as an alias so legacy pipe-effect calls still resolve
+_run_multipitch = _run_multipitch_rb3
 
 
 
@@ -2313,34 +2333,69 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
 
 
-@bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via SoX")
-@app_commands.describe(args="Pipe-separated semitone values (e.g. 25|5|8.5)", attachment="Video or audio file to pitch-shift")
+_MULTIPITCH_AUDIO_EXTS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif",
+    ".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a", ".opus",
+}
+
+_MULTIPITCH_MAX = 20
+
+
+@bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via Rubber Band R3")
+@app_commands.describe(args="Semicolon-separated semitone values (e.g. -7;12;19)", attachment="Video or audio file to pitch-shift")
 async def multipitch_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
-    """Apply multi-voice pitch shifting to an attached video using SoX pitch.
+    """Apply multi-voice pitch shifting using Rubber Band R3 (-3 engine).
 
     Usage:
-      t!multipitch <pitch_values>     — pipe-separated semitone values
-      t!mp 25|5|8.5                    — aliases
-      t!multi -3|0|5                  — negative values supported
+      t!multipitch -7;12;19          — semicolon-separated semitone values (primary)
+      t!multipitch -7|12|19          — pipe-separated also accepted
+      t!mp -7;12;19                  — alias
+      t!multi -7;12;19               — alias
 
-    Example: t!multipitch 25|5|8.5
+    Each value creates a separately pitched voice; all voices are mixed together.
+    Supports negative and positive semitone values.
+    Works on video and audio files. Video stream is preserved unchanged.
+
+    Example: t!multipitch -7;12;19
     """
     if not args:
         await ctx.reply(
-            "**IHTX Multipitch**\n"
-            "Attach a video and use `t!multipitch <pitches>`.\n\n"
-            "Pitches are pipe-separated semitone values.\n"
-            "Each pitch creates a separate shifted voice, then they are mixed together.\n\n"
-            "Example: `t!multipitch 25|5|8.5`\n"
-            "Aliases: `t!mp`, `t!multi`"
+            "**IHTX Multipitch** — Rubber Band R3\n"
+            "Attach a video or audio file and provide semicolon-separated semitone values.\n\n"
+            "Each value creates a pitched voice; all voices are mixed together.\n\n"
+            f"Example: `t!multipitch -7;12;19`\n"
+            f"Pipe syntax also works: `t!multipitch -7|12|19`\n"
+            f"Aliases: `t!mp`, `t!multi`\n"
+            f"Max pitches: {_MULTIPITCH_MAX}"
         )
         return
 
-    # Parse pipe-separated pitch values
-    pitch_values = [v.strip() for v in args.split("|") if v.strip()]
+    # Parse: semicolons are the primary separator; fall back to pipes
+    raw = args.strip()
+    if ";" in raw:
+        pitch_values = [v.strip() for v in raw.split(";") if v.strip()]
+    elif "|" in raw:
+        pitch_values = [v.strip() for v in raw.split("|") if v.strip()]
+    else:
+        pitch_values = [raw] if raw else []
+
     if not pitch_values:
-        await ctx.reply("No pitch values provided. Use pipe-separated values like `25|5|8.5`.")
+        await ctx.reply("No pitch values provided. Example: `t!multipitch -7;12;19`")
         return
+
+    if len(pitch_values) > _MULTIPITCH_MAX:
+        await ctx.reply(f"Too many pitches (max {_MULTIPITCH_MAX}). Got {len(pitch_values)}.")
+        return
+
+    # Validate each value up-front for a fast, clear error
+    for pv in pitch_values:
+        try:
+            val = float(pv)
+            if not math.isfinite(val):
+                raise ValueError
+        except ValueError:
+            await ctx.reply(f"❌ Invalid pitch value: `{pv}` — must be a finite number in semitones.")
+            return
 
     # Resolve attachment: slash commands pass it as a parameter;
     # prefix commands need us to look at the message or referenced message.
@@ -2357,8 +2412,8 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
 
     if not attachment:
         await ctx.reply(
-            "Attach a video and use `t!multipitch <pitches>`.\n"
-            "Example: `t!multipitch 25|5|8.5`"
+            "Attach a video or audio file and provide pitch values.\n"
+            "Example: `t!multipitch -7;12;19`"
         )
         return
 
@@ -2367,13 +2422,16 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
         return
 
     suffix = Path(attachment.filename).suffix.lower()
-    if suffix not in VIDEO_EXTENSIONS:
-        await ctx.reply(f"Multipitch requires a video file. Got `{suffix}`.")
+    if suffix not in _MULTIPITCH_AUDIO_EXTS:
+        await ctx.reply(
+            f"Unsupported file type `{suffix}`.\n"
+            f"Supported: video (mp4, mov, avi, mkv, webm, gif) or audio (wav, mp3, flac, ogg, aac, m4a, opus)."
+        )
         return
 
-    pitch_str = "|".join(pitch_values)
+    pitch_str = ";".join(pitch_values)
     status_msg = await ctx.reply(
-        f"⚙️ Applying **multipitch** ({pitch_str})... this may take a moment."
+        f"⚙️ Applying **multipitch** ({pitch_str}) via Rubber Band R3… this may take a moment."
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2388,7 +2446,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
 
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
-            None, _run_multipitch,
+            None, _run_multipitch_rb3,
             input_path, output_path, pitch_values
         )
 
@@ -2401,7 +2459,8 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
             await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
             return
 
-        out_filename = f"multipitch_{pitch_str}_{Path(attachment.filename).stem}.mp4"
+        safe_pitch_str = pitch_str.replace(";", "_")
+        out_filename = f"multipitch_{safe_pitch_str}_{Path(attachment.filename).stem}.mp4"
         try:
             await ctx.reply(
                 content=f"✅ **IHTX multipitch** ({pitch_str}) applied!",
