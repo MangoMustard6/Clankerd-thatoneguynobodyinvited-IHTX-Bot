@@ -3445,6 +3445,48 @@ async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
     await ctx.reply(f"✅ Activity set to **{label}** {text}", ephemeral=True)
 
 
+# ---------- Owner: cross-server messaging ----------
+
+@bot.command(name="sendmsg", aliases=["msgsend"], description="Owner-only: send a message to any channel by ID")
+@commands.check(_is_owner)
+async def sendmsg(ctx: commands.Context, channel_id: str, *, text: str):
+    """Owner-only: send a message to any channel the bot can access, by channel ID.
+
+    Usage:
+      t!sendmsg <channel_id> <message>
+      t!sendmsg 123456789012345678 Hello from the bot!
+    """
+    try:
+        cid = int(channel_id.strip("<#>"))
+    except ValueError:
+        await ctx.reply("❌ Invalid channel ID. Provide a numeric ID or channel mention.")
+        return
+
+    channel = bot.get_channel(cid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(cid)
+        except discord.NotFound:
+            await ctx.reply("❌ Channel not found. Make sure the bot is in that server.")
+            return
+        except discord.Forbidden:
+            await ctx.reply("❌ Bot doesn't have permission to access that channel.")
+            return
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.DMChannel)):
+        await ctx.reply("❌ That channel type doesn't support text messages.")
+        return
+
+    try:
+        await channel.send(text)
+        if ctx.message:
+            await ctx.message.add_reaction("✅")
+    except discord.Forbidden:
+        await ctx.reply("❌ Bot lacks permission to send messages in that channel.")
+    except discord.HTTPException as e:
+        await ctx.reply(f"❌ Failed to send: {e}")
+
+
 # ---------- AI Chat ----------
 
 _OWNER_PERSONAS: dict[int, dict] = {
