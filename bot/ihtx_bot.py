@@ -9,7 +9,7 @@ ImageMagick/sox/etc. depending on advanced effects.
 """
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 import json
@@ -96,6 +96,8 @@ HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
+USAGE_FILE = Path("bot/usage.json")
+PENDING_RESETS_FILE = Path("bot/pending_resets.json")
 heavy_limits: dict[int, int] = {}
 heavy_usage: dict[int, list[float]] = {}
 
@@ -118,6 +120,25 @@ def _save_limits():
         json.dump(heavy_limits, f)
 
 
+def _load_usage():
+    global heavy_usage
+    try:
+        if USAGE_FILE.exists():
+            with USAGE_FILE.open() as f:
+                data = json.load(f)
+                heavy_usage = {int(k): [float(t) for t in v] for k, v in data.items()}
+        else:
+            heavy_usage = {}
+    except Exception:
+        heavy_usage = {}
+
+
+def _save_usage():
+    USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with USAGE_FILE.open("w") as f:
+        json.dump({str(k): v for k, v in heavy_usage.items()}, f)
+
+
 def _check_heavy_limit(user_id: int) -> tuple[bool, str]:
     if _is_owner_by_id(user_id):
         return True, ""
@@ -129,9 +150,12 @@ def _check_heavy_limit(user_id: int) -> tuple[bool, str]:
     if len(usage) >= limit:
         return False, f"Heavy command limit reached ({limit}/{limit} per 24h). Contact an owner."
     usage.append(now)
+    heavy_usage[user_id] = usage
+    _save_usage()
     return True, ""
 
 _load_limits()
+_load_usage()
 
 # Blocklist (users)
 BLOCKLIST_FILE = Path("bot/blocklist.json")
@@ -1792,6 +1816,23 @@ def _run_preview1280(
 
 # ---------- Bot events & commands ----------
 
+@tasks.loop(seconds=5)
+async def _process_pending_resets():
+    """Poll bot/pending_resets.json and clear usage for requested users."""
+    try:
+        if not PENDING_RESETS_FILE.exists():
+            return
+        with PENDING_RESETS_FILE.open() as f:
+            user_ids = [int(x) for x in json.load(f)]
+        if user_ids:
+            for uid in user_ids:
+                heavy_usage.pop(uid, None)
+            _save_usage()
+            PENDING_RESETS_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 @bot.event
 async def on_ready():
     print(f"IHTX Bot online as {bot.user} (ID: {bot.user.id})")
@@ -1809,6 +1850,8 @@ async def on_ready():
         type=discord.ActivityType.watching,
         name="Meet the Sparkles! ✨👗 | Sparkles Magical Market Full Episode | Cartoons for Kids"
     ))
+    if not _process_pending_resets.is_running():
+        _process_pending_resets.start()
 
 
 @bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
@@ -3534,6 +3577,31 @@ async def usage(ctx: commands.Context):
 
     embed.set_footer(text=f"Window: rolling 24h · Heavy commands: {', '.join(sorted(HEAVY_COMMANDS))}")
     await ctx.reply(embed=embed)
+
+
+@bot.command(name="resetlimit", aliases=["rl", "resetusage"])
+@commands.check(_is_owner)
+async def resetlimit(ctx: commands.Context, user: discord.User):
+    """[Owner] Reset a user's heavy command usage back to zero."""
+    heavy_usage.pop(user.id, None)
+    _save_usage()
+    embed = discord.Embed(
+        title="✅ Usage Reset",
+        description=f"Heavy command usage for {user.mention} has been reset to **0**.",
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"Reset by {ctx.author} · Their 24h window is now clear")
+    await ctx.reply(embed=embed)
+
+
+@resetlimit.error
+async def resetlimit_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.reply("❌ Only bot owners can reset usage limits.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.reply("❌ Couldn't find that user. Try mentioning them or using their user ID.")
+    else:
+        await ctx.reply(f"❌ Error: {error}")
 
 
 # ---------- Fun commands ----------
