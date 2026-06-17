@@ -1832,10 +1832,21 @@ async def on_ready():
             print("Entry Point command conflict — skipping bulk sync (slash commands already registered)")
         else:
             print(f"Failed to sync slash commands: {e}")
-    await bot.change_presence(activity=discord.Activity(
+    _activity_file = Path("bot/activity.json")
+    _default_activity = discord.Activity(
         type=discord.ActivityType.watching,
         name="Meet the Sparkles! ✨👗 | Sparkles Magical Market Full Episode | Cartoons for Kids"
-    ))
+    )
+    try:
+        if _activity_file.exists():
+            with _activity_file.open() as _af:
+                _ad = json.load(_af)
+            _atype = discord.ActivityType.watching if _ad.get("type") == "watching" else discord.ActivityType.listening
+            await bot.change_presence(activity=discord.Activity(type=_atype, name=_ad.get("name", "")))
+        else:
+            await bot.change_presence(activity=_default_activity)
+    except Exception:
+        await bot.change_presence(activity=_default_activity)
     if not _process_pending_resets.is_running():
         _process_pending_resets.start()
 
@@ -3394,6 +3405,12 @@ async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
         await ctx.reply("❌ Activity type must be `watching` or `listening`.")
         return
     await bot.change_presence(activity=activity)
+    try:
+        _activity_file = Path("bot/activity.json")
+        with _activity_file.open("w") as _af:
+            json.dump({"type": activity_type if activity_type in ("watching", "listening") else "watching", "name": text}, _af)
+    except Exception:
+        pass
     if ctx.message:
         await ctx.message.add_reaction("✅")
     await ctx.reply(f"✅ Activity set to **{label}** {text}", ephemeral=True)
