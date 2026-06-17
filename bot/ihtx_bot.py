@@ -1079,7 +1079,7 @@ def _apply_pipe_effects(
                 cmd = [
                     "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                     "-i", current,
-                    "-vf", f"lut3d={lut_path},format=yuv420p",
+                    "-vf", f"format=rgb24,lut3d={lut_path},format=yuv420p",
                     "-c:a", "copy",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-shortest", "-movflags", "+faststart",
@@ -2212,7 +2212,7 @@ async def invlum_command(ctx: commands.Context, *, args: str = "1", attachment: 
             None,
             lambda: _run_ihtxcustom_workflow(
                 input_path, output_path, powers, duration,
-                f"lut3d={lut_path}", "",
+                f"format=rgb24,lut3d={lut_path},format=yuv420p", "",
             ),
         )
 
