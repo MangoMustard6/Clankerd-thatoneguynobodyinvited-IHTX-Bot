@@ -1841,8 +1841,21 @@ async def on_ready():
         if _activity_file.exists():
             with _activity_file.open() as _af:
                 _ad = json.load(_af)
-            _atype = discord.ActivityType.watching if _ad.get("type") == "watching" else discord.ActivityType.listening
-            await bot.change_presence(activity=discord.Activity(type=_atype, name=_ad.get("name", "")))
+            _atype_str = _ad.get("type", "watching")
+            _aname = _ad.get("name", "")
+            if _atype_str == "playing":
+                _restored = discord.Game(name=_aname)
+            elif _atype_str == "streaming":
+                _parts = [p.strip() for p in _aname.split("|", 1)]
+                _restored = discord.Streaming(
+                    name=_parts[0],
+                    url=_parts[1] if len(_parts) > 1 else "https://twitch.tv/placeholder"
+                )
+            elif _atype_str == "listening":
+                _restored = discord.Activity(type=discord.ActivityType.listening, name=_aname)
+            else:
+                _restored = discord.Activity(type=discord.ActivityType.watching, name=_aname)
+            await bot.change_presence(activity=_restored)
         else:
             await bot.change_presence(activity=_default_activity)
     except Exception:
@@ -3383,32 +3396,48 @@ async def clearwarn(ctx: commands.Context, user: discord.Member):
 
 @bot.hybrid_command(name="setactivity", aliases=["activity", "presence"], description="Owner-only: change the bot's activity status")
 @app_commands.describe(
-    activity_type="Type of activity: watching or listening",
-    text="The activity text to display"
+    activity_type="Type of activity: watching, listening, playing, or streaming",
+    text="The activity text to display (streaming: use 'Title | https://twitch.tv/...' to include a URL)"
 )
 @commands.check(_is_owner)
 async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
-    """Owner-only: change the bot's activity (watching/listening).
+    """Owner-only: change the bot's activity.
 
     Usage:
       t!setactivity watching some cool video
       t!setactivity listening lo-fi beats
+      t!setactivity playing Minecraft
+      t!setactivity streaming Cool Stream | https://twitch.tv/yourchannel
     """
     activity_type = activity_type.lower().strip()
     if activity_type in ("watching", "watch", "w"):
         activity = discord.Activity(type=discord.ActivityType.watching, name=text)
         label = "Watching"
+        save_type = "watching"
     elif activity_type in ("listening", "listen", "l"):
         activity = discord.Activity(type=discord.ActivityType.listening, name=text)
         label = "Listening to"
+        save_type = "listening"
+    elif activity_type in ("playing", "play", "p"):
+        activity = discord.Game(name=text)
+        label = "Playing"
+        save_type = "playing"
+    elif activity_type in ("streaming", "stream", "s"):
+        parts = [p.strip() for p in text.split("|", 1)]
+        stream_name = parts[0]
+        stream_url = parts[1] if len(parts) > 1 else "https://twitch.tv/placeholder"
+        activity = discord.Streaming(name=stream_name, url=stream_url)
+        label = "Streaming"
+        save_type = "streaming"
+        text = f"{stream_name} | {stream_url}"
     else:
-        await ctx.reply("❌ Activity type must be `watching` or `listening`.")
+        await ctx.reply("❌ Activity type must be `watching`, `listening`, `playing`, or `streaming`.")
         return
     await bot.change_presence(activity=activity)
     try:
         _activity_file = Path("bot/activity.json")
         with _activity_file.open("w") as _af:
-            json.dump({"type": activity_type if activity_type in ("watching", "listening") else "watching", "name": text}, _af)
+            json.dump({"type": save_type, "name": text}, _af)
     except Exception:
         pass
     if ctx.message:
