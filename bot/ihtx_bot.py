@@ -967,31 +967,59 @@ def _run_r3multipitch(
     output_path: str,
     pitches: list[str],
 ) -> tuple[bool, str]:
-    """Apply rubberband r3 multi-pitch using filter_complex.
+    """Apply rubberband pitch shifting sequentially via the rubberband CLI.
 
-    Each semitone value produces one pitch-shifted copy; all are amixed.
-    Requires FFmpeg built with --enable-librubberband (ffmpeg-full).
+    Pitches are semitone integers applied in chain order:
+      rubberband -3 -p <p0> input.wav step1.wav
+      rubberband -3 -p <p1> step1.wav step2.wav
+      ...
+    The final pitched WAV is merged back with the original video stream.
     """
     if not pitches:
         return False, "No pitches provided for r3multipitch."
-    n = len(pitches)
-    fc_parts = [
-        f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:channels=together:smoothing=on[a{j}]"
-        for j, p in enumerate(pitches)
-    ]
-    mix = "".join(f"[a{j}]" for j in range(n))
-    fc_parts.append(f"{mix}amix=inputs={n},volume={n}[outa]")
-    cmd = [
-        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-        "-i", input_path,
-        "-filter_complex", ";".join(fc_parts),
-        "-map", "0:v", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "pcm_s16le",
-        output_path,
-    ]
-    return _run_ffmpeg_raw(cmd, timeout=180)
+
+    try:
+        pitch_ints = [int(p) for p in pitches]
+    except ValueError as e:
+        return False, f"r3multipitch pitches must be integers: {e}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Step 1: extract audio as WAV
+        input_wav = os.path.join(tmpdir, "input.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path, "-vn", input_wav,
+        ], timeout=120)
+        if not ok:
+            return False, f"r3multipitch audio extract failed: {err}"
+
+        # Step 2: apply rubberband sequentially
+        current_wav = input_wav
+        for i, semitones in enumerate(pitch_ints):
+            next_wav = os.path.join(tmpdir, f"step{i + 1}.wav")
+            result = subprocess.run(
+                ["rubberband", "-3", f"-p{semitones}", current_wav, next_wav],
+                capture_output=True, text=True, timeout=180,
+            )
+            if result.returncode != 0:
+                return False, f"rubberband step {i + 1} (pitch {semitones}) failed: {result.stderr.strip()}"
+            current_wav = next_wav
+
+        # Step 3: merge pitched audio back with original video
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path, "-i", current_wav,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "pcm_s16le",
+            "-shortest",
+            output_path,
+        ], timeout=180)
+        if not ok:
+            return False, f"r3multipitch merge failed: {err}"
+
+    return True, ""
 
 
 def _apply_pipe_effects(
@@ -2051,30 +2079,65 @@ def _run_ihtxcustom_workflow(
             return os.path.join(tmpdir, f"{n}.ts")
 
         def apply_step(src: str, dst: str) -> tuple[bool, str]:
-            cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y", "-i", src]
-            # r3multipitch needs filter_complex + special mapping
+            # r3multipitch: apply rubberband CLI sequentially, then merge back
             r3mp_m = re.match(r'^r3multipitch[=\s]+(.*)', af.strip(), re.IGNORECASE) if af else None
             if r3mp_m:
-                pitches = [p.strip() for p in re.split(r'[|,;]', r3mp_m.group(1)) if p.strip()]
-                n = len(pitches) or 1
-                fc_parts = [
-                    f"[0:a]rubberband=pitch=2^({p}/12):pitchq=quality:window=long:channels=together:smoothing=on[a{j}]"
-                    for j, p in enumerate(pitches)
-                ]
-                mix = "".join(f"[a{j}]" for j in range(n))
-                fc_parts.append(f"{mix}amix=inputs={n},volume={n}[outa]")
-                if vf:
-                    cmd.extend(["-vf", vf])
-                if duration > 0:
-                    cmd.extend(["-t", str(duration)])
-                cmd += [
-                    "-filter_complex", ";".join(fc_parts),
-                    "-map", "0:v", "-map", "[outa]",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                    "-ac", "2", "-ar", "44100", "-c:a", "mp2", "-b:a", "192k",
-                    "-bsf:v", "h264_mp4toannexb", dst,
-                ]
-                return _run_ffmpeg_raw(cmd, timeout=180)
+                pitches_raw = [p.strip() for p in re.split(r'[|,;]', r3mp_m.group(1)) if p.strip()]
+                try:
+                    pitch_ints = [int(p) for p in pitches_raw]
+                except ValueError as e:
+                    return False, f"r3multipitch pitches must be integers: {e}"
+
+                with tempfile.TemporaryDirectory() as rb_tmp:
+                    # 1. Apply vf + duration trim → intermediate (audio copy)
+                    mid = os.path.join(rb_tmp, "mid.mp4")
+                    mid_cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y", "-i", src]
+                    if vf:
+                        mid_cmd.extend(["-vf", vf])
+                    if duration > 0:
+                        mid_cmd.extend(["-t", str(duration)])
+                    mid_cmd.extend([
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                        "-c:a", "copy", mid,
+                    ])
+                    ok, err = _run_ffmpeg_raw(mid_cmd, timeout=180)
+                    if not ok:
+                        return False, f"r3multipitch vf step failed: {err}"
+
+                    # 2. Extract audio as WAV
+                    input_wav = os.path.join(rb_tmp, "input.wav")
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", mid, "-vn", input_wav,
+                    ], timeout=120)
+                    if not ok:
+                        return False, f"r3multipitch audio extract failed: {err}"
+
+                    # 3. Apply rubberband sequentially
+                    current_wav = input_wav
+                    for i, semitones in enumerate(pitch_ints):
+                        next_wav = os.path.join(rb_tmp, f"step{i + 1}.wav")
+                        result = subprocess.run(
+                            ["rubberband", "-3", f"-p{semitones}", current_wav, next_wav],
+                            capture_output=True, text=True, timeout=180,
+                        )
+                        if result.returncode != 0:
+                            return False, f"rubberband step {i + 1} (pitch {semitones}) failed: {result.stderr.strip()}"
+                        current_wav = next_wav
+
+                    # 4. Merge video + pitched audio → dst (.ts)
+                    merge_cmd = [
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", mid, "-i", current_wav,
+                        "-map", "0:v", "-map", "1:a",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                        "-ac", "2", "-ar", "44100", "-c:a", "mp2", "-b:a", "192k",
+                        "-shortest",
+                        "-bsf:v", "h264_mp4toannexb", dst,
+                    ]
+                    return _run_ffmpeg_raw(merge_cmd, timeout=180)
+
+            cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y", "-i", src]
             # Normal path
             if vf:
                 cmd.extend(["-vf", vf])
