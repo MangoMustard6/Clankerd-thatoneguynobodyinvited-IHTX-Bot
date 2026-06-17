@@ -98,6 +98,7 @@ HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
 USAGE_FILE = Path("bot/usage.json")
 PENDING_RESETS_FILE = Path("bot/pending_resets.json")
+INVLUM_LUT_FILE = Path("bot/InvertLuminosity.cube")
 heavy_limits: dict[int, int] = {}
 heavy_usage: dict[int, list[float]] = {}
 
@@ -1070,6 +1071,26 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
+            # invlum — apply InvertLuminosity LUT
+            if name in ("invlum", "il"):
+                lut_path = str(INVLUM_LUT_FILE.resolve())
+                if not INVLUM_LUT_FILE.exists():
+                    return False, "InvertLuminosity.cube LUT file not found."
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-vf", f"lut3d={lut_path},format=yuv420p",
+                    "-c:a", "copy",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-shortest", "-movflags", "+faststart",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"invlum failed: {err}"
+                current = out
+                continue
+
             # Raw VIDEO:/AUDIO: filters — each rendered immediately
             if name == "__rawvf__":
                 vf_str = params[0] if params else ""
@@ -1990,8 +2011,14 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             out_filename = f"ihtx_custom_{Path(attachment.filename).stem}{out_ext}"
 
         try:
+            embed = discord.Embed(
+                title="IHTX / thatoneguynobodyinvited's bot",
+                description="Use t!syncaudio / t!syncaudio alt",
+                color=discord.Color.blurple(),
+            )
+            embed.set_thumbnail(url="https://files.catbox.moe/s6m6h3.gif")
             await ctx.reply(
-                content=f"✅ **IHTX `{'preset: ' + preset if is_preset else 'custom'}`** applied!\n⚠️ Make sure you use `t!syncaudio` or `t!syncaudio alt` afterwards to make sure the video is synced to the audio.",
+                embed=embed,
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -2179,12 +2206,13 @@ async def invlum_command(ctx: commands.Context, *, args: str = "1", attachment: 
             await status_msg.edit(content=f"❌ Download failed: {e}")
             return
 
+        lut_path = str(INVLUM_LUT_FILE.resolve())
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
             None,
             lambda: _run_ihtxcustom_workflow(
                 input_path, output_path, powers, duration,
-                "curves=all='0/1 1/0'", "",
+                f"lut3d={lut_path}", "",
             ),
         )
 
