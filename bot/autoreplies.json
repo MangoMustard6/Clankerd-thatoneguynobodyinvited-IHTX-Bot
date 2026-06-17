@@ -3,13 +3,6 @@
     "response": "Hello there, {mention}!",
     "channel_id": null
   },
-  "67": {
-    "response": "\"67\" \ud83e\udd16",
-    "channel_id": null,
-    "blocked_channels": [
-      1513368653137973329
-    ]
-  },
   ".t": {
     "response": "HEY!!!! USE <#1496114769458106509> FOR A REASON, ||{mention}||",
     "channel_id": 1496094014179381319
