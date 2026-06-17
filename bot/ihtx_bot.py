@@ -2041,43 +2041,34 @@ def _run_ihtxcustom_workflow(
     return True, ""
 
 
-@bot.hybrid_command(name="ihtxcustom", aliases=["icustom"], description="HEAVY COMMAND: apply a filter stack powers times then concatenate")
+@bot.hybrid_command(name="invlum", aliases=["il"], description="Apply luma-inversion progressively N times and concatenate all iterations")
 @app_commands.describe(
-    args="<powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]",
+    args="<powers> [duration] [PIPE: effect;effect]",
     attachment="Video to process",
 )
-async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
-    """HEAVY COMMAND: Powers-based ihtxcustom filter stacker.
+async def invlum_command(ctx: commands.Context, *, args: str = "1", attachment: discord.Attachment = None):
+    """Powers-based luma-inversion stacker.
 
-    Applies a filter powers times progressively and concatenates all iterations.
+    Applies curves=all='0/1 1/0' (full luma inversion) powers times progressively
+    and concatenates all iterations into a single video.
     Optionally runs a pipe-effect chain on the final concatenated output.
 
     Usage:
-      t!ihtxcustom <powers> <duration> [VIDEO: <vf>] [AUDIO: <af>] [PIPE: effect;effect]
+      t!invlum <powers> [duration] [PIPE: effect;effect]
 
     Examples:
-      t!ihtxcustom 4 1.5 VIDEO: hflip AUDIO: volume=2
-      t!ihtxcustom 3 2.0 VIDEO: negate
-      t!ihtxcustom 5 1.0 VIDEO: hue=h=90:s=2 AUDIO: vibrato=f=5:d=0.5
-      t!ihtxcustom 3 2.0 VIDEO: hflip PIPE: negate;r3multipitch=-4|5
-      t!ihtxcustom 4 1.0 PIPE: huehsv=0.3;r3multipitch=-7|0|7
-
-    PIPE: runs the full t!ihtx pipe-effect chain on the concatenated output
-    after all powers iterations are done (VIDEO:/AUDIO: still apply per-step).
-
-    Each iteration is one more application of the filter on top of the last,
-    and all iterations are concatenated into the final video.
-    ⚠️ Run t!syncaudio afterwards if audio drifts.
+      t!invlum 4
+      t!invlum 3 2.0
+      t!invlum 5 1.5 PIPE: negate;r3multipitch=-4|5
+      t!invlum 4 1.0 PIPE: huehsv=0.3;r3multipitch=-7|0|7
     """
-    vf = ""
-    af = ""
     pipe_raw = ""
     pipe_effects: list[tuple[str, list[str]]] = []
-    powers = 0
+    powers = 1
     duration = 1.0
 
     try:
-        pre = re.split(r'VIDEO:|AUDIO:|PIPE:', args, flags=re.IGNORECASE)[0].strip()
+        pre = re.split(r'PIPE:', args, flags=re.IGNORECASE)[0].strip()
         pre_parts = pre.split()
         if len(pre_parts) >= 2:
             powers = int(pre_parts[0])
@@ -2085,24 +2076,17 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
         elif len(pre_parts) == 1:
             powers = int(pre_parts[0])
 
-        vf_m = re.search(r'VIDEO:\s*(.*?)(?=\bAUDIO:|\bPIPE:|$)', args, re.IGNORECASE | re.DOTALL)
-        af_m = re.search(r'AUDIO:\s*(.*?)(?=\bVIDEO:|\bPIPE:|$)', args, re.IGNORECASE | re.DOTALL)
-        pipe_m = re.search(r'PIPE:\s*(.*?)(?=\bVIDEO:|\bAUDIO:|$)', args, re.IGNORECASE | re.DOTALL)
-        if vf_m:
-            vf = vf_m.group(1).strip()
-        if af_m:
-            af = af_m.group(1).strip()
+        pipe_m = re.search(r'PIPE:\s*(.*)', args, re.IGNORECASE | re.DOTALL)
         if pipe_m:
             pipe_raw = pipe_m.group(1).strip()
             pipe_effects = _parse_pipe_effects(pipe_raw)
     except (ValueError, IndexError):
         pass
 
-    if powers < 1 or (not vf and not af and not pipe_effects):
+    if powers < 1:
         await ctx.reply(
-            "❌ Invalid syntax.\n"
-            "**Usage:** `t!ihtxcustom <powers> <duration> [VIDEO: <vf>] [AUDIO: <af>] [PIPE: effect;effect]`\n"
-            "**Example:** `t!ihtxcustom 4 1.5 VIDEO: hflip PIPE: negate;r3multipitch=-4|5`"
+            "❌ Powers must be at least 1.\n"
+            "**Usage:** `t!invlum <powers> [duration] [PIPE: effect;effect]`"
         )
         return
 
@@ -2118,36 +2102,26 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
                 pass
 
     if not attachment:
-        await ctx.reply(
-            "❌ Attach a video.\n"
-            "**Usage:** `t!ihtxcustom <powers> <duration> VIDEO: <vf_filter> [AUDIO: <af_filter>]`"
-        )
+        await ctx.reply("❌ Attach a video.\n**Usage:** `t!invlum <powers> [duration] [PIPE: effect;effect]`")
         return
 
     if attachment.size > MAX_FILE_SIZE:
-        await ctx.reply(f"❌ File too large (max 25 MB).")
+        await ctx.reply("❌ File too large (max 25 MB).")
         return
 
     suffix = Path(attachment.filename).suffix.lower()
     if suffix not in VIDEO_EXTENSIONS:
-        await ctx.reply(f"❌ `ihtxcustom` requires a video file. Got `{suffix}`.")
+        await ctx.reply(f"❌ `invlum` requires a video file. Got `{suffix}`.")
         return
 
-    filter_parts = []
-    if vf:
-        filter_parts.append(f"VIDEO: `{vf}`")
-    if af:
-        filter_parts.append(f"AUDIO: `{af}`")
-    if pipe_raw:
-        filter_parts.append(f"PIPE: `{pipe_raw}`")
-    filter_desc = " | ".join(filter_parts)
+    pipe_desc = f" | PIPE: `{pipe_raw}`" if pipe_raw else ""
     status_msg = await ctx.reply(
-        f"⚙️ **ihtxcustom** — `{powers}` power(s) × `{duration}s` | {filter_desc} … this may take a moment."
+        f"⚙️ **invlum** — `{powers}` power(s) × `{duration}s`{pipe_desc} … this may take a moment."
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, "ihtx_custom.mov")
+        output_path = os.path.join(tmpdir, "invlum_out.mov")
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -2161,21 +2135,24 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
             None,
-            lambda: _run_ihtxcustom_workflow(input_path, output_path, powers, duration, vf, af),
+            lambda: _run_ihtxcustom_workflow(
+                input_path, output_path, powers, duration,
+                "curves=all='0/1 1/0'", "",
+            ),
         )
 
         if not ok:
-            await status_msg.edit(content=f"❌ ihtxcustom failed: {err}")
+            await status_msg.edit(content=f"❌ invlum failed: {err}")
             return
 
         if pipe_effects:
-            pipe_out = os.path.join(tmpdir, "ihtx_custom_pipe.mov")
+            pipe_out = os.path.join(tmpdir, "invlum_pipe.mov")
             ok, err = await loop.run_in_executor(
                 None,
                 lambda: _apply_pipe_effects(output_path, pipe_out, pipe_effects),
             )
             if not ok:
-                await status_msg.edit(content=f"❌ ihtxcustom pipe step failed: {err}")
+                await status_msg.edit(content=f"❌ invlum pipe step failed: {err}")
                 return
             output_path = pipe_out
 
@@ -2184,10 +2161,10 @@ async def ihtxcustom_command(ctx: commands.Context, *, args: str = "", attachmen
             await status_msg.edit(content="❌ Output too large for Discord (>25 MB). Try fewer powers or a shorter duration.")
             return
 
-        out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mov"
+        out_filename = f"invlum_{Path(attachment.filename).stem}.mov"
         try:
             await ctx.reply(
-                content=f"✅ **ihtxcustom** done! `{powers}` power(s), `{duration}s` each.\n⚠️ Use `t!syncaudio` if audio seems off.",
+                content=f"✅ **invlum** done! `{powers}` power(s), `{duration}s` each.",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
