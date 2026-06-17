@@ -67,3 +67,4 @@ PORT = "8081"
 
 [nix]
 channel = "stable-25_05"
+packages = ["rubberband"]
