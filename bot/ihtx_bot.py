@@ -1401,34 +1401,39 @@ def _run_multipitch(
             pitched_wavs.append(out_wav)
 
         # Step 4: Re-merge with video
+        # apad pads SoX-shortened audio back to at least video length;
+        # -shortest then clamps output to the video duration so audio
+        # length drift never compounds across repeated iterations.
         if n == 1:
-            # Single pitch: ffmpeg -i a0.mp4 -i 10.wav -filter_complex "[1:a]highpass=10[a]"
-            #   -map 0:v -map "[a]" -c:a pcm_s16le output
+            # Single pitch: ffmpeg -i a0.mp4 -i 10.wav -filter_complex "[1:a]highpass=10,apad[a]"
+            #   -map 0:v -map "[a]" -c:a pcm_s16le -shortest output
             cmd = [
                 "ffmpeg", "-y",
                 "-i", base_mp4,
                 "-i", pitched_wavs[0],
-                "-filter_complex", "[1:a]highpass=10[a]",
+                "-filter_complex", "[1:a]highpass=10,apad[a]",
                 "-map", "0:v", "-map", "[a]",
                 "-c:a", "pcm_s16le",
+                "-shortest",
                 output_path,
             ]
         else:
             # Multiple pitches: ffmpeg -i a0.mp4 -i 10.wav -i 11.wav ...
-            #   -filter_complex "[1][2]...[N]amix=N:normalize=0,highpass=7.5"
-            #   -c:a pcm_s16le -preset ultrafast output
+            #   -filter_complex "[1][2]...[N]amix=N:normalize=0,highpass=7.5,apad[a]"
+            #   -c:a pcm_s16le -preset ultrafast -shortest output
             cmd = ["ffmpeg", "-y", "-i", base_mp4]
             for wav in pitched_wavs:
                 cmd.extend(["-i", wav])
 
-            # Build filter_complex: [1][2]...[N]amix=N:normalize=0,highpass=7.5
+            # Build filter_complex: [1][2]...[N]amix=N:normalize=0,highpass=7.5,apad[a]
             mix_inputs = "".join(f"[{i+1}]" for i in range(n))
-            filter_complex = f"{mix_inputs}amix={n}:normalize=0,highpass=7.5"
+            filter_complex = f"{mix_inputs}amix={n}:normalize=0,highpass=7.5,apad[a]"
 
             cmd.extend([
                 "-filter_complex", filter_complex,
-                "-map", "0:v",
+                "-map", "0:v", "-map", "[a]",
                 "-c:a", "pcm_s16le", "-preset", "ultrafast",
+                "-shortest",
                 output_path,
             ])
 
