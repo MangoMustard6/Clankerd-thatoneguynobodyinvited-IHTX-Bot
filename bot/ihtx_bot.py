@@ -35,7 +35,11 @@ except ImportError:
 try:
     from google import genai as _genai_lib
     from google.genai import types as _genai_types
-    _genai_client = _genai_lib.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    _gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if _gemini_api_key:
+        _genai_client = _genai_lib.Client(api_key=_gemini_api_key)
+    else:
+        _genai_client = None
 except ImportError:
     _genai_client = None
 
