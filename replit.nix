@@ -4,5 +4,6 @@
     pkgs.imagemagick
     pkgs.sox
     pkgs.ffmpeg
+    pkgs.rubberband
   ];
 }
