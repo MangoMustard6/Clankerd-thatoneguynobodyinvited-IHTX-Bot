@@ -3487,6 +3487,60 @@ async def sendmsg(ctx: commands.Context, channel_id: str, *, text: str):
         await ctx.reply(f"❌ Failed to send: {e}")
 
 
+@bot.command(name="listservers", aliases=["servers", "guilds"])
+@commands.check(_is_owner)
+async def listservers(ctx: commands.Context):
+    """Owner-only: list all servers the bot is in with their IDs and channel counts."""
+    guilds = sorted(bot.guilds, key=lambda g: g.name.lower())
+    if not guilds:
+        await ctx.reply("Bot is not in any servers.")
+        return
+
+    lines = []
+    for g in guilds:
+        text_channels = [c for c in g.channels if isinstance(c, discord.TextChannel)]
+        lines.append(f"**{g.name}** (`{g.id}`) — {g.member_count} members, {len(text_channels)} text channels")
+
+    # Split into chunks of 10 servers per message to avoid hitting the 2000 char limit
+    chunk_size = 10
+    for i in range(0, len(lines), chunk_size):
+        chunk = lines[i:i + chunk_size]
+        header = f"**Servers ({len(guilds)} total):**\n" if i == 0 else ""
+        await ctx.reply(header + "\n".join(chunk))
+
+
+@bot.command(name="listchannels", aliases=["channels"])
+@commands.check(_is_owner)
+async def listchannels(ctx: commands.Context, *, guild_id: str):
+    """Owner-only: list all text channels in a server by guild ID."""
+    try:
+        gid = int(guild_id.strip())
+    except ValueError:
+        await ctx.reply("❌ Provide a numeric guild/server ID.")
+        return
+
+    guild = bot.get_guild(gid)
+    if guild is None:
+        await ctx.reply("❌ Server not found. Make sure the bot is in that server.")
+        return
+
+    text_channels = sorted(
+        [c for c in guild.channels if isinstance(c, discord.TextChannel)],
+        key=lambda c: c.position,
+    )
+    if not text_channels:
+        await ctx.reply(f"No text channels found in **{guild.name}**.")
+        return
+
+    lines = [f"**{guild.name}** text channels:"]
+    for c in text_channels:
+        lines.append(f"#{c.name} — `{c.id}`")
+
+    chunk_size = 20
+    for i in range(0, len(lines), chunk_size):
+        await ctx.reply("\n".join(lines[i:i + chunk_size]))
+
+
 # ---------- AI Chat ----------
 
 _OWNER_PERSONAS: dict[int, dict] = {
