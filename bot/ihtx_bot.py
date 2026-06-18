@@ -1355,7 +1355,7 @@ def _run_multipitch_rb3(
             "ffmpeg", "-y",
             "-t", cap,          # input-side hard cap — stops reading the source
             "-i", input_path,
-            "-vn", "-acodec", "pcm_s16le", "-ar", "44100",
+            "-vn", "-ar", "44100",
             "-t", cap,          # output-side belt-and-suspenders
             base_wav,
         ], timeout=120)
@@ -1394,7 +1394,6 @@ def _run_multipitch_rb3(
                 "-filter_complex",
                 f"{mix_inputs}amix={n}:normalize=0:duration=shortest,highpass=7.5[a]",
                 "-map", "[a]",
-                "-acodec", "pcm_s16le",
                 mixed_wav,
             ])
             ok, err = _run_ffmpeg_raw(mix_cmd, timeout=180)
