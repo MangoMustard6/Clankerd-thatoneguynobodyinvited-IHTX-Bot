@@ -1368,7 +1368,6 @@ def _run_multipitch_rb3(
             "-t", cap,          # input-side hard cap — stops reading the source
             "-i", input_path,
             "-vn", "-ar", "44100",
-            "-af", "atrim=0.02",
             "-t", cap,          # output-side belt-and-suspenders
             base_wav,
         ], timeout=120)
