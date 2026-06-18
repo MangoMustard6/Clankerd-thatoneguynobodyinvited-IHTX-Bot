@@ -1258,6 +1258,18 @@ def _run_ihtx_tagscript_workflow(
             ok, err = _apply_pipe_effects(previous, current, effects)
             if not ok:
                 return False, f"Export {i} failed: {err}"
+            # Validate output is non-empty and has video frames before next iteration
+            if not os.path.exists(current) or os.path.getsize(current) < 64:
+                return False, f"Export {i} produced an empty or invalid file."
+            probe = _ffprobe(
+                current,
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames",
+                "-count_frames",
+                "-of", "default=nw=1:nk=1",
+            ).strip()
+            if probe == "0":
+                return False, f"Export {i} has no video frames (likely a filter or codec issue with format '{export_format}')."
             previous = current
 
         concat_list = os.path.join(tmpdir, "concat.txt")
