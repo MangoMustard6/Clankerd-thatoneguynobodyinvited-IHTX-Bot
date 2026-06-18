@@ -3889,78 +3889,144 @@ async def rate(ctx: commands.Context, *, thing: str):
     await ctx.reply(f"**{thing}**: {bar} **{score}/10**")
 
 
-# ---------- Random media picker ----------
+# ---------- Random media pool ----------
 
-_RANDOM_MEDIA_EXTS = {
-    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif",
-    ".png", ".jpg", ".jpeg", ".webp",
-    ".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a", ".opus",
-}
+RANDOM_POOL_FILE = Path("bot/random_pool.json")
+_random_pool: list[str] = []
 
 
-@bot.hybrid_command(name="random", aliases=["rand"], description="Randomly pick one media item from URLs and/or attachments")
-@app_commands.describe(args="Space-separated media URLs to include in the pool (attachments are added automatically)")
-async def random_command(ctx: commands.Context, *, args: str = ""):
-    """Randomly select one media item from a pool of URLs and/or file attachments.
+def _load_random_pool() -> None:
+    global _random_pool
+    try:
+        if RANDOM_POOL_FILE.exists():
+            with RANDOM_POOL_FILE.open() as f:
+                _random_pool = [str(u) for u in json.load(f) if str(u).strip()]
+        else:
+            _random_pool = []
+    except Exception:
+        _random_pool = []
+
+
+def _save_random_pool() -> None:
+    RANDOM_POOL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with RANDOM_POOL_FILE.open("w") as f:
+        json.dump(_random_pool, f, indent=2)
+
+
+_load_random_pool()
+
+
+@bot.command(name="random", aliases=["rand"], description="Roll a random media item from the persistent pool, or manage the pool")
+async def random_command(ctx: commands.Context, subcommand: str = "", *, args: str = ""):
+    """Persistent random media pool.
 
     Usage:
-      t!random https://a.png https://b.gif https://c.mp4
-      t!random                (with files attached to the message)
-      t!random https://a.png  (with additional files attached)
-
-    Attachments on the message and referenced message are included automatically.
-    URLs and attachments are combined into one pool, deduplicated, then one is
-    chosen via random.choice() and returned as a plain URL.
-
-    Supported types: video (mp4, mov, avi, mkv, webm, gif),
-                     image (png, jpg, jpeg, webp),
-                     audio (wav, mp3, flac, ogg, aac, m4a, opus).
+      t!random                    — post a random item from the pool
+      t!random add <url>          — owner: add a URL to the pool
+      t!random add  (attachment)  — owner: add an attached file's URL
+      t!random remove <url>       — owner: remove a URL from the pool
+      t!random list               — owner: list all items in the pool
+      t!random clear              — owner: wipe the entire pool
     """
-    pool: list[str] = []
-    seen: set[str] = set()
+    sub = subcommand.strip().lower()
 
-    def _add(url: str, filename: str) -> None:
-        ext = Path(filename).suffix.lower()
-        if ext in _RANDOM_MEDIA_EXTS and url not in seen:
-            pool.append(url)
-            seen.add(url)
-
-    # Collect attachments from this message
-    if ctx.message and ctx.message.attachments:
-        for att in ctx.message.attachments:
-            _add(att.url, att.filename)
-
-    # Collect attachments from a replied-to message
-    if ctx.message and ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            for att in ref.attachments:
-                _add(att.url, att.filename)
-        except Exception:
-            pass
-
-    # Collect URLs from the args string
-    has_args = bool(args.strip())
-    if has_args:
-        for token in args.split():
-            token = token.strip()
-            if not token.startswith(("http://", "https://")):
-                continue
-            parsed_path = urllib.parse.urlparse(token).path
-            _add(token, parsed_path)
-
-    # Error: nothing was provided at all
-    if not has_args and not (ctx.message and ctx.message.attachments) and not pool:
-        await ctx.reply("❌ Please provide at least one media URL or attachment.")
+    # ── Roll ────────────────────────────────────────────────────────────────
+    if sub == "":
+        if not _random_pool:
+            await ctx.reply("❌ The random pool is empty. An owner can add items with `t!random add <url>`.")
+            return
+        chosen = random.choice(_random_pool)
+        await ctx.reply(chosen)
         return
 
-    # Error: something was provided but none matched supported types
-    if not pool:
-        await ctx.reply("❌ No valid media was found.")
+    # ── Owner-only subcommands ───────────────────────────────────────────────
+    if not _is_owner(ctx):
+        await ctx.reply("❌ Only owners can manage the random pool.")
         return
 
-    chosen = random.choice(pool)
-    await ctx.reply(chosen)
+    # ── Add ─────────────────────────────────────────────────────────────────
+    if sub == "add":
+        urls_to_add: list[str] = []
+
+        # Attachment on this message
+        if ctx.message and ctx.message.attachments:
+            for att in ctx.message.attachments:
+                urls_to_add.append(att.url)
+
+        # URL argument
+        url_arg = args.strip()
+        if url_arg:
+            urls_to_add.append(url_arg)
+
+        if not urls_to_add:
+            await ctx.reply("❌ Provide a URL or attach a file: `t!random add <url>`")
+            return
+
+        added = []
+        for url in urls_to_add:
+            if url not in _random_pool:
+                _random_pool.append(url)
+                added.append(url)
+
+        if added:
+            _save_random_pool()
+            lines = "\n".join(f"• `{u}`" for u in added)
+            await ctx.reply(f"✅ Added {len(added)} item(s) to the pool ({len(_random_pool)} total):\n{lines}")
+        else:
+            await ctx.reply("ℹ️ All provided URLs are already in the pool.")
+        return
+
+    # ── Remove ──────────────────────────────────────────────────────────────
+    if sub in ("remove", "rm", "del", "delete"):
+        url_arg = args.strip()
+        if not url_arg:
+            await ctx.reply("❌ Provide a URL to remove: `t!random remove <url>`")
+            return
+        if url_arg in _random_pool:
+            _random_pool.remove(url_arg)
+            _save_random_pool()
+            await ctx.reply(f"✅ Removed from pool ({len(_random_pool)} remaining).")
+        else:
+            await ctx.reply("❌ That URL isn't in the pool.")
+        return
+
+    # ── List ────────────────────────────────────────────────────────────────
+    if sub == "list":
+        if not _random_pool:
+            await ctx.reply("The random pool is empty.")
+            return
+        lines = "\n".join(f"{i+1}. {u}" for i, u in enumerate(_random_pool))
+        # Split into chunks to avoid the 2000-char Discord limit
+        chunk, chunks = "", []
+        for line in lines.splitlines():
+            if len(chunk) + len(line) + 1 > 1900:
+                chunks.append(chunk)
+                chunk = line
+            else:
+                chunk = (chunk + "\n" + line).lstrip("\n")
+        if chunk:
+            chunks.append(chunk)
+        await ctx.reply(f"**Random pool ({len(_random_pool)} items):**\n{chunks[0]}")
+        for c in chunks[1:]:
+            await ctx.send(c)
+        return
+
+    # ── Clear ───────────────────────────────────────────────────────────────
+    if sub == "clear":
+        count = len(_random_pool)
+        _random_pool.clear()
+        _save_random_pool()
+        await ctx.reply(f"✅ Cleared {count} item(s) from the pool.")
+        return
+
+    await ctx.reply(
+        "Unknown subcommand. Usage:\n"
+        "`t!random` — roll\n"
+        "`t!random add <url>` — add item (owner)\n"
+        "`t!random remove <url>` — remove item (owner)\n"
+        "`t!random list` — list all items (owner)\n"
+        "`t!random clear` — wipe pool (owner)"
+    )
 
 
 # ---------- Message filtering ----------
