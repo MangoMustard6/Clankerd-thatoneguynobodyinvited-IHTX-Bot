@@ -1410,7 +1410,7 @@ def _run_multipitch_rb3(
                 "-map", "0:v",
                 "-map", "1:a",
                 "-c:v", "copy",
-                "-c:a", "pcm_s16le",
+                "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
                 output_path,
             ], timeout=300)
