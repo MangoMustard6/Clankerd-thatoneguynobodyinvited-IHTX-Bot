@@ -1342,13 +1342,21 @@ def _run_multipitch_rb3(
         "-of", "default=nw=1:nk=1",
     ).strip())
 
+    # Hard duration cap: probe actual length, clamp to MAX_DURATION
+    actual_dur = _ffprobe_duration(input_path)
+    cap = str(int(min(actual_dur, MAX_DURATION)) + 1) if actual_dur > 0 else str(MAX_DURATION)
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Step 1: Extract PCM WAV audio
+        # Step 1: Extract PCM WAV audio.
+        # -t is placed on the INPUT side (before -i) so FFmpeg stops reading
+        # from the source regardless of container metadata or stream-loop flags.
         base_wav = os.path.join(tmpdir, "base.wav")
         ok, err = _run_ffmpeg_raw([
-            "ffmpeg", "-y", "-i", input_path,
-            "-t", str(MAX_DURATION),
+            "ffmpeg", "-y",
+            "-t", cap,          # input-side hard cap — stops reading the source
+            "-i", input_path,
             "-vn", "-acodec", "pcm_s16le", "-ar", "44100",
+            "-t", cap,          # output-side belt-and-suspenders
             base_wav,
         ], timeout=120)
         if not ok:
@@ -1371,7 +1379,9 @@ def _run_multipitch_rb3(
                 )
             pitched_wavs.append(out_wav)
 
-        # Step 3: Mix all pitched WAVs together
+        # Step 3: Mix all pitched WAVs together.
+        # duration=shortest stops at the shortest input so rubberband tail
+        # artefacts never extend the output past the original length.
         if n == 1:
             mixed_wav = pitched_wavs[0]
         else:
@@ -1382,7 +1392,7 @@ def _run_multipitch_rb3(
             mix_inputs = "".join(f"[{i}:a]" for i in range(n))
             mix_cmd.extend([
                 "-filter_complex",
-                f"{mix_inputs}amix={n}:normalize=0,highpass=7.5,apad[a]",
+                f"{mix_inputs}amix={n}:normalize=0:duration=shortest,highpass=7.5[a]",
                 "-map", "[a]",
                 "-acodec", "pcm_s16le",
                 mixed_wav,
@@ -1395,7 +1405,7 @@ def _run_multipitch_rb3(
         if has_video:
             ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
-                "-i", input_path,
+                "-t", cap, "-i", input_path,
                 "-i", mixed_wav,
                 "-map", "0:v",
                 "-map", "1:a",
@@ -3877,6 +3887,80 @@ async def rate(ctx: commands.Context, *, thing: str):
     score = (hash(thing.lower()) % 11 + 11) % 11
     bar = "█" * score + "░" * (10 - score)
     await ctx.reply(f"**{thing}**: {bar} **{score}/10**")
+
+
+# ---------- Random media picker ----------
+
+_RANDOM_MEDIA_EXTS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif",
+    ".png", ".jpg", ".jpeg", ".webp",
+    ".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a", ".opus",
+}
+
+
+@bot.hybrid_command(name="random", aliases=["rand"], description="Randomly pick one media item from URLs and/or attachments")
+@app_commands.describe(args="Space-separated media URLs to include in the pool (attachments are added automatically)")
+async def random_command(ctx: commands.Context, *, args: str = ""):
+    """Randomly select one media item from a pool of URLs and/or file attachments.
+
+    Usage:
+      t!random https://a.png https://b.gif https://c.mp4
+      t!random                (with files attached to the message)
+      t!random https://a.png  (with additional files attached)
+
+    Attachments on the message and referenced message are included automatically.
+    URLs and attachments are combined into one pool, deduplicated, then one is
+    chosen via random.choice() and returned as a plain URL.
+
+    Supported types: video (mp4, mov, avi, mkv, webm, gif),
+                     image (png, jpg, jpeg, webp),
+                     audio (wav, mp3, flac, ogg, aac, m4a, opus).
+    """
+    pool: list[str] = []
+    seen: set[str] = set()
+
+    def _add(url: str, filename: str) -> None:
+        ext = Path(filename).suffix.lower()
+        if ext in _RANDOM_MEDIA_EXTS and url not in seen:
+            pool.append(url)
+            seen.add(url)
+
+    # Collect attachments from this message
+    if ctx.message and ctx.message.attachments:
+        for att in ctx.message.attachments:
+            _add(att.url, att.filename)
+
+    # Collect attachments from a replied-to message
+    if ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            for att in ref.attachments:
+                _add(att.url, att.filename)
+        except Exception:
+            pass
+
+    # Collect URLs from the args string
+    has_args = bool(args.strip())
+    if has_args:
+        for token in args.split():
+            token = token.strip()
+            if not token.startswith(("http://", "https://")):
+                continue
+            parsed_path = urllib.parse.urlparse(token).path
+            _add(token, parsed_path)
+
+    # Error: nothing was provided at all
+    if not has_args and not (ctx.message and ctx.message.attachments) and not pool:
+        await ctx.reply("❌ Please provide at least one media URL or attachment.")
+        return
+
+    # Error: something was provided but none matched supported types
+    if not pool:
+        await ctx.reply("❌ No valid media was found.")
+        return
+
+    chosen = random.choice(pool)
+    await ctx.reply(chosen)
 
 
 # ---------- Message filtering ----------
