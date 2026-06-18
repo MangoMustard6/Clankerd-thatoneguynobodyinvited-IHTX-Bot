@@ -1347,6 +1347,7 @@ def _run_multipitch_rb3(
         base_wav = os.path.join(tmpdir, "base.wav")
         ok, err = _run_ffmpeg_raw([
             "ffmpeg", "-y", "-i", input_path,
+            "-t", str(MAX_DURATION),
             "-vn", "-acodec", "pcm_s16le", "-ar", "44100",
             base_wav,
         ], timeout=120)
