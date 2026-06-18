@@ -24,6 +24,7 @@ import subprocess
 import aiohttp
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import urllib.parse
 import base64
@@ -1375,11 +1376,13 @@ def _run_multipitch_rb3(
             return False, f"Audio extraction failed: {err}"
 
         # Step 2: Rubber Band R3 pitch shift per voice
+        # -t 1 explicitly sets time ratio to 1.0 (preserve duration, change pitch only)
         pitched_wavs: list[str] = []
         for i, st in enumerate(semitones):
             out_wav = os.path.join(tmpdir, f"pitched_{i}.wav")
             cmd = [
                 "rubberband", "-3",
+                "-t", "1",
                 "-p", str(st),
                 base_wav, out_wav,
             ]
@@ -2493,6 +2496,213 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+# ---------- t!trim — precise media trimmer ----------
+
+_TRIM_SUPPORTED_EXTS = {
+    ".mp4", ".mov", ".webm", ".gif", ".mkv",
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a",
+}
+_TRIM_MAX_DECIMALS = 10
+
+
+def _parse_trim_timestamp(ts: str) -> Decimal:
+    """Parse HH:MM:SS[.frac], MM:SS[.frac], or plain seconds into Decimal seconds.
+
+    Raises:
+        ValueError("too_many_decimals") — more than 10 decimal places in the fractional part
+        ValueError("invalid_format")    — unrecognisable or non-numeric input
+    """
+    ts = ts.strip()
+    if "." in ts:
+        frac = ts.rsplit(".", 1)[1]
+        if len(frac) > _TRIM_MAX_DECIMALS:
+            raise ValueError("too_many_decimals")
+    parts = ts.split(":")
+    try:
+        if len(parts) == 1:
+            return Decimal(parts[0])
+        elif len(parts) == 2:
+            return Decimal(parts[0]) * 60 + Decimal(parts[1])
+        elif len(parts) == 3:
+            return Decimal(parts[0]) * 3600 + Decimal(parts[1]) * 60 + Decimal(parts[2])
+        else:
+            raise ValueError("invalid_format")
+    except InvalidOperation:
+        raise ValueError("invalid_format")
+
+
+@bot.command(name="trim", description="Trim audio/video/GIF to a precise time range")
+async def trim_command(ctx: commands.Context, *, args: str = ""):
+    """Trim media from <start> to <end> with up to 10 decimal places of precision.
+
+    Usage:
+      t!trim <start> <end>
+      t!trim 5 15
+      t!trim 0.5 3.75
+      t!trim 1.2345678901 9.8765432109
+      t!trim 00:01:30.5 00:02:45.25
+      t!trim 1:30 2:45
+
+    Media from: attachment on this message, replied-to message, or a URL in args.
+    Supported: mp4, mov, webm, gif, mkv, mp3, wav, flac, ogg, m4a.
+    """
+    tokens = args.split()
+
+    # Separate URLs from timestamp tokens
+    media_url: str | None = None
+    ts_tokens: list[str] = []
+    for tok in tokens:
+        if tok.startswith(("http://", "https://")):
+            if media_url is None:
+                media_url = tok
+        else:
+            ts_tokens.append(tok)
+
+    if len(ts_tokens) < 2:
+        await ctx.reply(
+            "❌ Usage: `t!trim <start> <end>`\n"
+            "Examples: `t!trim 5 15` · `t!trim 0.5 3.75` · `t!trim 00:01:30 00:02:45`\n"
+            "Attach, reply to, or include a media URL."
+        )
+        return
+
+    # Parse start timestamp
+    try:
+        t_start = _parse_trim_timestamp(ts_tokens[0])
+    except ValueError as exc:
+        if str(exc) == "too_many_decimals":
+            await ctx.reply("❌ Timestamps may contain at most 10 decimal places.")
+        else:
+            await ctx.reply("❌ Invalid timestamp format.")
+        return
+
+    # Parse end timestamp
+    try:
+        t_end = _parse_trim_timestamp(ts_tokens[1])
+    except ValueError as exc:
+        if str(exc) == "too_many_decimals":
+            await ctx.reply("❌ Timestamps may contain at most 10 decimal places.")
+        else:
+            await ctx.reply("❌ Invalid timestamp format.")
+        return
+
+    # Validate ordering
+    if t_start < 0 or t_end < 0:
+        await ctx.reply("❌ Timestamps cannot be negative.")
+        return
+    if t_start >= t_end:
+        await ctx.reply("❌ Start time must be less than end time.")
+        return
+
+    # Resolve media source (priority: attachment > reply > URL arg)
+    attachment: discord.Attachment | None = None
+    if media_url is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+                else:
+                    for tok in ref.content.split():
+                        if tok.startswith(("http://", "https://")):
+                            media_url = tok
+                            break
+            except Exception:
+                pass
+
+    if attachment is None and media_url is None:
+        await ctx.reply("❌ No media found. Attach, reply to, or provide a media URL.")
+        return
+
+    # Determine file extension
+    src_name = attachment.filename if attachment else urllib.parse.urlparse(media_url).path
+    suffix = Path(src_name).suffix.lower()
+    if not suffix:
+        suffix = ".mp4"
+    if suffix not in _TRIM_SUPPORTED_EXTS:
+        await ctx.reply(
+            f"❌ Unsupported format `{suffix}`.\n"
+            f"Supported: {', '.join(sorted(_TRIM_SUPPORTED_EXTS))}"
+        )
+        return
+
+    status_msg = await ctx.reply(f"✂️ Trimming…")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+
+        # Download
+        try:
+            if attachment:
+                await download_attachment(attachment, input_path)
+            else:
+                await download_url(media_url, input_path)
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Failed to download media: {exc}")
+            return
+
+        # Probe duration
+        loop = asyncio.get_event_loop()
+        dur = await loop.run_in_executor(None, _ffprobe_duration, input_path)
+        if dur <= 0:
+            await status_msg.edit(content="❌ Could not read media duration.")
+            return
+
+        if float(t_end) > dur + 0.001:
+            await status_msg.edit(
+                content=f"❌ End time exceeds the media duration ({dur:.6f}s)."
+            )
+            return
+
+        output_path = os.path.join(tmpdir, f"trimmed{suffix}")
+        start_str = str(t_start)
+        end_str = str(t_end)
+
+        if suffix == ".gif":
+            # GIFs cannot be stream-copied; re-encode
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", start_str, "-to", end_str,
+                "-i", input_path,
+                output_path,
+            ]
+        else:
+            # Output-side seek for frame-accurate trim; stream copy = lossless + fast
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-ss", start_str,
+                "-to", end_str,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                output_path,
+            ]
+
+        ok, err = await loop.run_in_executor(None, lambda: _run_ffmpeg_raw(cmd, 120))
+        if not ok:
+            await status_msg.edit(content=f"❌ FFmpeg failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB).")
+            return
+
+        stem = Path(src_name).stem
+        safe_s = str(t_start).replace(".", "_")
+        safe_e = str(t_end).replace(".", "_")
+        out_filename = f"trim_{safe_s}-{safe_e}_{stem}{suffix}"
+
+        try:
+            await ctx.reply(
+                content=f"✅ Trimmed `{t_start}s` → `{t_end}s`",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as exc:
+            await status_msg.edit(content=f"❌ Failed to upload result: {exc}")
 
 
 @bot.hybrid_command(name="huehsv", aliases=["hhsv"], description="Apply hue shift via ImageMagick haldclut")
