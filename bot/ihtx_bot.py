@@ -1506,6 +1506,8 @@ def _run_multipitch_rb3(
                 return False, f"❌ amix failed: {err_mix}"
 
         # ── 6. Remux pitched audio with original video (or audio-only) ───────
+        # Use -c:v copy to preserve original timestamps exactly — re-encoding
+        # would reset the timebase and cause the video to play back faster.
         if has_video:
             ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
@@ -1513,8 +1515,7 @@ def _run_multipitch_rb3(
                 "-i", out_wav,
                 "-map", "0:v",
                 "-map", "1:a",
-                "-c:v", "libx264", "-preset", "ultrafast", "-qp", "1",
-                "-pix_fmt", "yuv420p",
+                "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
                 "-t", cap,
                 "-shortest",
