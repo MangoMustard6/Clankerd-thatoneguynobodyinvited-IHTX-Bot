@@ -1187,17 +1187,17 @@ def _apply_pipe_effects(
 
 # ---------- IHTX TagScript workflow ----------
 
-def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str, str] | None:
+def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str] | None:
     """Parse TagScript-style IHTX custom syntax.
 
     Syntax:
-      <exports> <duration_expr> <no_trim> <export_file_format> <output_file_format> <pipe effects>
+      <exports> <duration_expr> <no_trim> <export_file_format> <pipe effects>
 
     Example:
-      10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7
+      10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7
     """
     parts = shlex.split(args)
-    if len(parts) <= 5:
+    if len(parts) <= 4:
         return None
     try:
         exports = int(parts[0])
@@ -1208,11 +1208,23 @@ def _parse_ihtx_custom_args(args: str) -> tuple[int, str, str, str, str, str] | 
     duration_expr = parts[1]
     no_trim = parts[2]
     export_format = parts[3].lstrip(".") or "mp4"
-    output_format = parts[4].lstrip(".") or "default"
-    pipe_effects = " ".join(parts[5:]).strip()
+    pipe_effects = " ".join(parts[4:]).strip()
     if not pipe_effects:
         return None
-    return exports, duration_expr, no_trim, export_format, output_format, pipe_effects
+    return exports, duration_expr, no_trim, export_format, pipe_effects
+
+
+def _pipe_effects_label(pipe_str: str) -> str:
+    """Extract just the effect names from a pipe effects string for display."""
+    names = []
+    for part in pipe_str.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        name = part.split("=")[0].split()[0].lower()
+        if name:
+            names.append(name)
+    return ",".join(names) or pipe_str[:40]
 
 
 def _safe_awk_duration(duration_expr: str, vidlen: float) -> tuple[bool, str]:
@@ -1265,20 +1277,18 @@ def _run_ihtx_tagscript_workflow(
     duration_expr: str,
     no_trim: str,
     export_format: str,
-    output_format: str,
     pipe_effects_str: str,
 ) -> tuple[bool, str]:
     """Run custom IHTX using the TagScript-style shell workflow with pipe effects.
 
     Pipe effects are applied sequentially to each export.
+    Output is always mp4.
     """
     if abs(exports) > MAX_REPETITIONS:
         exports = MAX_REPETITIONS if exports > 0 else -MAX_REPETITIONS
 
     if not re.fullmatch(r"[A-Za-z0-9]+", export_format):
         return False, "Export file format must be alphanumeric (example: mp4)."
-    if output_format != "default" and not re.fullmatch(r"[A-Za-z0-9]+", output_format):
-        return False, "Output file format must be alphanumeric or `default`."
 
     effects = _parse_pipe_effects(pipe_effects_str)
     if not effects:
@@ -1292,8 +1302,7 @@ def _run_ihtx_tagscript_workflow(
         return False, dur_or_error
     dur = dur_or_error
 
-    in_ext = Path(input_path).suffix.lower().lstrip(".") or "mp4"
-    extension = in_ext if output_format == "default" else output_format.lower().lstrip(".")
+    extension = "mp4"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         base = os.path.join(tmpdir, "0.mp4")
@@ -1349,7 +1358,7 @@ def _run_ihtx_tagscript_workflow(
             "-f", "concat", "-safe", "0", "-i", concat_list,
         ]
         concat_cmd.extend(_concat_codec_args(extension))
-        concat_cmd.extend(["-movflags", "+faststart", final_output])
+        concat_cmd.extend(["-f", "mp4", "-movflags", "+faststart", final_output])
         ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
         if not ok:
             return False, f"Concat failed: {err}"
@@ -2022,7 +2031,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
     Usage:
       t!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
-      t!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>   — custom TagScript workflow
+      t!ihtx <exports> <duration> <no_trim> <export_fmt> <pipe effects>   — custom TagScript workflow
     """
     # Parse arguments: preset name or TagScript-style custom icf+ workflow.
     parts = args.split()
@@ -2037,8 +2046,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
         await ctx.reply(
             f"Unknown preset or invalid custom IHTX syntax. Available presets: {preset_list}\n"
-            f"Custom syntax: `t!ihtx <exports> <duration> <no_trim> <export_fmt> <output_fmt> <pipe effects>`\n"
-            f"Example: `t!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
+            f"Custom syntax: `t!ihtx <exports> <duration> <no_trim> <export_fmt> <pipe effects>`\n"
+            f"Example: `t!ihtx 10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`\n"
             f"Use `t!ihtxhelp` for full usage."
         )
         return
@@ -2062,13 +2071,13 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             f"**I HATE THE X — IHTX Bot**\n"
             f"Attach a video or image and use `t!ihtx [preset]` or the custom IHTX syntax.\n\n"
             f"**Presets:** {preset_list}\n\n"
-            f"**Custom IHTX:** `t!ihtx 10 0.483 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`\n"
+            f"**Custom IHTX:** `t!ihtx 10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`\n"
             f"Use `t!ihtxhelp` for full usage.\n\n"
             f"Examples:\n"
             f"`t!ihtx chaos`\n"
             f"`t!ihtx glitch`\n"
-            f"`t!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=25|5|8.5`\n"
-            f"`t!ihtx 5 0.25 - mp4 default multipitch=1|2|3|4`"
+            f"`t!ihtx 10 0.5 - mp4 huehsv 0.5;negate;multipitch=25|5|8.5`\n"
+            f"`t!ihtx 5 0.25 - mp4 multipitch=1|2|3|4`"
         )
         return
 
@@ -2084,9 +2093,16 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
     is_video = suffix in VIDEO_EXTENSIONS
     out_ext = get_output_ext(suffix, is_video)
 
-    status_msg = await ctx.reply(
-        f"⚙️ Applying **{'preset: ' + preset if is_preset else 'custom IHTX TagScript workflow'}**... this may take a moment."
-    )
+    # Build status label
+    if is_preset:
+        _status_label = f"`{preset}`"
+    else:
+        _tmp_effects_label = _pipe_effects_label(custom_args[4])
+        _tmp_reps = custom_args[0]
+        _reps_str = f"×{_tmp_reps}" if abs(_tmp_reps) > 1 else ""
+        _status_label = f"`{_tmp_effects_label}`{_reps_str}"
+
+    status_msg = await ctx.reply(f"⏳ Processing {_status_label}…")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, f"input{suffix}")
@@ -2109,13 +2125,12 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             if not is_video:
                 await status_msg.edit(content="❌ Custom IHTX workflow requires video input (not images/GIFs).")
                 return
-            exports, duration_expr, no_trim, export_format, output_format, pipe_effects = custom_args
-            output_ext = suffix if output_format == "default" else f".{output_format.lstrip('.')}"
-            output_path = os.path.join(tmpdir, f"output{output_ext}")
+            exports, duration_expr, no_trim, export_format, pipe_effects = custom_args
+            output_path = os.path.join(tmpdir, "output.mp4")
             ok, err = await loop.run_in_executor(
                 None, _run_ihtx_tagscript_workflow,
                 input_path, output_path, exports, duration_expr, no_trim,
-                export_format, output_format, pipe_effects
+                export_format, pipe_effects
             )
 
         if not ok:
@@ -2142,11 +2157,10 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
                 "duration": duration_expr,
                 "no_trim": no_trim,
                 "export_format": export_format,
-                "output_format": output_format,
                 "pipe_effects": pipe_effects,
                 "label": "custom",
             }
-            out_filename = f"ihtx_custom_{Path(attachment.filename).stem}{out_ext}"
+            out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mp4"
 
         try:
             embed = discord.Embed(
@@ -2590,6 +2604,116 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
             await status_msg.delete()
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
+# ---------- t!ffmpeg — raw FFmpeg command ----------
+
+@bot.hybrid_command(name="ffmpeg", description="Run FFmpeg with custom args on an attachment")
+@app_commands.describe(
+    args="FFmpeg args inserted between -i <input> and <output> (e.g. -vf negate -c:a copy)",
+    attachment="File to process",
+)
+async def ffmpeg_raw_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
+    """Run raw FFmpeg on an attached file.
+
+    Args go between -i <input> and <output>. Output filename matches input.
+
+    Usage:
+      t!ffmpeg -vf negate
+      t!ffmpeg -vf hue=h=180 -c:a copy
+      t!ffmpeg -af volume=2.0
+    """
+    if not args:
+        await ctx.reply(
+            "**t!ffmpeg** — Run raw FFmpeg on an attachment.\n"
+            "Args are inserted between `-i <input>` and `<output>`.\n\n"
+            "**Usage:** `t!ffmpeg <ffmpeg args>`\n"
+            "**Examples:**\n"
+            "`t!ffmpeg -vf negate`\n"
+            "`t!ffmpeg -vf hue=h=180 -c:a copy`\n"
+            "`t!ffmpeg -af volume=2.0`"
+        )
+        return
+
+    if attachment is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+            except Exception:
+                pass
+
+    if not attachment:
+        await ctx.reply("❌ Attach a file to use `t!ffmpeg`.")
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"❌ File too large (max 25 MB).")
+        return
+
+    args_display = args if len(args) <= 80 else args[:79] + "…"
+    status_msg = await ctx.reply(f"⏳ Processing `{args_display}`…")
+
+    start_time = time.time()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        suffix = Path(attachment.filename).suffix.lower()
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, attachment.filename)
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Download failed: {e}")
+            return
+
+        try:
+            user_args = shlex.split(args)
+        except ValueError as e:
+            await status_msg.edit(content=f"❌ Invalid ffmpeg args: {e}")
+            return
+
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+        ] + user_args + [output_path]
+
+        loop = asyncio.get_event_loop()
+        ok, err_log = await loop.run_in_executor(None, _run_ffmpeg_raw, cmd, 180)
+
+        elapsed = int(time.time() - start_time)
+
+        if not ok:
+            err_block = f"\n```\n{err_log.strip()[-1200:]}\n```" if err_log and err_log.strip() else ""
+            await status_msg.edit(content=f"❌ FFmpeg failed (took {elapsed}s){err_block}")
+            return
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            await status_msg.edit(content="❌ FFmpeg produced no output file.")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output too large for Discord (>25 MB).")
+            return
+
+        footer_parts = []
+        if err_log and err_log.strip():
+            footer_parts.append(f"-# Error log:\n```\n{err_log.strip()[-800:]}\n```")
+        footer_parts.append(f"-# Took: {elapsed} seconds")
+        footer = "\n".join(footer_parts)
+
+        try:
+            await ctx.reply(
+                content=footer,
+                file=discord.File(output_path, filename=attachment.filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Upload failed: {e}")
 
 
 # ---------- t!trim — precise media trimmer ----------
