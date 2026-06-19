@@ -1323,7 +1323,7 @@ def _run_ihtx_tagscript_workflow(
 
 # ---------- Multipitch (Rubber Band R3 pitch-shift pipeline) ----------
 
-MAX_PITCHES = 20
+MAX_PITCHES = 64
 
 
 def _run_multipitch_rb3(
@@ -1331,51 +1331,51 @@ def _run_multipitch_rb3(
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Run the multipitch pipeline using Rubber Band R3 pitch shifting + FFmpeg re-merge.
+    """Multi-voice pitch shift pipeline using Rubber Band R3 + FFmpeg.
 
     Pipeline:
-      1. ffmpeg: extract PCM WAV audio from input (vn strip)
-      2. For each semitone value:
-           rubberband -3 -p <semitones> base.wav pitched_N.wav
-      3. ffmpeg: mix all pitched WAVs via amix → mixed.wav
-      4. ffmpeg: remux mixed audio back with the original video stream (if present),
-                 or encode audio-only output when no video stream exists.
+      1. Extract PCM WAV audio from the input.
+      2. For each unique semitone value, pitch-shift a copy with rubberband R3.
+         0-semitone voices use the base WAV directly (no rubberband call).
+      3. Mix all voiced WAVs together; normalise with alimiter to prevent
+         clipping and loudnorm for consistent perceived volume.
+      4. Remux the mixed audio back over the original video stream (or emit
+         audio-only when the input has no video).
 
-    Accepts | and ; as pitch separators within each pitch_values entry.
+    Accepts ; | , or whitespace as pitch separators within each element.
     """
-    # Flatten: support both ; and | separators within entries
+    # ── 1. Flatten & parse pitch values ──────────────────────────────────────
     flattened: list[str] = []
     for pv in pitch_values:
-        if ";" in pv:
-            flattened.extend([v.strip() for v in pv.split(";") if v.strip()])
-        elif "|" in pv:
-            flattened.extend([v.strip() for v in pv.split("|") if v.strip()])
-        else:
-            s = pv.strip()
-            if s:
-                flattened.append(s)
-    pitch_values = flattened
+        flattened.extend(
+            v.strip()
+            for v in re.split(r"[;|,\s]+", pv)
+            if v.strip()
+        )
 
-    if not pitch_values:
-        return False, "No pitch values provided."
+    if not flattened:
+        return False, "❌ No pitch values specified."
 
-    if len(pitch_values) > MAX_PITCHES:
-        return False, f"Too many pitches (max {MAX_PITCHES}). Got {len(pitch_values)}."
+    if len(flattened) > MAX_PITCHES:
+        return False, f"❌ Too many pitch values (maximum: {MAX_PITCHES})."
 
-    # Validate: each must be a finite float
+    # Validate and deduplicate (preserve first-seen order)
     semitones: list[float] = []
-    for pv in pitch_values:
+    seen: set[float] = set()
+    for raw in flattened:
         try:
-            val = float(pv)
+            val = float(raw)
         except ValueError:
-            return False, f"Invalid pitch value: {pv!r} — must be a number (semitones)."
+            return False, f"❌ Invalid pitch value: {raw!r} — must be a number in semitones."
         if not math.isfinite(val):
-            return False, f"Pitch value must be finite, got: {pv!r}"
-        semitones.append(val)
+            return False, f"❌ Invalid pitch value: {raw!r} — must be finite."
+        if val not in seen:
+            seen.add(val)
+            semitones.append(val)
 
     n = len(semitones)
 
-    # Detect whether input has a video stream
+    # ── 2. Probe input ───────────────────────────────────────────────────────
     has_video = bool(_ffprobe(
         input_path,
         "-select_streams", "v:0",
@@ -1383,67 +1383,61 @@ def _run_multipitch_rb3(
         "-of", "default=nw=1:nk=1",
     ).strip())
 
-    # Hard duration cap: probe actual length, clamp to MAX_DURATION
     actual_dur = _ffprobe_duration(input_path)
     cap = str(int(min(actual_dur, MAX_DURATION)) + 1) if actual_dur > 0 else str(MAX_DURATION)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Step 1: Extract PCM WAV audio.
-        # -t is placed on the INPUT side (before -i) so FFmpeg stops reading
-        # from the source regardless of container metadata or stream-loop flags.
+        # ── 3. Extract base PCM WAV ──────────────────────────────────────────
         base_wav = os.path.join(tmpdir, "base.wav")
         ok, err = _run_ffmpeg_raw([
             "ffmpeg", "-y",
-            "-t", cap,          # input-side hard cap — stops reading the source
+            "-t", cap,
             "-i", input_path,
-            "-vn", "-ar", "44100",
-            "-t", cap,          # output-side belt-and-suspenders
+            "-vn", "-ar", "44100", "-ac", "2",
+            "-t", cap,
             base_wav,
         ], timeout=120)
         if not ok:
             return False, f"Audio extraction failed: {err}"
 
-        # Step 2: Rubber Band R3 pitch shift per voice
-        # -t 1 explicitly sets time ratio to 1.0 (preserve duration, change pitch only)
+        # ── 4. Pitch-shift each voice with Rubber Band R3 ────────────────────
+        # 0-semitone voice reuses the base WAV directly (no rubberband call).
+        # -t 1 locks time ratio = 1.0 (duration preserved, only pitch changes).
         pitched_wavs: list[str] = []
-        for i, st in enumerate(semitones):
-            out_wav = os.path.join(tmpdir, f"pitched_{i}.wav")
-            cmd = [
-                "rubberband", "-3",
-                "-t", "1",
-                "-p", str(st),
-                base_wav, out_wav,
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        for idx, st in enumerate(semitones):
+            if st == 0.0:
+                pitched_wavs.append(base_wav)
+                continue
+            out_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
+            cmd = ["rubberband", "-3", "-t", "1", "-p", str(st), base_wav, out_wav]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 return False, (
-                    f"Rubber Band R3 failed for voice {i + 1} "
-                    f"({st:+.2f} st): {result.stderr[-1000:]}"
+                    f"❌ Bungee processing failed for voice {idx + 1} "
+                    f"({st:+.2f} st): {result.stderr[-800:]}"
                 )
             pitched_wavs.append(out_wav)
 
-        # Step 3: Mix all pitched WAVs together.
-        # duration=shortest stops at the shortest input so rubberband tail
-        # artefacts never extend the output past the original length.
-        if n == 1:
-            mixed_wav = pitched_wavs[0]
-        else:
-            mixed_wav = os.path.join(tmpdir, "mixed.wav")
-            mix_cmd = ["ffmpeg", "-y"]
-            for wav in pitched_wavs:
-                mix_cmd.extend(["-i", wav])
-            mix_inputs = "".join(f"[{i}:a]" for i in range(n))
-            mix_cmd.extend([
-                "-filter_complex",
-                f"{mix_inputs}amix={n}:normalize=0:duration=shortest,highpass=7.5[a]",
-                "-map", "[a]",
-                mixed_wav,
-            ])
-            ok, err = _run_ffmpeg_raw(mix_cmd, timeout=180)
-            if not ok:
-                return False, f"Audio mix failed: {err}"
+        # ── 5. Mix all voices + normalise/limit ──────────────────────────────
+        mixed_wav = os.path.join(tmpdir, "mixed.wav")
+        mix_cmd = ["ffmpeg", "-y"]
+        for wav in pitched_wavs:
+            mix_cmd.extend(["-i", wav])
 
-        # Step 4: Remux with original video stream (preserved), or output audio-only
+        mix_inputs = "".join(f"[{i}:a]" for i in range(n))
+        # amix sums all voices (normalize=0 = no auto-divide)
+        # alimiter prevents clipping; loudnorm normalises perceived loudness
+        fc = (
+            f"{mix_inputs}amix={n}:normalize=0:duration=shortest,"
+            f"alimiter=limit=0.95:level=0,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11[a]"
+        )
+        mix_cmd.extend(["-filter_complex", fc, "-map", "[a]", mixed_wav])
+        ok, err = _run_ffmpeg_raw(mix_cmd, timeout=300)
+        if not ok:
+            return False, f"Audio mix failed: {err}"
+
+        # ── 6. Remux mixed audio with original video (or audio-only) ─────────
         if has_video:
             ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
@@ -1451,7 +1445,8 @@ def _run_multipitch_rb3(
                 "-i", mixed_wav,
                 "-map", "0:v",
                 "-map", "1:a",
-                "-c:v", "copy",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
                 output_path,
