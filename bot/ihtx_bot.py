@@ -2660,23 +2660,40 @@ async def trim_command(ctx: commands.Context, *, args: str = ""):
         start_str = str(t_start)
         end_str = str(t_end)
 
+        duration_str = str(t_end - t_start)
+        _audio_only_exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
+
         if suffix == ".gif":
-            # GIFs cannot be stream-copied; re-encode
+            # GIFs cannot be stream-copied; re-encode with palette
             cmd = [
                 "ffmpeg", "-y",
-                "-ss", start_str, "-to", end_str,
+                "-ss", start_str, "-t", duration_str,
                 "-i", input_path,
+                "-vf", "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                output_path,
+            ]
+        elif suffix in _audio_only_exts:
+            # Audio-only: input-side seek, stream copy
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", start_str,
+                "-i", input_path,
+                "-t", duration_str,
+                "-c", "copy",
                 output_path,
             ]
         else:
-            # Output-side seek for frame-accurate trim; stream copy = lossless + fast
+            # Video (mp4/mov/webm/mkv): input-side seek keeps file at a keyframe
+            # so the output is always decodable/viewable.
             cmd = [
                 "ffmpeg", "-y",
-                "-i", input_path,
                 "-ss", start_str,
-                "-to", end_str,
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
+                "-i", input_path,
+                "-t", duration_str,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
                 output_path,
             ]
 
@@ -2698,6 +2715,176 @@ async def trim_command(ctx: commands.Context, *, args: str = ""):
         try:
             await ctx.reply(
                 content=f"✅ Trimmed `{t_start}s` → `{t_end}s`",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as exc:
+            await status_msg.edit(content=f"❌ Failed to upload result: {exc}")
+
+
+# ---------- t!mirror — mirror presets via FFmpeg split/crop/flip/stack ----------
+
+# Each preset is (vf_filter, description)
+# Native FFmpeg: split the frame, crop each half, flip one, stack back.
+_MIRROR_PRESETS: dict[str, tuple[str, str]] = {
+    "left": (
+        "split[a][b];[a]crop=iw/2:ih:0:0[L];[b]crop=iw/2:ih:0:0,hflip[R];[L][R]hstack",
+        "left half mirrored onto right",
+    ),
+    "right": (
+        "split[a][b];[a]crop=iw/2:ih:iw/2:0,hflip[L];[b]crop=iw/2:ih:iw/2:0[R];[L][R]hstack",
+        "right half mirrored onto left",
+    ),
+    "top": (
+        "split[a][b];[a]crop=iw:ih/2:0:0[T];[b]crop=iw:ih/2:0:0,vflip[B];[T][B]vstack",
+        "top half mirrored onto bottom",
+    ),
+    "bottom": (
+        "split[a][b];[a]crop=iw:ih/2:0:ih/2,vflip[T];[b]crop=iw:ih/2:0:ih/2[B];[T][B]vstack",
+        "bottom half mirrored onto top",
+    ),
+}
+# Short aliases → canonical name
+_MIRROR_ALIASES: dict[str, str] = {"l": "left", "r": "right", "t": "top", "b": "bottom"}
+_MIRROR_SUPPORTED_EXTS = {
+    ".mp4", ".mov", ".webm", ".mkv", ".gif",
+    ".png", ".jpg", ".jpeg", ".webp",
+}
+
+
+@bot.command(name="mirror", description="Mirror media using FFmpeg split/flip/stack")
+async def mirror_command(ctx: commands.Context, preset: str = "", *, args: str = ""):
+    """Mirror media along an axis.
+
+    Usage:
+      t!mirror <preset>
+      Presets: left (l), right (r), top (t), bottom (b)
+
+    Examples:
+      t!mirror left
+      t!mirror r
+      t!mirror top
+
+    Media from: attachment, replied-to message, or a URL in the preset/args.
+    """
+    # Resolve preset name (allow short aliases)
+    preset_key = preset.strip().lower()
+    preset_key = _MIRROR_ALIASES.get(preset_key, preset_key)
+
+    # A URL might have been passed in the preset slot; re-route it
+    media_url: str | None = None
+    if preset.startswith(("http://", "https://")):
+        media_url = preset
+        preset_key = args.split()[0].lower() if args.strip() else ""
+        preset_key = _MIRROR_ALIASES.get(preset_key, preset_key)
+
+    if preset_key not in _MIRROR_PRESETS:
+        preset_list = ", ".join(f"`{k}`" for k in _MIRROR_PRESETS)
+        await ctx.reply(f"❌ Available presets: {preset_list}")
+        return
+
+    vf, description = _MIRROR_PRESETS[preset_key]
+
+    # Scan args for a URL if not already found
+    if media_url is None:
+        for tok in args.split():
+            if tok.startswith(("http://", "https://")):
+                media_url = tok
+                break
+
+    # Resolve media: attachment > reply > URL arg
+    attachment: discord.Attachment | None = None
+    if media_url is None:
+        if ctx.message and ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+        elif ctx.message and ctx.message.reference:
+            try:
+                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                if ref.attachments:
+                    attachment = ref.attachments[0]
+                else:
+                    for tok in ref.content.split():
+                        if tok.startswith(("http://", "https://")):
+                            media_url = tok
+                            break
+            except Exception:
+                pass
+
+    if attachment is None and media_url is None:
+        await ctx.reply("❌ No media found. Attach, reply to, or provide media.")
+        return
+
+    src_name = attachment.filename if attachment else urllib.parse.urlparse(media_url).path
+    suffix = Path(src_name).suffix.lower()
+    if not suffix:
+        suffix = ".mp4"
+    if suffix not in _MIRROR_SUPPORTED_EXTS:
+        await ctx.reply(
+            f"❌ Unsupported format `{suffix}`.\n"
+            f"Supported: {', '.join(sorted(_MIRROR_SUPPORTED_EXTS))}"
+        )
+        return
+
+    status_msg = await ctx.reply(f"🪞 Applying `mirror={preset_key}` ({description})…")
+
+    _image_exts = {".png", ".jpg", ".jpeg", ".webp"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+
+        try:
+            if attachment:
+                await download_attachment(attachment, input_path)
+            else:
+                await download_url(media_url, input_path)
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Failed to download media: {exc}")
+            return
+
+        out_suffix = suffix if suffix != ".webp" else ".png"
+        output_path = os.path.join(tmpdir, f"mirror_{preset_key}{out_suffix}")
+
+        loop = asyncio.get_event_loop()
+
+        if suffix == ".gif":
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", f"{vf},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                output_path,
+            ]
+        elif suffix in _image_exts:
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", vf,
+                output_path,
+            ]
+        else:
+            # Video: re-encode with libx264 so output is always viewable
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", f"{vf},format=yuv420p",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+
+        ok, err = await loop.run_in_executor(None, lambda: _run_ffmpeg_raw(cmd, 180))
+        if not ok:
+            await status_msg.edit(content=f"❌ FFmpeg failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB).")
+            return
+
+        stem = Path(src_name).stem
+        out_filename = f"mirror_{preset_key}_{stem}{out_suffix}"
+
+        try:
+            await ctx.reply(
+                content=f"✅ `mirror={preset_key}` — {description}",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
