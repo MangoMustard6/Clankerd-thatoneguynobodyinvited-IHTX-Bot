@@ -1325,24 +1325,51 @@ def _run_ihtx_tagscript_workflow(
 
 MAX_PITCHES = 64
 
+# Path to the Signalsmith multi-pitch binary (downloaded at startup)
+_MULTIPITCH_BIN = os.path.join(os.path.dirname(__file__), "fileaa")
+_MULTIPITCH_URL = "https://file.garden/aTXso15ukD3mnuPI/multipitch"
+
+
+def _ensure_multipitch_bin() -> bool:
+    """Download the multipitch binary if it isn't already present and executable.
+    Returns True if the binary is ready, False on failure.
+    """
+    if os.path.isfile(_MULTIPITCH_BIN) and os.access(_MULTIPITCH_BIN, os.X_OK):
+        return True
+    try:
+        import urllib.request
+        tmp = _MULTIPITCH_BIN + ".tmp"
+        req = urllib.request.Request(
+            _MULTIPITCH_URL,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            with open(tmp, "wb") as f:
+                f.write(resp.read())
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, _MULTIPITCH_BIN)
+        print(f"[multipitch] binary downloaded → {_MULTIPITCH_BIN}")
+        return True
+    except Exception as exc:
+        print(f"[multipitch] binary download failed: {exc}")
+        return False
+
 
 def _run_multipitch_rb3(
     input_path: str,
     output_path: str,
     pitch_values: list[str],
 ) -> tuple[bool, str]:
-    """Multi-voice pitch shift pipeline using Rubber Band R3 + FFmpeg.
+    """Multi-voice pitch shift using the Signalsmith fileaa binary + FFmpeg.
 
     Pipeline:
-      1. Extract PCM WAV audio from the input.
-      2. For each unique semitone value, pitch-shift a copy with rubberband R3.
-         0-semitone voices use the base WAV directly (no rubberband call).
-      3. Mix all voiced WAVs together; normalise with alimiter to prevent
-         clipping and loudnorm for consistent perceived volume.
-      4. Remux the mixed audio back over the original video stream (or emit
-         audio-only when the input has no video).
+      1. Validate & deduplicate semitone values.
+      2. Extract 16-bit PCM WAV audio from the input.
+      3. Run fileaa with all pitches as a comma-separated list (single call).
+      4. Remux the output WAV back over the original video stream, or emit
+         audio-only when the input has no video.
 
-    Accepts ; | , or whitespace as pitch separators within each element.
+    Accepts ; | , or whitespace as pitch separators.
     """
     # ── 1. Flatten & parse pitch values ──────────────────────────────────────
     flattened: list[str] = []
@@ -1359,7 +1386,6 @@ def _run_multipitch_rb3(
     if len(flattened) > MAX_PITCHES:
         return False, f"❌ Too many pitch values (maximum: {MAX_PITCHES})."
 
-    # Validate and deduplicate (preserve first-seen order)
     semitones: list[float] = []
     seen: set[float] = set()
     for raw in flattened:
@@ -1373,9 +1399,11 @@ def _run_multipitch_rb3(
             seen.add(val)
             semitones.append(val)
 
-    n = len(semitones)
+    # ── 2. Ensure binary is available ────────────────────────────────────────
+    if not _ensure_multipitch_bin():
+        return False, "❌ Multipitch binary unavailable — download failed."
 
-    # ── 2. Probe input ───────────────────────────────────────────────────────
+    # ── 3. Probe input ───────────────────────────────────────────────────────
     has_video = bool(_ffprobe(
         input_path,
         "-select_streams", "v:0",
@@ -1387,74 +1415,52 @@ def _run_multipitch_rb3(
     cap = str(int(min(actual_dur, MAX_DURATION)) + 1) if actual_dur > 0 else str(MAX_DURATION)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # ── 3. Extract base PCM WAV ──────────────────────────────────────────
+        # ── 4. Extract 16-bit PCM WAV (required by fileaa) ───────────────────
         base_wav = os.path.join(tmpdir, "base.wav")
         ok, err = _run_ffmpeg_raw([
             "ffmpeg", "-y",
             "-t", cap,
             "-i", input_path,
             "-vn", "-ar", "44100", "-ac", "2",
+            "-c:a", "pcm_s16le",
             "-t", cap,
             base_wav,
         ], timeout=120)
         if not ok:
             return False, f"Audio extraction failed: {err}"
 
-        # ── 4. Pitch-shift each voice with Rubber Band R3 ────────────────────
-        # 0-semitone voice reuses the base WAV directly (no rubberband call).
-        # -t 1 locks time ratio = 1.0 (duration preserved, only pitch changes).
-        pitched_wavs: list[str] = []
-        for idx, st in enumerate(semitones):
-            if st == 0.0:
-                pitched_wavs.append(base_wav)
-                continue
-            out_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
-            cmd = ["rubberband", "-3", "-t", "1", "-p", str(st), base_wav, out_wav]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                return False, (
-                    f"❌ Bungee processing failed for voice {idx + 1} "
-                    f"({st:+.2f} st): {result.stderr[-800:]}"
-                )
-            pitched_wavs.append(out_wav)
-
-        # ── 5. Mix all voices + normalise/limit ──────────────────────────────
-        mixed_wav = os.path.join(tmpdir, "mixed.wav")
-        mix_cmd = ["ffmpeg", "-y"]
-        for wav in pitched_wavs:
-            mix_cmd.extend(["-i", wav])
-
-        mix_inputs = "".join(f"[{i}:a]" for i in range(n))
-        # amix sums all voices (normalize=0 = no auto-divide)
-        # alimiter prevents clipping; loudnorm normalises perceived loudness
-        fc = (
-            f"{mix_inputs}amix={n}:normalize=0:duration=shortest,"
-            f"alimiter=limit=0.95:level=0,"
-            f"loudnorm=I=-14:TP=-1.5:LRA=11[a]"
+        # ── 5. Run fileaa (all pitches in one call, comma-separated) ─────────
+        pitch_arg = ",".join(
+            str(int(s)) if s == int(s) else str(s)
+            for s in semitones
         )
-        mix_cmd.extend(["-filter_complex", fc, "-map", "[a]", mixed_wav])
-        ok, err = _run_ffmpeg_raw(mix_cmd, timeout=300)
-        if not ok:
-            return False, f"Audio mix failed: {err}"
+        out_wav = os.path.join(tmpdir, "pitched.wav")
+        result = subprocess.run(
+            [_MULTIPITCH_BIN, base_wav, out_wav, pitch_arg],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            return False, f"❌ Multipitch processing failed: {result.stderr[-800:]}"
 
-        # ── 6. Remux mixed audio with original video (or audio-only) ─────────
+        # ── 6. Remux pitched audio with original video (or audio-only) ───────
         if has_video:
             ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
                 "-t", cap, "-i", input_path,
-                "-i", mixed_wav,
+                "-i", out_wav,
                 "-map", "0:v",
                 "-map", "1:a",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "ultrafast", "-qp", "1",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k",
+                "-t", cap,
                 "-shortest",
                 output_path,
             ], timeout=300)
         else:
             ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
-                "-i", mixed_wav,
+                "-i", out_wav,
                 "-c:a", "aac", "-b:a", "192k",
                 output_path,
             ], timeout=180)
@@ -1930,6 +1936,9 @@ async def on_ready():
         await bot.change_presence(activity=_default_activity)
     if not _process_pending_resets.is_running():
         _process_pending_resets.start()
+    # Pre-download multipitch binary in the background so first use is instant
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _ensure_multipitch_bin)
     # Load tag system cog (once)
     if "Tags" not in bot.cogs:
         try:
