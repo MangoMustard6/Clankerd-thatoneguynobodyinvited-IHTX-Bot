@@ -729,7 +729,7 @@ PIPE_EFFECT_NAMES = {
     "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
     "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
-    "syncaudio",
+    "syncaudio", "speed",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -829,20 +829,16 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
     if name == "swapuv":
         return "swapuv"
     if name == "mirror":
-        angle = params[0] if params else "0"
-        a_val = float(angle)
-        mirror_geq = "p(W*0.5-abs(X-W*0.5),Y)"
-        if a_val == 0:
-            return f"format=yuv444p,geq='{mirror_geq}',format=yuv420p"
-        a_plus_90 = a_val + 90
-        return (
-            f"format=yuv444p,"
-            f"rotate={a_plus_90}/180*PI:iw*2:ih*2,"
-            f"geq='{mirror_geq}',"
-            f"rotate=-{a_plus_90}/180*PI,"
-            f"crop=iw/2:ih/2,"
-            f"format=yuv420p"
-        )
+        preset = (params[0] if params else "left").lower().strip()
+        _mirror_aliases = {"l": "left", "r": "right", "t": "top", "b": "bottom"}
+        preset = _mirror_aliases.get(preset, preset)
+        _mirror_vf = {
+            "left":   "split[_ma][_mb];[_ma]crop=iw/2:ih:0:0[_mL];[_mb]crop=iw/2:ih:0:0,hflip[_mR];[_mL][_mR]hstack",
+            "right":  "split[_ma][_mb];[_ma]crop=iw/2:ih:iw/2:0,hflip[_mL];[_mb]crop=iw/2:ih:iw/2:0[_mR];[_mL][_mR]hstack",
+            "top":    "split[_ma][_mb];[_ma]crop=iw:ih/2:0:0[_mT];[_mb]crop=iw:ih/2:0:0,vflip[_mB];[_mT][_mB]vstack",
+            "bottom": "split[_ma][_mb];[_ma]crop=iw:ih/2:0:ih/2,vflip[_mT];[_mb]crop=iw:ih/2:0:ih/2[_mB];[_mT][_mB]vstack",
+        }
+        return _mirror_vf.get(preset, _mirror_vf["left"])
     if name == "zoom":
         amount = params[0] if params else "1.1"
         zoom_geq = f"p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})"
@@ -1082,6 +1078,33 @@ def _apply_pipe_effects(
                     current = out
                 continue
 
+            # Speed: change playback rate (video setpts + audio atempo chain)
+            if name == "speed":
+                try:
+                    spd = float(params[0]) if params else 1.0
+                except (ValueError, IndexError):
+                    spd = 1.0
+                spd = max(0.01, min(spd, 100.0))
+                # video: setpts = 1/speed * PTS
+                vf_speed = f"setpts={1.0/spd:.6f}*PTS"
+                # audio: chain atempo filters to stay in FFmpeg's 0.5-100 range
+                af_speed = _build_atempo_chain(spd)
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-vf", vf_speed,
+                    "-af", af_speed,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"speed failed: {err}"
+                current = out
+                continue
+
             # Named audio filters — rendered immediately
             if name in ("volume", "vibrato", "areverse"):
                 af = _build_ffmpeg_pipe_vf(name, params)
@@ -1089,7 +1112,7 @@ def _apply_pipe_effects(
                     cmd = [
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                         "-i", current, "-af", af,
-                        "-c:v", "copy", "-c:a", "pcm_s16le", out,
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out,
                     ]
                     ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                     if not ok:
