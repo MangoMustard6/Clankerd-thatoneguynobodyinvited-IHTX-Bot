@@ -3479,6 +3479,67 @@ async def help_command(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
+# ---------- Update Log ----------
+
+_UPDATELOG: list[dict] = [
+    {
+        "version": "v1.6",
+        "date": "2026-06-19",
+        "heavy": [
+            "**t!ihtx** — pipe parser now uses commas as delimiters: `huehsv,negate,speed=1.5`",
+            "**t!ihtx** — new `ffmpeg(...)` pipe step: pass raw FFmpeg args mid-chain e.g. `ffmpeg(-vf hue=h=50)`",
+            "**t!ihtx** — processing status message now shows effect name + repeat count while running",
+            "**t!ffmpeg** — new standalone command: run any FFmpeg args on an attachment; shows error log + elapsed time",
+            "**t!ihtx** — output is always `.mp4`; `-f mp4` added to concat step; output_format param removed from custom syntax",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
+        "version": "v1.5",
+        "date": "2026-06-18",
+        "heavy": [
+            "**t!ihtx** — parametric angle-based `mirror=<deg>` effect added (keeps left/right/top/bottom presets)",
+            "**t!multipitch** — rubberband CLI fallback added for R3 engine",
+            "**t!multipitch** — fixed speed bug in remux step (`-c:v copy` instead of libx264) to preserve timestamps",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+]
+
+@bot.hybrid_command(name="updatelog", aliases=["updates", "changelog"], description="Show recent bot updates by category")
+async def updatelog_command(ctx: commands.Context):
+    """Show recent bot updates organized by category."""
+    for entry in _UPDATELOG:
+        embed = discord.Embed(
+            title=f"📋 Update Log — {entry['version']}",
+            color=discord.Color.og_blurple(),
+        )
+        embed.set_footer(text=entry["date"])
+
+        if entry.get("heavy"):
+            embed.add_field(
+                name="⚙️ Heavy Commands",
+                value="\n".join(f"• {line}" for line in entry["heavy"]),
+                inline=False,
+            )
+        if entry.get("fun"):
+            embed.add_field(
+                name="🎉 Fun",
+                value="\n".join(f"• {line}" for line in entry["fun"]),
+                inline=False,
+            )
+        if entry.get("owner"):
+            embed.add_field(
+                name="🔒 Owner",
+                value="\n".join(f"• {line}" for line in entry["owner"]),
+                inline=False,
+            )
+
+        await ctx.send(embed=embed)
+
+
 # ---------- Last Export Grab ----------
 
 # Track the last IHTX export for each user so they can re-run with t!lexg
