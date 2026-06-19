@@ -738,14 +738,18 @@ PIPE_EFFECT_NAMES = {
 }
 
 def _split_effect_params(value: str) -> list[str]:
-    """Split effect parameters using the separators users commonly type."""
-    return [p.strip() for p in re.split(r"[;,|\s]+", value.strip()) if p.strip()]
+    """Split effect parameters using the separators users commonly type.
+
+    Commas are intentionally excluded — commas are now the top-level effect
+    delimiter, so param values are separated by spaces, pipes, or semicolons.
+    """
+    return [p.strip() for p in re.split(r"[;|\s]+", value.strip()) if p.strip()]
 
 
 def _split_pipe_segments(pipe_str: str) -> list[str]:
-    """Split pipe_str on ';' while respecting parentheses.
+    """Split pipe_str on ',' while respecting parentheses.
 
-    Semicolons inside ``ffmpeg(...)`` or any other ``name(...)`` block are
+    Commas inside ``ffmpeg(...)`` or any other ``name(...)`` block are
     treated as part of the args, not as segment delimiters.
     """
     segments: list[str] = []
@@ -758,7 +762,7 @@ def _split_pipe_segments(pipe_str: str) -> list[str]:
         elif ch == ")":
             depth -= 1
             current.append(ch)
-        elif ch == ";" and depth == 0:
+        elif ch == "," and depth == 0:
             seg = "".join(current).strip()
             if seg:
                 segments.append(seg)
