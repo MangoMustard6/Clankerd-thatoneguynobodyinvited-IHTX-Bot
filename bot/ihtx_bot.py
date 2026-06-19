@@ -434,6 +434,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="t!", intents=intents)
 
+# Maps user message id → list of bot reply message ids.
+# Used to delete old responses when the user edits their command.
+_response_map: dict[int, list[int]] = {}
+_RESPONSE_MAP_MAX = 2000  # cap to prevent unbounded growth
+
 # Runtime stats
 _bot_start_time: float = time.time()
 _renders_completed: int = 0
@@ -4464,6 +4469,16 @@ async def random_command(ctx: commands.Context, subcommand: str = "", *, args: s
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Track bot replies so on_message_edit can clean them up
+    if message.author == bot.user and message.reference and message.reference.message_id:
+        user_id = message.reference.message_id
+        _response_map.setdefault(user_id, []).append(message.id)
+        # Trim the map if it gets too large (drop oldest entries)
+        if len(_response_map) > _RESPONSE_MAP_MAX:
+            oldest = next(iter(_response_map))
+            del _response_map[oldest]
+        return
+
     if message.author.bot:
         return
 
@@ -4541,6 +4556,34 @@ async def on_message(message: discord.Message):
             return
 
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """Re-run a command when the user edits their message.
+
+    Deletes all bot replies that were made in response to the original message,
+    then re-processes the edited message as a fresh command invocation.
+    """
+    if after.author.bot:
+        return
+    # Only re-run if the content actually changed and it's a bot command
+    if before.content == after.content:
+        return
+    if not after.content.startswith("t!"):
+        return
+
+    # Delete previous bot responses to this message
+    old_ids = _response_map.pop(before.id, [])
+    for msg_id in old_ids:
+        try:
+            old_msg = await after.channel.fetch_message(msg_id)
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    # Re-process as a fresh command invocation
+    await bot.process_commands(after)
 
 
 # ---------- Image-to-video (fal.ai HappyHorse) ----------
