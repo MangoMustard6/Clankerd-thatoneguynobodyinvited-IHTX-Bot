@@ -734,12 +734,41 @@ PIPE_EFFECT_NAMES = {
     "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
     "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
-    "syncaudio", "speed",
+    "syncaudio", "speed", "ffmpeg",
 }
 
 def _split_effect_params(value: str) -> list[str]:
     """Split effect parameters using the separators users commonly type."""
     return [p.strip() for p in re.split(r"[;,|\s]+", value.strip()) if p.strip()]
+
+
+def _split_pipe_segments(pipe_str: str) -> list[str]:
+    """Split pipe_str on ';' while respecting parentheses.
+
+    Semicolons inside ``ffmpeg(...)`` or any other ``name(...)`` block are
+    treated as part of the args, not as segment delimiters.
+    """
+    segments: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in pipe_str:
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == ";" and depth == 0:
+            seg = "".join(current).strip()
+            if seg:
+                segments.append(seg)
+            current = []
+        else:
+            current.append(ch)
+    seg = "".join(current).strip()
+    if seg:
+        segments.append(seg)
+    return segments
 
 
 def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
@@ -749,6 +778,9 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
     ``name=value`` or ``name value``. Parameters can be separated with spaces,
     commas, semicolons, or pipes, so forms like ``swirl=1`` or
     ``lut=https://example.com/lut.cube`` both work.
+
+    ``ffmpeg(...)`` is a special effect whose content is passed verbatim as raw
+    FFmpeg args; semicolons inside the parens do *not* act as delimiters.
     """
     # VIDEO: <vf_filter> AUDIO: <af_filter> raw format — pass directly to FFmpeg
     if re.search(r'\b(VIDEO|AUDIO):', pipe_str, re.IGNORECASE):
@@ -769,12 +801,22 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
     current_name = None
     current_params: list[str] = []
 
-    for part in pipe_str.split(";"):
+    for part in _split_pipe_segments(pipe_str):
         part = part.strip()
         if not part:
             continue
         # Strip optional annotations like (magick)
         part = re.sub(r"\s*\(magick\)\s*", "", part, flags=re.IGNORECASE)
+
+        # ffmpeg(...) — raw FFmpeg args, captured verbatim
+        ffmpeg_m = re.match(r'^ffmpeg\s*\((.+)\)\s*$', part, re.IGNORECASE | re.DOTALL)
+        if ffmpeg_m:
+            if current_name is not None:
+                effects.append((current_name, current_params))
+                current_name = None
+                current_params = []
+            effects.append(("ffmpeg", [ffmpeg_m.group(1).strip()]))
+            continue
 
         if "=" in part:
             if current_name is not None:
@@ -1144,6 +1186,25 @@ def _apply_pipe_effects(
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
                     return False, f"speed failed: {err}"
+                current = out
+                continue
+
+            # ffmpeg(...) — raw FFmpeg args pipe step
+            if name == "ffmpeg":
+                raw_args = params[0] if params else ""
+                if not raw_args:
+                    return False, "ffmpeg() pipe step requires args inside the parentheses."
+                try:
+                    user_args = shlex.split(raw_args)
+                except ValueError as e:
+                    return False, f"ffmpeg() pipe step — invalid args: {e}"
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                ] + user_args + [out]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"ffmpeg() pipe step failed: {err}"
                 current = out
                 continue
 
