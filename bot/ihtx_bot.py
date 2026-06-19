@@ -834,16 +834,53 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
     if name == "swapuv":
         return "swapuv"
     if name == "mirror":
-        preset = (params[0] if params else "left").lower().strip()
+        first = (params[0] if params else "").lower().strip()
         _mirror_aliases = {"l": "left", "r": "right", "t": "top", "b": "bottom"}
-        preset = _mirror_aliases.get(preset, preset)
-        _mirror_vf = {
-            "left":   "split[_ma][_mb];[_ma]crop=iw/2:ih:0:0[_mL];[_mb]crop=iw/2:ih:0:0,hflip[_mR];[_mL][_mR]hstack",
-            "right":  "split[_ma][_mb];[_ma]crop=iw/2:ih:iw/2:0,hflip[_mL];[_mb]crop=iw/2:ih:iw/2:0[_mR];[_mL][_mR]hstack",
-            "top":    "split[_ma][_mb];[_ma]crop=iw:ih/2:0:0[_mT];[_mb]crop=iw:ih/2:0:0,vflip[_mB];[_mT][_mB]vstack",
-            "bottom": "split[_ma][_mb];[_ma]crop=iw:ih/2:0:ih/2,vflip[_mT];[_mb]crop=iw:ih/2:0:ih/2[_mB];[_mT][_mB]vstack",
-        }
-        return _mirror_vf.get(preset, _mirror_vf["left"])
+        first_resolved = _mirror_aliases.get(first, first)
+        _preset_names = {"left", "right", "top", "bottom"}
+        if first_resolved in _preset_names:
+            # Legacy preset mode: left / right / top / bottom
+            _mirror_vf = {
+                "left":   "split[_ma][_mb];[_ma]crop=iw/2:ih:0:0[_mL];[_mb]crop=iw/2:ih:0:0,hflip[_mR];[_mL][_mR]hstack",
+                "right":  "split[_ma][_mb];[_ma]crop=iw/2:ih:iw/2:0,hflip[_mL];[_mb]crop=iw/2:ih:iw/2:0[_mR];[_mL][_mR]hstack",
+                "top":    "split[_ma][_mb];[_ma]crop=iw:ih/2:0:0[_mT];[_mb]crop=iw:ih/2:0:0,vflip[_mB];[_mT][_mB]vstack",
+                "bottom": "split[_ma][_mb];[_ma]crop=iw:ih/2:0:ih/2,vflip[_mT];[_mb]crop=iw:ih/2:0:ih/2[_mB];[_mT][_mB]vstack",
+            }
+            return _mirror_vf.get(first_resolved, _mirror_vf["left"])
+        else:
+            # Parametric mode: mirror=angle[,cx,cy]
+            # Folds the image along a line through (cx,cy) at `angle` degrees.
+            # angle=90  → horizontal fold (default)
+            # angle=0   → vertical fold
+            # angle=45  → diagonal fold
+            try:
+                A = float(first) if first else 90.0
+            except ValueError:
+                A = 90.0
+            cx = float(params[1]) if len(params) > 1 else 0.5
+            cy = float(params[2]) if len(params) > 2 else 0.5
+            # In the 2x canvas (W=2·OW, H=2·OH) the fold line's Y position is:
+            #   fold_y = H/2 + (cx-0.5)*(W/2)*sin(A°) + (cy-0.5)*(H/2)*cos(A°)
+            a_rad = f"{A}/180*PI"
+            cx_off = cx - 0.5
+            cy_off = cy - 0.5
+            cx_term = (
+                f"+{cx_off:.6f}*(W/2)*sin({a_rad})" if cx_off >= 0
+                else f"{cx_off:.6f}*(W/2)*sin({a_rad})"
+            )
+            cy_term = (
+                f"+{cy_off:.6f}*(H/2)*cos({a_rad})" if cy_off >= 0
+                else f"{cy_off:.6f}*(H/2)*cos({a_rad})"
+            )
+            fold_y = f"H/2{cx_term}{cy_term}"
+            return (
+                f"rotate={A}/180*PI:iw*2:ih*2,"
+                f"geq='if(gte(Y,{fold_y}),p(X,2*({fold_y})-Y),p(X,Y))',"
+                f"format=yuv420p,"
+                f"rotate={A}/-180*PI,"
+                f"crop=iw/2:ih/2,"
+                f"format=yuv420p"
+            )
     if name == "zoom":
         amount = params[0] if params else "1.1"
         zoom_geq = f"p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})"
@@ -1440,7 +1477,33 @@ def _run_multipitch_rb3(
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
-            return False, f"❌ Multipitch processing failed: {result.stderr[-800:]}"
+            # ── Fallback: rubberband CLI — one pass per voice, then amix ─────
+            rb_bin = shutil.which("rubberband")
+            if not rb_bin:
+                return False, f"❌ Multipitch processing failed: {result.stderr[-800:]}"
+            voice_wavs: list[str] = []
+            for idx, st in enumerate(semitones):
+                v_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
+                pitch_flag = f"-p{st:+.4f}" if st != 0 else "-p+0.0"
+                rb_res = subprocess.run(
+                    [rb_bin, pitch_flag, "-t1", base_wav, v_wav],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if rb_res.returncode != 0:
+                    return False, f"❌ rubberband fallback failed (voice {idx}): {rb_res.stderr[-600:]}"
+                voice_wavs.append(v_wav)
+            # Mix all voices with FFmpeg amix
+            mix_cmd = ["ffmpeg", "-y"]
+            for vw in voice_wavs:
+                mix_cmd += ["-i", vw]
+            mix_cmd += [
+                "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+                "-c:a", "pcm_s16le",
+                out_wav,
+            ]
+            ok_mix, err_mix = _run_ffmpeg_raw(mix_cmd, timeout=180)
+            if not ok_mix:
+                return False, f"❌ amix failed: {err_mix}"
 
         # ── 6. Remux pitched audio with original video (or audio-only) ───────
         if has_video:
