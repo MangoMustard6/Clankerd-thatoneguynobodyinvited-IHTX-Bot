@@ -46,6 +46,19 @@ except ImportError:
     _genai_client = None
 
 try:
+    from openai import OpenAI as _OpenAI_lib
+    _openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+    if _openrouter_api_key:
+        _openrouter_client = _OpenAI_lib(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_openrouter_api_key,
+        )
+    else:
+        _openrouter_client = None
+except ImportError:
+    _openrouter_client = None
+
+try:
     import fal_client as _fal_client
 except ImportError:
     _fal_client = None
@@ -3726,7 +3739,7 @@ _HELP_ENTRIES: list[dict] = [
     {
         "cat": "fun",
         "name": "t!chat <prompt>  (aliases: ask, ai)",
-        "value": "Chat with the AI assistant. Attach images or videos too.",
+        "value": "Chat with the AI assistant. Uses OpenRouter (qwen3-coder) when configured, falls back to Gemini. Attach images or videos too.",
     },
     {
         "cat": "fun",
@@ -3940,6 +3953,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v2.1",
+        "date": "2026-06-20",
+        "heavy": [],
+        "fun": [
+            "**t!chat / t!ask** — now powered by OpenRouter (qwen/qwen3-coder:free) when `OPENROUTER_API_KEY` is set; falls back to Gemini automatically",
+            "**t!chat** — system prompt now includes dynamic prefix awareness and username/channel context",
+            "**t!ask** — confirmed alias of `t!chat` (unchanged behavior, new backend)",
+        ],
+        "owner": [],
+    },
     {
         "version": "v2.0",
         "date": "2026-06-20",
@@ -4937,49 +4961,99 @@ async def _build_gemini_parts(text: str, attachments) -> list[dict]:
 @app_commands.describe(message="Your message to the AI (optional if attaching media)")
 async def chat(ctx: commands.Context, *, message: str = ""):
     """Chat with the IHTX AI assistant. Attach images or videos and the bot will see them."""
-    if _genai_client is None:
-        await ctx.reply("❌ AI chat is unavailable (missing `google-genai` package).")
-        return
     if not message and not ctx.message.attachments:
         await ctx.reply("❌ Send a message or attach an image/video.")
         return
 
     user_id = ctx.author.id
+    username = ctx.author.display_name
+    channel_name = getattr(ctx.channel, "name", "DM")
+    prefix = ctx.prefix or "t!"
+
+    system = (
+        f"You are 'Clankered Thatoneguynobodyinvited', a highly advanced video editing AI bot which makes IHTXes (I Hate The Xs). "
+        f"You are currently chatting with {username} in #{channel_name}. "
+        f"Always maintain an elegant, polite, and deeply knowledgeable tone. Keep it low sometimes but still have proper grammar. "
+        f"Address the user by their name when appropriate. Refuse NSFW questions.\n\n"
+        f"When guiding users through commands, always use the active prefix '{prefix}' "
+        f"(e.g. {prefix}ihtx, {prefix}chat, {prefix}trim, {prefix}ffmpeg). Never assume a different prefix.\n\n"
+        f"Speak like a chill Gen Z friend. Use modern slang, meme culture references, and occasional AAVE-inspired internet terms naturally. "
+        f"Keep responses short, casual, and conversational. Match the user's energy. "
+        f"Use modern emojis naturally (😭🥹🙏🔥💔🥀🤝). Don't spam emojis in every sentence."
+    )
+    if _OWNER_PERSONAS.get(user_id):
+        system += "\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
+
     history = _chat_histories.setdefault(user_id, [])
 
-    system = _CHAT_SYSTEM_PROMPT
-    if _OWNER_PERSONAS.get(user_id):
-        system += f"\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
+    # ── OpenRouter (qwen3-coder) ──────────────────────────────────────────────
+    if _openrouter_client is not None:
+        # Ensure history is in OpenAI format; reset if it's Gemini-format
+        if history and "parts" in history[0]:
+            history.clear()
 
-    parts = await _build_gemini_parts(message, ctx.message.attachments)
-    history.append({"role": "user", "parts": parts})
-    if len(history) > _CHAT_MAX_HISTORY:
-        history[:] = history[-_CHAT_MAX_HISTORY:]
+        history.append({"role": "user", "content": message or "[media attached]"})
+        if len(history) > _CHAT_MAX_HISTORY:
+            history[:] = history[-_CHAT_MAX_HISTORY:]
 
-    async with ctx.typing():
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: _genai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=history,
-                    config=_genai_types.GenerateContentConfig(
-                        system_instruction=system,
-                        max_output_tokens=1024,
+        async with ctx.typing():
+            try:
+                loop = asyncio.get_event_loop()
+                completion = await loop.run_in_executor(
+                    None,
+                    lambda: _openrouter_client.chat.completions.create(
+                        model="qwen/qwen3-coder:free",
+                        messages=[{"role": "system", "content": system}] + history,
+                        max_tokens=1024,
+                        temperature=0.83,
                     ),
-                ),
-            )
-            reply_text = response.text
-        except Exception as e:
-            await ctx.reply(f"❌ AI error: {e}")
-            history.pop()
-            return
+                )
+                reply_text = completion.choices[0].message.content
+            except Exception as e:
+                await ctx.reply(f"❌ AI error: {e}")
+                history.pop()
+                return
 
-    # Strip inline_data from stored history to save memory — keep only text
-    text_only = [p for p in parts if "text" in p] or [{"text": "[media]"}]
-    history[-1] = {"role": "user", "parts": text_only}
-    history.append({"role": "model", "parts": [{"text": reply_text}]})
+        history.append({"role": "assistant", "content": reply_text})
+
+    # ── Gemini fallback ───────────────────────────────────────────────────────
+    elif _genai_client is not None:
+        # Ensure history is in Gemini format; reset if it's OpenAI-format
+        if history and "content" in history[0]:
+            history.clear()
+
+        parts = await _build_gemini_parts(message, ctx.message.attachments)
+        history.append({"role": "user", "parts": parts})
+        if len(history) > _CHAT_MAX_HISTORY:
+            history[:] = history[-_CHAT_MAX_HISTORY:]
+
+        async with ctx.typing():
+            try:
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: _genai_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=history,
+                        config=_genai_types.GenerateContentConfig(
+                            system_instruction=system,
+                            max_output_tokens=1024,
+                        ),
+                    ),
+                )
+                reply_text = response.text
+            except Exception as e:
+                await ctx.reply(f"❌ AI error: {e}")
+                history.pop()
+                return
+
+        text_only = [p for p in parts if "text" in p] or [{"text": "[media]"}]
+        history[-1] = {"role": "user", "parts": text_only}
+        history.append({"role": "model", "parts": [{"text": reply_text}]})
+
+    else:
+        await ctx.reply("❌ AI chat is unavailable — no API key configured (`OPENROUTER_API_KEY` or `GEMINI_API_KEY`).")
+        return
 
     if len(reply_text) > 1900:
         chunks = [reply_text[i:i+1900] for i in range(0, len(reply_text), 1900)]
