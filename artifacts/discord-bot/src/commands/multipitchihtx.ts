@@ -14,13 +14,16 @@ const USAGE = [
   '`repetitions=<n>` — auto-generate N evenly spaced pitch layers (default: 20)',
   '`spread=<n>` — total semitone range for auto mode, 0.01–999 (default: 0.4)',
   '',
+  '**Time stretch:**',
+  '`duration=<seconds>` — stretch/compress output to this length in seconds (optional)',
+  '',
   '**Engine & window:**',
   '`engine=<r2|r3|r4>` — Rubber Band engine (default: r3)',
   '`window=<long|short>` — window mode (default: long)',
   '',
   '**Examples:**',
   '`t!multipitchihtx pitches=0|-0.1|0.1|-0.2|0.2`',
-  '`t!multipitchihtx repetitions=10 spread=1.0 engine=r2`',
+  '`t!multipitchihtx repetitions=10 spread=1.0 duration=30 engine=r2`',
 ].join('\n');
 
 type Engine = 'r2' | 'r3' | 'r4';
@@ -28,6 +31,7 @@ type WindowMode = 'long' | 'short';
 
 interface Opts {
   pitches: number[] | null;
+  duration: number | null;
   repetitions: number;
   spread: number;
   engine: Engine;
@@ -47,7 +51,7 @@ function windowFlags(engine: Engine, window: WindowMode): string[] {
 }
 
 function parseArgs(args: string[]): Opts | string {
-  const opts: Opts = { pitches: null, repetitions: 20, spread: 0.4, engine: 'r3', window: 'long' };
+  const opts: Opts = { pitches: null, duration: null, repetitions: 20, spread: 0.4, engine: 'r3', window: 'long' };
 
   for (const arg of args) {
     const eqIdx = arg.indexOf('=');
@@ -62,6 +66,12 @@ function parseArgs(args: string[]): Opts | string {
         if (parts.some(isNaN)) return `❌ \`pitches\` contains a non-numeric value.`;
         if (parts.some((p) => Math.abs(p) > 9999)) return `❌ Pitch offsets must be between -9999 and 9999 semitones.`;
         opts.pitches = parts;
+        break;
+      }
+      case 'duration': {
+        const n = Number(val);
+        if (isNaN(n) || n <= 0 || n > 86400) return `❌ \`duration\` must be a positive number of seconds (max 86400).`;
+        opts.duration = n;
         break;
       }
       case 'repetitions': {
@@ -162,9 +172,10 @@ export async function handleMultipitchIHTX(
   const modeDesc = opts.pitches !== null
     ? `pitches: ${offsets.map((p) => p.toFixed(3)).join(', ')}`
     : `${layerCount} layers, spread ${opts.spread} semitones`;
+  const durationDesc = opts.duration !== null ? `, duration: ${opts.duration}s` : '';
 
   const status = await message.reply(
-    `⏳ Processing **${layerCount}** pitch layer${layerCount !== 1 ? 's' : ''}… (engine: ${opts.engine}, window: ${opts.window}, ${modeDesc})`,
+    `⏳ Processing **${layerCount}** pitch layer${layerCount !== 1 ? 's' : ''}… (engine: ${opts.engine}, window: ${opts.window}, ${modeDesc}${durationDesc})`,
   );
 
   const tmpDir = makeTempDir('multi');
@@ -200,11 +211,11 @@ export async function handleMultipitchIHTX(
       const layerPath = path.join(tmpDir, `layer_${i}.wav`);
       const pitchSemitones = offsets[i].toFixed(6);
 
-      const rbResult = await spawnAsync(
-        'rubberband',
-        [engineFlag, ...winFlags, '--pitch', pitchSemitones, inputAudio, layerPath],
-        { timeout: PROCESS_TIMEOUTS.RUBBERBAND_MS },
-      );
+      const rbArgs = [engineFlag, ...winFlags];
+      if (opts.duration !== null) rbArgs.push('--duration', String(opts.duration));
+      rbArgs.push('--pitch', pitchSemitones, inputAudio, layerPath);
+
+      const rbResult = await spawnAsync('rubberband', rbArgs, { timeout: PROCESS_TIMEOUTS.RUBBERBAND_MS });
 
       if (rbResult.code !== 0) {
         await status.edit(
@@ -259,9 +270,10 @@ export async function handleMultipitchIHTX(
       return;
     }
 
+    const durSuffix = opts.duration !== null ? `, ${opts.duration}s` : '';
     const summary = opts.pitches !== null
-      ? `pitches: ${offsets.map((p) => (p >= 0 ? '+' : '') + p.toFixed(3)).join(', ')}`
-      : `${layerCount} layers, ${opts.spread} semitone spread`;
+      ? `pitches: ${offsets.map((p) => (p >= 0 ? '+' : '') + p.toFixed(3)).join(', ')}${durSuffix}`
+      : `${layerCount} layers, ${opts.spread} semitone spread${durSuffix}`;
 
     await status.edit({
       content: `✅ Done! (${summary})`,
