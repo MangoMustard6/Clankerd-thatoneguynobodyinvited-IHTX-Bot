@@ -3376,107 +3376,218 @@ async def presets_command(ctx: commands.Context):
 
 @bot.hybrid_command(name="ihtxhelp", aliases=["bothelp"], description="Show IHTX Bot help and effect list")
 async def help_command(ctx: commands.Context):
-    embed = discord.Embed(
-        title="IHTX Bot — Help",
+    # ── 1. Heavy Commands ─────────────────────────────────────────────────
+    heavy = discord.Embed(
+        title="⚙️ Heavy Commands",
         color=discord.Color.dark_red(),
     )
-    embed.add_field(
+    heavy.add_field(
         name="t!ihtx [preset]",
-        value="Apply a preset effect to an attached video/image.\nDefault preset: `chaos`",
+        value=(
+            "Apply a preset to an attached video/image. Default preset: `chaos`\n"
+            "Other presets: `glitch`, `melt`, `chaos2`, `vhs`, …  — run `t!presets` for the full list."
+        ),
         inline=False,
     )
-    embed.add_field(
-        name="t!ihtx effect=value,effect=value [rep] [dur]",
-        value="Chain custom effects. Params use `=`, sub-params use `;`.\n"
-              "Example: `t!ihtx 10 0.5 - mp4 default huehsv 0.5;negate;multipitch=1|6|7`",
+    heavy.add_field(
+        name="t!ihtx <reps> <dur> <noTrim> <fmt> <effects>",
+        value=(
+            "Custom effect chain (comma-delimited). Each effect can have `=` params.\n"
+            "**Example:** `t!ihtx 10 0.483 - mp4 huehsv=0.5,negate,multipitch=25|5|8.5`\n"
+            "**ffmpeg pipe step:** `t!ihtx 1 10 false mp4 ffmpeg(-vf hue=h=50),speed=1.5`"
+        ),
         inline=False,
     )
-    embed.add_field(
+    heavy.add_field(
+        name="Pipe effects (comma-separated)",
+        value=(
+            "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
+            "`huehsv=<val>` `ccshue=<val>` `brightness=<val>` `contrast=<val>` "
+            "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
+            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `swirl=angle;r;cx;cy` `pinch&punch=str;r;cx;cy`\n"
+            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `areverse` `syncaudio`\n"
+            "**Raw:** `ffmpeg(<args>)` `lut=<url>` `speed=<factor>`"
+        ),
+        inline=False,
+    )
+    heavy.add_field(
+        name="t!ffmpeg <args>",
+        value=(
+            "Run raw FFmpeg on an attachment. Args go between `-i input` and `output`.\n"
+            "Example: `t!ffmpeg -vf negate` · `t!ffmpeg -af volume=2.0`\n"
+            "Shows `-# Error log:` + `-# Took: N seconds` footer."
+        ),
+        inline=False,
+    )
+    heavy.add_field(
+        name="t!multipitch <semitones>  (aliases: mp, multi)",
+        value=(
+            "Multi-voice pitch shift via Rubber Band R3.\n"
+            "Pipe-separated semitones: `t!multipitch 25|5|8.5`\n"
+            "Or use inline: `t!ihtx 1 10 false mp4 multipitch=25|5|8.5`"
+        ),
+        inline=False,
+    )
+    heavy.add_field(
         name="t!preview1280 [start] [dur]",
-        value="12-segment TV-simulator montage.\nDefaults: start=1.85, dur=0.85",
+        value="12-segment TV-simulator montage. Defaults: start=1.85, dur=0.85",
         inline=False,
     )
-    embed.add_field(
-        name="t!multipitch <pitches>  (aliases: mp, multi)",
-        value="Multi-voice pitch shift via SoX pitch.\n"
-              "Pipe-separated semitones: `t!multipitch 25|5|8.5`\n"
-              "Can also be chained: `t!ihtx huehsv 0.5;negate;multipitch=25|5|8.5`",
+    heavy.add_field(
+        name="t!invlum [n]",
+        value="Apply luma-inversion progressively N times and concat all iterations.",
         inline=False,
     )
-    embed.add_field(
-        name="t!presets",
-        value="List all available effect presets.",
+    heavy.add_field(
+        name="t!lexg  (aliases: lastexportgrab)",
+        value="Re-apply the last `t!ihtx` export to a new attachment using the same effect chain.",
         inline=False,
     )
-    # Effect reference
-    video_effects = (
-        "hflip, vflip, negate (invert alias), invlum, invertrgb=r;g;b, grayscale, sepia, "
-        "rotate=<deg>, huehsv=<val> (magick-style), ccshue=<val> (FFmpeg hue=h=), "
-        "brightness=<val>, contrast=<val>, saturation=<val 0-1>, swapuv, gm4, realgm4"
-    )
-    distortion_effects = (
-        "pinch&punch|p&p=strength;radius;cx;cy, swirl=angle;radius;cx;cy;fallout;lockaspectratio, "
-        "zoom=<amount>, mirror=<degrees>, gm91deform"
-    )
-    audio_effects = "multipitch=<semitones> (pipe-sep: 25|5|8.5), volume=<val>, vibrato=freq;depth, areverse, syncaudio[=alt]"
-    lut_effects = "lut=<url>, invlum, ffmpeg(<raw args>)"
+    heavy.set_footer(text=f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB")
 
-    embed.add_field(
-        name="t!huehsv <hue>",
-        value="Apply hue shift via ImageMagick haldclut.\n"
-              "Example: `t!huehsv 0.5`\n"
-              "Aliases: `t!hhsv`",
+    # ── 2. Fun ────────────────────────────────────────────────────────────
+    fun = discord.Embed(
+        title="🎉 Fun",
+        color=discord.Color.blurple(),
+    )
+    fun.add_field(
+        name="t!huehsv <hue>  (aliases: hhsv)",
+        value="Apply hue shift via ImageMagick haldclut. Example: `t!huehsv 0.5`",
         inline=False,
     )
-    embed.add_field(name="Video Effects", value=video_effects, inline=False)
-    embed.add_field(name="Distortion", value=distortion_effects, inline=False)
-    embed.add_field(name="Audio", value=audio_effects, inline=False)
-    embed.add_field(
-        name="t!syncaudio [alt]",
-        value="Sync video & audio durations by adjusting playback speed.\n"
-              "Default: video speed → match audio. `alt`: audio speed → match video.\n"
-              "Aliases: `t!sa`, `t!sync`",
+    fun.add_field(
+        name="t!mirror <left|right|top|bottom|deg>",
+        value="Mirror media using FFmpeg split/flip/stack. Also works as a pipe effect.",
         inline=False,
     )
-    embed.add_field(
-        name="t!lexg",
-        value="Re-apply the last IHTX export with the same effect chain.\n"
-              "Aliases: `t!lastexportgrab`",
+    fun.add_field(
+        name="t!syncaudio [alt]  (aliases: sa, sync)",
+        value=(
+            "Sync video and audio durations by adjusting playback speed.\n"
+            "Default: speeds up video to match audio. `alt`: speeds up audio to match video."
+        ),
         inline=False,
     )
-    embed.add_field(name="LUT/Raw", value=lut_effects, inline=False)
-    embed.add_field(
-        name="Owner moderation",
-        value="`t!keywordblock <keyword> [channel]` blocks a keyword only in that channel.\n"
-              "`t!keywordblockremove <keyword> [channel]` removes that channel keyword block.",
+    fun.add_field(
+        name="t!trim <start> <end>",
+        value="Precisely trim audio, video, or GIF. Supports HH:MM:SS.frac and plain seconds.",
         inline=False,
     )
-
-    embed.add_field(
-        name="Supported formats",
-        value=", ".join(sorted(SUPPORTED_EXTENSIONS)),
+    fun.add_field(
+        name="t!dl <url>  (aliases: dv, download, dlv)",
+        value="Download a video or image from a URL and upload it to Discord.",
         inline=False,
     )
-    embed.add_field(
-        name="Max file size",
-        value=f"{MAX_FILE_SIZE // (1024*1024)} MB",
-        inline=False,
-    )
-    embed.add_field(
-        name="t!img2vid [duration] <prompt>  (aliases: i2v)",
-        value="Generate a video from a text prompt (+ optional image attachment) using Sora.\n"
-              "Model auto-selected: `sora-2` (default), `sora-2-pro` (cinematic), `sora-image-1` (image+fast).\n"
-              "Example: `t!img2vid 5 a cyberpunk city at night`",
-        inline=False,
-    )
-    embed.add_field(
+    fun.add_field(
         name="t!catbox  (aliases: cb, upload)",
-        value="Upload an attached file (or replied-to attachment) to catbox.moe and return a direct link.\n"
-              "Supports any file type up to 200 MB.",
+        value="Upload any file (up to 200 MB) to catbox.moe and get a permanent direct link.",
         inline=False,
     )
-    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
-    await ctx.reply(embed=embed)
+    fun.add_field(
+        name="t!chat <prompt>  (aliases: ask, ai)",
+        value="Chat with the AI assistant. Attach images or videos too.",
+        inline=False,
+    )
+    fun.add_field(
+        name="t!img2vid [duration] <prompt>  (aliases: i2v)",
+        value=(
+            "Generate a video from a prompt (+ optional image) via Sora.\n"
+            "Example: `t!img2vid 5 a cyberpunk city at night`"
+        ),
+        inline=False,
+    )
+    fun.add_field(
+        name="t!tag <name> [args]  (aliases: tags)",
+        value=(
+            "Invoke a custom tag. Run `t!tag help` for the full tag scripting reference.\n"
+            "Supports variables, math, conditionals, embed JSON, iscript, mediascript, and IHTX."
+        ),
+        inline=False,
+    )
+    fun.add_field(
+        name="t!presets",
+        value="List all available IHTX presets.",
+        inline=False,
+    )
+    fun.add_field(
+        name="t!updatelog  (aliases: updates, changelog)",
+        value="Show recent bot updates organized by category.",
+        inline=False,
+    )
+
+    # ── 3. Owner ──────────────────────────────────────────────────────────
+    owner = discord.Embed(
+        title="🔒 Owner",
+        color=discord.Color.dark_grey(),
+    )
+    owner.add_field(
+        name="t!blockuser / t!unblockuser <@user>",
+        value="Add or remove a user from the global blocklist.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!blockchannel / t!unblockchannel <#channel>",
+        value="Block or unblock a channel from running bot commands.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!keywordblock <keyword> [#channel]",
+        value="Block a keyword in a specific channel (or globally). `t!keywordblockremove` to undo.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!autoreply <trigger> | <response> [#channel]",
+        value="Add an autoreply. Supports `{mention}` / `{user}` / `{random:a|b|c}` placeholders.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!removeautoreply <trigger>  (aliases: rar)",
+        value="Remove an autoreply trigger.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!autoreplies  (aliases: arlist)",
+        value="List all active autoreplies.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!autoreply2 [#channel]  / t!autoreply2list",
+        value="Toggle AI auto-reply (responds to every message) in a channel.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!warn @user <reason>  /  t!warnings @user  /  t!clearwarn @user",
+        value="Warn, view, or clear warnings for a user.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!say / t!sayembed <content>",
+        value="Send a plain message or embed as the bot.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!setactivity <type> <text>  (aliases: activity, presence)",
+        value="Change the bot's activity status. Types: playing, watching, listening, streaming.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!setlimit @user <n>  /  t!usage",
+        value="Set per-user heavy command limit. `t!usage` checks your current count.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!listservers  /  t!listchannels <guild_id>",
+        value="List all guilds the bot is in, or all channels in a specific guild.",
+        inline=False,
+    )
+    owner.add_field(
+        name="t!sendmsg <channel_id> <message>  (aliases: msgsend)",
+        value="Send a message to any channel by ID.",
+        inline=False,
+    )
+    owner.set_footer(text="All owner commands are restricted to the configured owner ID(s).")
+
+    await ctx.reply(embeds=[heavy, fun, owner])
 
 
 # ---------- Update Log ----------

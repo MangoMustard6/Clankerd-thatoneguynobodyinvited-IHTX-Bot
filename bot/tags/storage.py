@@ -101,6 +101,7 @@ class TagStorage:
             if not is_owner and tag["owner_id"] != editor_id:
                 return "not_owner"
             tag["content"] = content
+            tag["edited_at"] = datetime.now(timezone.utc).isoformat()
             await self._flush()
             return "ok"
 

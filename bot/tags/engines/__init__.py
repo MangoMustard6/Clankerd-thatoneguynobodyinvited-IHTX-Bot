@@ -10,10 +10,11 @@ from __future__ import annotations
 
 
 class EngineResult:
-    __slots__ = ("text", "files", "error")
+    __slots__ = ("text", "embed", "files", "error")
 
-    def __init__(self, text: str = "", files=None, error: str = ""):
+    def __init__(self, text: str = "", embed=None, files=None, error: str = ""):
         self.text: str = text
+        self.embed = embed
         self.files: list = files or []
         self.error: str = error
 
@@ -41,11 +42,15 @@ from .attach import AttachEngine
 from .iscript import IScriptEngine
 from .mediascript import MediaScriptEngine
 from .pyscript import PyScriptEngine
+from .embedjson import EmbedJSONEngine
+from .ihtx_engine import IHTXEngine
 
 register(AttachEngine())
 register(IScriptEngine())
 register(MediaScriptEngine())
 register(PyScriptEngine())
+register(EmbedJSONEngine())
+register(IHTXEngine())
 
 __all__ = [
     "EngineResult",
@@ -56,4 +61,6 @@ __all__ = [
     "IScriptEngine",
     "MediaScriptEngine",
     "PyScriptEngine",
+    "EmbedJSONEngine",
+    "IHTXEngine",
 ]
