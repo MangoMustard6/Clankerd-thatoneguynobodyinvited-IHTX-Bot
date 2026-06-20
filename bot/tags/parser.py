@@ -7,9 +7,16 @@ Syntax:
                {upper:text}  {lower:text}  {title:text}  {reverse:text}
                {len:text}  {repeat:N|text}  {slice:s|e|text}
                {math:1+2}  {if:a|=|b|then:yes}
-  Engines    : {attach:URL}  {iscript:...}  {mediascript:...}
-               {embedjson:{...}}  {ihtx:reps dur noTrim fmt effects}  {py:...}
-               Engine blocks are stripped from text and returned separately.
+  Engines    : {attach:URL}  {text:…}  {eval:…}
+               {iscript:…}  {mediascript:…}  {py:…}  {bash:…}
+               {embedjson:{…}}  {ihtx:…}  {tagscript:…}
+
+Script prefix syntax (multiline):
+  tagscript:        tscript:
+  imagescript:      iscript:
+  mediascript:      mscript:
+  python:           py:
+  bash:             sh:
 """
 
 from __future__ import annotations
@@ -17,6 +24,48 @@ from __future__ import annotations
 import random
 import re
 from typing import Any
+
+# ── Script alias map ──────────────────────────────────────────────────────────
+# Maps any alias/prefix → canonical engine name used in the registry.
+SCRIPT_ALIASES: dict[str, str] = {
+    "tagscript":   "tagscript",
+    "tscript":     "tagscript",
+    "imagescript": "iscript",
+    "iscript":     "iscript",
+    "mediascript": "mediascript",
+    "mscript":     "mediascript",
+    "python":      "py",
+    "py":          "py",
+    "bash":        "bash",
+    "sh":          "bash",
+    # brace-syntax engines (kept for KNOWN_ENGINES)
+    "text":        "text",
+    "eval":        "eval",
+    "attach":      "attach",
+    "embedjson":   "embedjson",
+    "ihtx":        "ihtx",
+}
+
+# Human-readable display names for engine types
+ENGINE_DISPLAY_NAMES: dict[str, str] = {
+    "tagscript":   "TagScript",
+    "iscript":     "ImageScript",
+    "mediascript": "MediaScript",
+    "py":          "Python",
+    "bash":        "Bash",
+    "text":        "Text",
+    "eval":        "Eval",
+    "attach":      "Attach",
+    "embedjson":   "EmbedJSON",
+    "ihtx":        "IHTX",
+}
+
+# Execution order — lower index = runs first
+_ENGINE_ORDER: list[str] = [
+    "tagscript", "iscript", "mediascript", "py", "bash",
+    "text", "attach", "embedjson", "eval", "ihtx",
+]
+_ENGINE_PRIORITY: dict[str, int] = {name: i for i, name in enumerate(_ENGINE_ORDER)}
 
 # ── Regex patterns ────────────────────────────────────────────────────────────
 
@@ -28,22 +77,24 @@ _BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Script-prefix line: "enginealias:" alone on a line (trailing whitespace OK)
+_SCRIPT_PREFIX_LINE = re.compile(
+    r"^(" + "|".join(re.escape(k) for k in SCRIPT_ALIASES) + r"):\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Engines whose content may contain deeply nested braces (e.g. JSON objects).
 # These are extracted by a depth-counting pre-pass before the regex runs.
 _DEEP_ENGINES = ("embedjson", "eval")
 
 # All engine names — blocks with these names are dispatched to engines.
-KNOWN_ENGINES = frozenset({"attach", "iscript", "mediascript", "py", "embedjson", "ihtx", "text", "eval"})
+KNOWN_ENGINES = frozenset(SCRIPT_ALIASES.values())
 
 
 # ── Safe math ─────────────────────────────────────────────────────────────────
 
 class _MathParser:
-    """Recursive-descent math parser — no eval/exec used.
-
-    Supports: + - * / % ^ (power), unary minus, parentheses, integer and
-    floating-point literals.
-    """
+    """Recursive-descent math parser — no eval/exec used."""
 
     _TOK = re.compile(r"\d+\.?\d*|[+\-*/^%()\s]")
 
@@ -136,12 +187,7 @@ def _safe_math(expr: str) -> str:
 # ── Deep-block pre-pass ───────────────────────────────────────────────────────
 
 def _extract_deep_blocks(text: str) -> tuple[str, list[dict]]:
-    """Extract {engine:...} blocks whose content may contain nested braces.
-
-    Scans character-by-character counting brace depth so JSON objects inside
-    {embedjson:...} are captured correctly.
-    Returns (remaining_text, list_of_engine_block_dicts).
-    """
+    """Extract {engine:...} blocks whose content may contain nested braces."""
     engine_blocks: list[dict] = []
 
     for engine_name in _DEEP_ENGINES:
@@ -153,7 +199,6 @@ def _extract_deep_blocks(text: str) -> tuple[str, list[dict]]:
 
         while i < len(text):
             if text_lo[i:i + len(prefix_lo)] == prefix_lo:
-                # Found the opening — now count braces to find the real close
                 start_content = i + len(prefix)
                 depth = 1
                 j = start_content
@@ -167,7 +212,7 @@ def _extract_deep_blocks(text: str) -> tuple[str, list[dict]]:
                     content = text[start_content : j - 1].strip()
                     engine_blocks.append({"engine": engine_name, "content": content})
                     i = j
-                    text_lo = text.lower()  # keep in sync (no mutation actually needed)
+                    text_lo = text.lower()
                     continue
             result_chars.append(text[i])
             i += 1
@@ -177,12 +222,64 @@ def _extract_deep_blocks(text: str) -> tuple[str, list[dict]]:
     return text, engine_blocks
 
 
+# ── Script prefix block extractor ─────────────────────────────────────────────
+
+def _extract_script_blocks(text: str) -> tuple[str, list[dict]]:
+    """
+    Extract prefix-based multiline script blocks.
+
+    Recognises patterns like:
+        tagscript:
+        Hello {user}
+
+        iscript:
+        caption=hello
+
+    Returns (remaining_plain_text, list_of_engine_block_dicts).
+    The remaining_plain_text contains lines that weren't part of any engine block.
+    """
+    lines = text.splitlines(keepends=True)
+
+    # Quick bail-out — avoid work if no prefix line present
+    if not any(_SCRIPT_PREFIX_LINE.match(ln) for ln in lines):
+        return text, []
+
+    blocks: list[dict] = []
+    plain_lines: list[str] = []
+    current_engine: str | None = None
+    current_content: list[str] = []
+
+    def _flush():
+        nonlocal current_engine, current_content
+        if current_engine is not None:
+            canonical = SCRIPT_ALIASES[current_engine.lower()]
+            blocks.append({
+                "engine": canonical,
+                "content": "".join(current_content).strip(),
+                "_script_prefix": True,
+            })
+        elif current_content:
+            plain_lines.extend(current_content)
+        current_engine = None
+        current_content = []
+
+    for line in lines:
+        m = _SCRIPT_PREFIX_LINE.match(line)
+        if m:
+            _flush()
+            current_engine = m.group(1)
+        else:
+            current_content.append(line)
+
+    _flush()
+
+    return "".join(plain_lines), blocks
+
+
 # ── Variable resolution ───────────────────────────────────────────────────────
 
 def _resolve_var(key: str, ctx: dict) -> str:
     key = key.lower()
-
-    # args.N — 1-indexed word from args
     if key.startswith("args."):
         try:
             idx = int(key.split(".", 1)[1]) - 1
@@ -190,25 +287,20 @@ def _resolve_var(key: str, ctx: dict) -> str:
             return words[idx] if 0 <= idx < len(words) else ""
         except (ValueError, IndexError):
             return ""
-
     val = ctx.get(key)
     return str(val) if val is not None else ""
 
 
 def resolve_variables(text: str, ctx: dict) -> str:
-    """Replace {var} / {var.N} placeholders with context values."""
-
     def replacer(m: re.Match) -> str:
         result = _resolve_var(m.group(1), ctx)
         return result if result else m.group(0)
-
     return _VAR_RE.sub(replacer, text)
 
 
 # ── Block processing ──────────────────────────────────────────────────────────
 
 def _eval_if(content: str) -> str:
-    """Evaluate {if:a|op|b|then:result} conditional."""
     parts = content.split("|")
     if len(parts) < 4:
         return ""
@@ -217,13 +309,11 @@ def _eval_if(content: str) -> str:
     if not then_rest.startswith("then:"):
         return ""
     result_val = then_rest[5:]
-
     try:
         a_num, b_num = float(a), float(b)
         numeric = True
     except ValueError:
         numeric = False
-
     matched = False
     if op in ("=", "=="):
         matched = a == b
@@ -237,29 +327,28 @@ def _eval_if(content: str) -> str:
         matched = a_num >= b_num
     elif op == "<=" and numeric:
         matched = a_num <= b_num
-
     return result_val if matched else ""
 
 
 def _handle_block(name: str, content: str, engine_blocks: list) -> str:
-    name = name.lower()
+    name_lo = name.lower()
+    canonical = SCRIPT_ALIASES.get(name_lo)
 
-    # ── Engines ──
-    if name in KNOWN_ENGINES:
-        engine_blocks.append({"engine": name, "content": content.strip()})
+    # ── Engine dispatch ──
+    if canonical in KNOWN_ENGINES:
+        engine_blocks.append({"engine": canonical, "content": content.strip()})
         return ""
 
     # ── Conditionals ──
-    if name == "if":
+    if name_lo == "if":
         return _eval_if(content)
 
     # ── Math ──
-    if name == "math":
+    if name_lo == "math":
         return _safe_math(content)
 
     # ── Random ──
-    if name in ("random", "choose"):
-        # {random:min:max} — colon-separated numeric range
+    if name_lo in ("random", "choose"):
         if ":" in content and "|" not in content:
             halves = content.split(":", 1)
             try:
@@ -267,27 +356,21 @@ def _handle_block(name: str, content: str, engine_blocks: list) -> str:
                 return str(random.randint(min(lo, hi), max(lo, hi)))
             except ValueError:
                 pass
-        # {random:a|b|c} / {choose:a|b|c} — pipe-separated choices
         choices = [c.strip() for c in content.split("|") if c.strip()]
         return random.choice(choices) if choices else ""
 
     # ── Text functions ──
-    if name == "upper":
+    if name_lo == "upper":
         return content.upper()
-
-    if name == "lower":
+    if name_lo == "lower":
         return content.lower()
-
-    if name == "title":
+    if name_lo == "title":
         return content.title()
-
-    if name == "reverse":
+    if name_lo == "reverse":
         return content[::-1]
-
-    if name == "len":
+    if name_lo == "len":
         return str(len(content.strip()))
-
-    if name == "repeat":
+    if name_lo == "repeat":
         parts = content.split("|", 1)
         try:
             n = max(0, min(int(parts[0].strip()), 20))
@@ -295,9 +378,7 @@ def _handle_block(name: str, content: str, engine_blocks: list) -> str:
             return val * n
         except ValueError:
             return ""
-
-    if name == "slice":
-        # {slice:start|end|text}
+    if name_lo == "slice":
         parts = content.split("|", 2)
         if len(parts) == 3:
             try:
@@ -307,15 +388,11 @@ def _handle_block(name: str, content: str, engine_blocks: list) -> str:
                 pass
         return ""
 
-    # Unknown block — leave intact
+    # Unknown — leave intact
     return "{" + name + ":" + content + "}"
 
 
 def resolve_blocks(text: str, ctx: dict) -> tuple[str, list[dict]]:
-    """
-    Process function blocks and extract engine blocks.
-    Returns (processed_text, list_of_engine_block_dicts).
-    """
     engine_blocks: list[dict] = []
 
     def replacer(m: re.Match) -> str:
@@ -325,17 +402,52 @@ def resolve_blocks(text: str, ctx: dict) -> tuple[str, list[dict]]:
     return processed.strip(), engine_blocks
 
 
+# ── Execution ordering ────────────────────────────────────────────────────────
+
+def sort_engine_blocks(blocks: list[dict]) -> list[dict]:
+    """Sort engine blocks by canonical execution order."""
+    return sorted(blocks, key=lambda b: _ENGINE_PRIORITY.get(b.get("engine", ""), 99))
+
+
+# ── Tag content analysis (for t!tag info) ─────────────────────────────────────
+
+def detect_engines(content: str) -> list[str]:
+    """
+    Return a sorted list of canonical engine names present in tag content.
+    Checks both {engine:} brace syntax and prefix-based script blocks.
+    """
+    found: set[str] = set()
+
+    # Brace syntax: {engine:...}
+    for m in re.finditer(r"\{([a-z_][a-z0-9_]*):", content, re.IGNORECASE):
+        canonical = SCRIPT_ALIASES.get(m.group(1).lower())
+        if canonical:
+            found.add(canonical)
+
+    # Script prefix syntax: "engine:\n"
+    for m in _SCRIPT_PREFIX_LINE.finditer(content):
+        canonical = SCRIPT_ALIASES.get(m.group(1).lower())
+        if canonical:
+            found.add(canonical)
+
+    return [e for e in _ENGINE_ORDER if e in found]
+
+
 # ── Top-level ─────────────────────────────────────────────────────────────────
 
 def parse(content: str, ctx: dict) -> tuple[str, list[dict]]:
-    """Full TagScript parse: resolve variables, deep-engine pre-pass, then blocks."""
-    # 1. Variable substitution
-    text = resolve_variables(content, ctx)
-    # 2. Extract engines with potentially nested braces (e.g. embedjson)
+    """Full TagScript parse: script prefixes → variables → deep engines → blocks."""
+    # 1. Extract prefix-based script blocks (multiline engine: syntax)
+    text, script_blocks = _extract_script_blocks(content)
+    # 2. Variable substitution
+    text = resolve_variables(text, ctx)
+    # 3. Extract engines with potentially nested braces (e.g. embedjson)
     text, deep_blocks = _extract_deep_blocks(text)
-    # 3. Extract remaining function/engine blocks via regex
+    # 4. Extract remaining function/engine blocks via regex
     text, shallow_blocks = resolve_blocks(text, ctx)
-    return text, deep_blocks + shallow_blocks
+    # 5. Combine + sort all engine blocks by execution order
+    all_blocks = sort_engine_blocks(script_blocks + deep_blocks + shallow_blocks)
+    return text, all_blocks
 
 
 def build_context(discord_ctx, args: str) -> dict:
@@ -343,31 +455,24 @@ def build_context(discord_ctx, args: str) -> dict:
     user = discord_ctx.author
     guild = discord_ctx.guild
     channel = discord_ctx.channel
-
     args = args.strip()
-
     nick = None
     if hasattr(user, "nick"):
         nick = user.nick
     nickname = nick or user.display_name
-
     return {
-        # User
-        "user": user.display_name,
-        "username": user.name,
-        "userid": str(user.id),
-        "id": str(user.id),
-        "mention": user.mention,
-        "avatar": str(user.display_avatar.url),
-        "nickname": nickname,
-        "usertag": str(user),
-        # Server
-        "server": guild.name if guild else "DM",
-        "serverid": str(guild.id) if guild else "0",
-        # Channel
-        "channel": getattr(channel, "name", "DM"),
+        "user":      user.display_name,
+        "username":  user.name,
+        "userid":    str(user.id),
+        "id":        str(user.id),
+        "mention":   user.mention,
+        "avatar":    str(user.display_avatar.url),
+        "nickname":  nickname,
+        "usertag":   str(user),
+        "server":    guild.name if guild else "DM",
+        "serverid":  str(guild.id) if guild else "0",
+        "channel":   getattr(channel, "name", "DM"),
         "channelid": str(channel.id),
-        # Args
-        "args": args,
-        "argslen": str(len(args.split()) if args else 0),
+        "args":      args,
+        "argslen":   str(len(args.split()) if args else 0),
     }

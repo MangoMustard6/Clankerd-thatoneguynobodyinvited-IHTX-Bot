@@ -16,7 +16,7 @@ import discord
 from discord.ext import commands
 
 from .storage import TagStorage
-from .parser import parse, build_context
+from .parser import parse, build_context, detect_engines, ENGINE_DISPLAY_NAMES
 from . import engines
 
 log = logging.getLogger(__name__)
@@ -31,25 +31,18 @@ _RESERVED = frozenset({
     "raw", "transfer", "stats", "help", "rename", "perms",
 })
 
-# Tag content type detection patterns
-_TYPE_PATTERNS = {
-    "EmbedJSON":   re.compile(r"\{embedjson:", re.IGNORECASE),
-    "IHTX":        re.compile(r"\{ihtx:", re.IGNORECASE),
-    "Attach":      re.compile(r"\{attach:", re.IGNORECASE),
-    "IScript":     re.compile(r"\{iscript:", re.IGNORECASE),
-    "MediaScript": re.compile(r"\{mediascript:", re.IGNORECASE),
-}
-
 storage = TagStorage()
 
 
-def _detect_type(content: str) -> str:
-    found = [name for name, pat in _TYPE_PATTERNS.items() if pat.search(content)]
-    if not found:
-        return "Text"
-    if len(found) > 1:
-        return "Mixed"
-    return found[0]
+def _detect_type(content: str) -> tuple[str, list[str]]:
+    """Return (type_label, list_of_display_engine_names) for the tag content."""
+    engines_found = detect_engines(content)
+    names = [ENGINE_DISPLAY_NAMES.get(e, e.title()) for e in engines_found]
+    if not names:
+        return "Text", []
+    if len(names) == 1:
+        return "Script", names
+    return "Mixed Scripts", names
 
 
 def _is_bot_owner(bot: commands.Bot, user_id: int) -> bool:
@@ -258,13 +251,16 @@ class TagCog(commands.Cog, name="Tags"):
         created_str = _fmt_ts(tag.get("created_at", ""))
         edited_str = _fmt_ts(tag.get("edited_at", tag.get("created_at", "")))
 
-        tag_type = _detect_type(tag["content"])
+        tag_type, tag_engines = _detect_type(tag["content"])
         content_len = len(tag["content"])
 
         embed = discord.Embed(title=f"Tag: {tag['name']}", color=0x5865F2)
         embed.add_field(name="Owner", value=owner_str, inline=True)
         embed.add_field(name="Uses", value=str(tag.get("uses", 0)), inline=True)
         embed.add_field(name="Type", value=tag_type, inline=True)
+        if tag_engines:
+            eng_label = "Engine" if len(tag_engines) == 1 else "Engines"
+            embed.add_field(name=eng_label, value="\n".join(tag_engines), inline=True)
         embed.add_field(name="Created", value=created_str, inline=True)
         embed.add_field(name="Last Edited", value=edited_str, inline=True)
         embed.add_field(name="Content Length", value=f"{content_len} chars", inline=True)
@@ -581,6 +577,36 @@ class TagCog(commands.Cog, name="Tags"):
                 `{upper:text}` · `{lower:text}` · `{title:text}` · `{reverse:text}`
                 `{len:text}` · `{repeat:3|text}` · `{slice:0|5|text}`\
             """),
+            inline=False,
+        )
+        embed.add_field(
+            name="Script prefix syntax (multiline blocks)",
+            value=textwrap.dedent("""\
+                Start a line with `engine:` alone to open a script block.
+                Everything after it (until the next prefix) runs in that engine.
+                ```
+                tagscript:
+                Hello {user}, you rolled {random:1:100}!
+
+                iscript:
+                caption=hello
+
+                mediascript:
+                speed=2
+                ```
+                **Aliases:** `tagscript`/`tscript` · `imagescript`/`iscript` · `mediascript`/`mscript` · `python`/`py` · `bash`/`sh`
+                **Execution order:** TagScript → ImageScript → MediaScript → Python → Bash\
+            """),
+            inline=False,
+        )
+        embed.add_field(
+            name="{tagscript:…}  /  {tscript:…}",
+            value="Re-evaluate content as TagScript (variables, math, conditionals). Inline version of the `tagscript:` prefix block.",
+            inline=False,
+        )
+        embed.add_field(
+            name="{bash:…}  /  {sh:…}  *(owner only)*",
+            value="Run a shell command and return stdout. 5 s timeout, 4 000 char output limit.",
             inline=False,
         )
         embed.add_field(

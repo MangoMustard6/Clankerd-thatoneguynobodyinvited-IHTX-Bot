@@ -46,6 +46,8 @@ from .embedjson import EmbedJSONEngine
 from .ihtx_engine import IHTXEngine
 from .text_engine import TextEngine
 from .eval_engine import EvalEngine
+from .tagscript_engine import TagScriptEngine
+from .bash_engine import BashEngine
 
 register(AttachEngine())
 register(IScriptEngine())
@@ -55,6 +57,8 @@ register(EmbedJSONEngine())
 register(IHTXEngine())
 register(TextEngine())
 register(EvalEngine())
+register(TagScriptEngine())
+register(BashEngine())
 
 __all__ = [
     "EngineResult",
@@ -69,4 +73,6 @@ __all__ = [
     "IHTXEngine",
     "TextEngine",
     "EvalEngine",
+    "TagScriptEngine",
+    "BashEngine",
 ]
