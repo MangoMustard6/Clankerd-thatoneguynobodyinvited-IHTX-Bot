@@ -816,6 +816,7 @@ PIPE_EFFECT_NAMES = {
     "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse", "vreverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio", "speed", "ffmpeg", "frei0r",
+    "wave",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1318,6 +1319,62 @@ def _apply_pipe_effects(
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
                     return False, f"shake failed: {err}"
+                current = out
+                continue
+
+            # wave — sinusoidal pixel-displacement distortion
+            if name == "wave":
+                def _wp(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                h_speed   = _wp(0, 1.0)
+                h_freq    = _wp(1, 1.0)
+                h_amp     = _wp(2, 1.0)
+                h_phase   = _wp(3, 0.0)
+                v_speed   = _wp(4, 1.0)
+                v_freq    = _wp(5, 1.0)
+                v_amp     = _wp(6, 1.0)
+                v_phase   = _wp(7, 0.0)
+                sep       = len(params) > 8 and params[8].strip() in ("1", "true", "sep", "yes")
+                noclip    = len(params) > 9 and params[9].strip() in ("1", "true", "noclip", "yes")
+
+                drawbox = "drawbox=t=1," if noclip else ""
+                h_wave = (
+                    f"sin((T*5*{v_speed}+({v_phase}*15))+(Y/H)*(PI*{v_freq}))*(-15*{v_amp})"
+                )
+                v_wave = (
+                    f"sin((T*5*{h_speed}+({h_phase}*15))+(X/W)*(PI*{h_freq}))*(-15*{h_amp})"
+                )
+
+                def _wave_cmd(inp, op, x_expr, y_expr):
+                    vf_str = f"{drawbox}format=yuv444p,geq='p({x_expr},{y_expr})',format=yuv420p"
+                    return [
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", inp, "-vf", vf_str,
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", op,
+                    ]
+
+                if sep:
+                    mid = os.path.join(tmpdir, f"wave_mid_{i}.mp4")
+                    ok, err = _run_ffmpeg_raw(
+                        _wave_cmd(current, mid, f"X-({h_wave})", "Y"), timeout=180
+                    )
+                    if not ok:
+                        return False, f"wave (h pass) failed: {err}"
+                    ok, err = _run_ffmpeg_raw(
+                        _wave_cmd(mid, out, "X", f"Y-({v_wave})"), timeout=180
+                    )
+                    if not ok:
+                        return False, f"wave (v pass) failed: {err}"
+                else:
+                    ok, err = _run_ffmpeg_raw(
+                        _wave_cmd(current, out, f"X-({h_wave})", f"Y-({v_wave})"), timeout=180
+                    )
+                    if not ok:
+                        return False, f"wave failed: {err}"
                 current = out
                 continue
 
@@ -3532,7 +3589,7 @@ _HELP_ENTRIES: list[dict] = [
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
-            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>`\n"
+            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
@@ -3570,6 +3627,20 @@ _HELP_ENTRIES: list[dict] = [
             "Common plugins: `distort0r` `cartoon` `edgeglow` `pixelize` `plasma` `sobel` `threshold0r`\n"
             "Example: `t!ihtx 1 5 - mp4 frei0r=distort0r:0.5:0.1`\n"
             "Also available in tags: `{frei0r:distort0r:0.5}` or `frei0r:\\ndistort0r:0.5` prefix block"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "wave pipe effect  (wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip])",
+        "value": (
+            "Sinusoidal pixel-displacement wave distortion using geq. All params optional.\n"
+            "• **hSpd/hFreq/hAmp/hPhase** — horizontal wave speed, frequency, amplitude, phase (defaults: 1|1|1|0)\n"
+            "• **vSpd/vFreq/vAmp/vPhase** — vertical wave speed, frequency, amplitude, phase (defaults: 1|1|1|0)\n"
+            "• **sep** — apply H and V waves as separate passes (pass `1` to enable)\n"
+            "• **noclip** — draw a border box to prevent pixel clipping at edges (pass `1` to enable)\n"
+            "Example (default): `t!ihtx 3 1.0 - mp4 wave`\n"
+            "Example (custom): `t!ihtx 3 1.0 - mp4 wave=2|1|1.5|0|1|2|1|0`\n"
+            "Example (separate passes + noclip): `t!ihtx 3 1.0 - mp4 wave=1|1|1|0|1|1|1|0|1|1`"
         ),
     },
     {
@@ -3868,6 +3939,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v1.9",
+        "date": "2026-06-20",
+        "heavy": [
+            "**t!ihtx** — new `wave` pipe effect: sinusoidal pixel-displacement distortion with 8 params (hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase)",
+            "**t!ihtx wave** — optional `sep` flag runs H and V waves as separate passes; `noclip` draws border box to hide edge clipping",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v1.8",
         "date": "2026-06-20",
