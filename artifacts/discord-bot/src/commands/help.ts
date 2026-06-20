@@ -8,66 +8,189 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
   const maxReps = getMaxRepetitions(message.author.id, ownerId, guild);
   const uploadLimit = getUploadLimitBytes(guild);
   const boosted = guild && guild.premiumTier >= GuildPremiumTier.Tier1;
-  const boostBonus = boosted ? ` +${LIMITS.BOOST_BONUS} boost` : '';
+  const boostBonus = boosted ? ` +${LIMITS.BOOST_BONUS}` : '';
   const baseReps = isOwner ? LIMITS.OWNER_MAX_REPS : LIMITS.NON_OWNER_MAX_REPS;
 
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setAuthor({
-      name: isOwner ? `👑 ${message.author.displayName}` : message.author.displayName,
-      iconURL: message.author.displayAvatarURL(),
-    })
-    .setTitle('IHTX Bot — All Commands')
-    .setDescription(`Prefix: \`${PREFIX}\`  •  All commands start with \`t!\``)
-    .addFields(
-      {
-        name: '🎬 Media',
-        value: [
-          `\`${PREFIX}download <url>\` — Download a video via yt-dlp`,
-          `\`${PREFIX}multipitchihtx [opts]\` — Multi-voice pitch shifting on a video attachment`,
-        ].join('\n'),
-      },
-      {
-        name: '🎮 Games',
-        value: [
-          `\`${PREFIX}coinflip\` (alias: \`cf\`) — Flip a coin`,
-          `\`${PREFIX}dice [expr]\` (alias: \`roll\`) — Roll dice, e.g. \`2d6\`, \`d20\`, \`3d8+5\``,
-          `\`${PREFIX}rps <rock|paper|scissors>\` — Rock Paper Scissors vs bot`,
-          `\`${PREFIX}8ball <question>\` — Ask the Magic 8-Ball`,
-          `\`${PREFIX}slots\` — Spin the slot machine`,
-          `\`${PREFIX}roulette <red|black|green|0-36>\` — Place a roulette bet`,
-          `\`${PREFIX}choose <a | b | c>\` (alias: \`pick\`) — Pick a random option`,
-          `\`${PREFIX}trivia\` — Answer a random trivia question`,
-        ].join('\n'),
-      },
-      {
-        name: `\`${PREFIX}multipitchihtx\` options`,
-        value: [
-          '**Pitch mode (pick one):**',
-          '`pitches=0|-0.1|0.1|-0.2|0.2` — explicit semitone offsets, pipe-separated',
-          `\`repetitions=<n>\` — auto N evenly spaced layers (default: 20, **max: ${baseReps}${boostBonus ? ` — ${boostBonus}` : ''}**)`,
-          '`spread=<n>` — semitone range for auto mode, 0.01–999 (default: 0.4)',
-          '',
-          '**Engine:**',
-          '`engine=<r2|r3|r4>` — Rubber Band engine (default: r3)',
-          '`window=<long|short>` — window mode (default: long)',
-          '',
-          '**Examples:**',
-          `\`${PREFIX}multipitchihtx pitches=0|-0.2|0.2|-0.5|0.5\``,
-          `\`${PREFIX}multipitchihtx repetitions=10 spread=1.0 engine=r2\``,
-        ].join('\n'),
-      },
-      {
-        name: '📊 Your Limits',
-        value: [
-          `Role: **${isOwner ? '👑 Owner' : 'User'}**`,
-          `Server boost: **${boosted ? `Tier ${guild!.premiumTier} ✅` : 'None'}**`,
-          `Max repetitions: **${maxReps}**`,
-          `Max upload: **${formatBytes(uploadLimit)}**`,
-        ].join('\n'),
-      },
-    )
-    .setFooter({ text: 'IHTX Bot (TypeScript) • yt-dlp, ffmpeg, Rubber Band' });
+  const embeds: EmbedBuilder[] = [];
 
-  await message.reply({ embeds: [embed] });
+  // ── Page 1: Heavy Effects ─────────────────────────────────────────────────
+  embeds.push(
+    new EmbedBuilder()
+      .setColor(0xe74c3c)
+      .setAuthor({
+        name: isOwner ? `👑 ${message.author.displayName}` : message.author.displayName,
+        iconURL: message.author.displayAvatarURL(),
+      })
+      .setTitle('IHTX Bot — Commands  (1/3)')
+      .setDescription(`Prefix: \`${PREFIX}\`  •  \`t!\` for all commands`)
+      .addFields(
+        {
+          name: '🔥 Heavy Effects  *(slow/rate-limited)*',
+          value: [
+            '`t!ihtx [preset]` — Apply FFmpeg preset to attachment (chaos, glitch, melt, vhs, …)',
+            '`t!ihtx <reps> <dur> <noTrim> <fmt> <effects>` — Custom pipe chain: `huehsv=0.5,negate,speed=1.5`',
+            '`t!invlum [n]` *il* — Luma-inversion N times, all iterations concatenated',
+            '`t!preview1280 [start] [dur]` *p1280 pv1280* — 12-segment TV-simulator montage',
+            '`t!multipitch <semis>` *mp multi* — Multi-voice pitch shift (Rubber Band R3): `t!multipitch 25|5|8.5`',
+            '`t!ffmpeg <args>` — Raw FFmpeg args on attachment: `t!ffmpeg -vf negate`',
+            '`t!lexg` *lastexportgrab* — Re-apply last `t!ihtx` export to a new attachment',
+          ].join('\n'),
+        },
+        {
+          name: '🎞️ Pipe effects (comma-separated inside t!ihtx)',
+          value: [
+            '**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` `huehsv=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`',
+            '**Color:** `ccshue=hue|sat|gamma|gain|offset`  `brightness=<v>` `contrast=<v>` `saturation=<v>`',
+            '**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`',
+            '**Reverse:** `vreverse` (frames) · `areverse` (audio)',
+            '**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`',
+            '**Plugins:** `frei0r=plugin:params` `lut=<url>` `speed=<factor>` `ffmpeg(<args>)`',
+          ].join('\n'),
+        },
+        {
+          name: '🎬 Video Tools',
+          value: [
+            '`t!trim <start> <end>` — Trim audio/video/GIF (HH:MM:SS or seconds)',
+            '`t!mirror <left|right|top|bottom|deg>` — Mirror media via FFmpeg split/flip/stack',
+            '`t!huehsv <hue>` *hhsv* — Hue shift via ImageMagick haldclut',
+            '`t!syncaudio [alt]` *sa sync* — Sync video/audio durations by adjusting speed',
+          ].join('\n'),
+        },
+      )
+      .setFooter({ text: 'Page 1/3 — IHTX Bot • FFmpeg, Rubber Band, yt-dlp' }),
+  );
+
+  // ── Page 2: TypeScript commands + Download + Info ─────────────────────────
+  embeds.push(
+    new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('IHTX Bot — Commands  (2/3)')
+      .addFields(
+        {
+          name: '⬇️ Download',
+          value: [
+            '`t!dl <url>` *dv download dlv* — Download video/image from URL → Discord',
+            '`t!download <url>` — Same via yt-dlp (TypeScript bot)',
+            '`t!catbox` *cb upload* — Upload attachment to catbox.moe (200 MB, permanent link)',
+          ].join('\n'),
+        },
+        {
+          name: '🎛️ TypeScript: t!multipitchihtx',
+          value: [
+            `\`pitches=0|-0.1|0.1\` — explicit semitone offsets, pipe-separated`,
+            `\`repetitions=<n>\` — auto N evenly-spaced layers (default 20, max **${baseReps}${boostBonus}**)`,
+            `\`spread=<n>\` — semitone range for auto mode (default 0.4)`,
+            `\`duration=<sec>\` — stretch all layers to this length via rubberband --duration`,
+            `\`engine=<r2|r3|r4>\` · \`window=<long|short>\``,
+            `Example: \`${PREFIX}multipitchihtx repetitions=50 spread=1.5 engine=r3\``,
+            `Example: \`${PREFIX}multipitchihtx pitches=-0.5|0|0.5 duration=30\``,
+          ].join('\n'),
+        },
+        {
+          name: '🎮 Games  *(both bots)*',
+          value: [
+            '`t!coinflip` *flip coin cf* — Flip a coin',
+            '`t!dice [expr]` *roll d* — Dice: `d20`, `2d6`, `3d8+5`',
+            '`t!rps <rock|paper|scissors>` — Rock Paper Scissors vs bot',
+            '`t!8ball <question>` *eightball* — Magic 8-Ball',
+            '`t!slots` — Spin the slot machine',
+            '`t!roulette <red|black|0-36>` — Roulette bet',
+            '`t!choose <a | b | c>` *pick* — Pick a random option',
+            '`t!trivia` — Random trivia (button answer, 30 s)',
+            '`t!rate <thing>` — Rate something /10',
+          ].join('\n'),
+        },
+        {
+          name: '🤖 AI & Utility',
+          value: [
+            '`t!chat <prompt>` *ask ai* — Chat with AI (Gemini/Anthropic), supports image/video attachments',
+            '`t!clearchat` *resetai chatclear* — Clear your AI conversation history',
+            '`t!img2vid [dur] <prompt>` *i2v* — Generate video from prompt (Sora)',
+            '`t!imagevideo [dur] [url] <prompt>` *iv vidgen* — Image-to-video via fal',
+            '`t!video [dur] [res] [ar] <prompt>` *vid seedance* — Text-to-video generation',
+            '`t!random [sub]` *rand* — Random media from pool; `add`/`remove`/`list`/`clear` sub-commands',
+            '`t!tag <name> [args]` *tags* — Custom scripting tags (variables, math, conditionals, iscript, IHTX)',
+          ].join('\n'),
+        },
+        {
+          name: 'ℹ️ Info',
+          value: [
+            '`t!help` — This embed',
+            '`t!info` — Bot uptime, tool versions, your role',
+            '`t!presets` *effects list* — List all IHTX presets',
+            '`t!ihtxhelp [query]` *bothelp* — Full searchable Python bot help',
+            '`t!updatelog` *updates changelog* — Recent bot updates',
+            '`t!usage` *limit checklimit* — Check your heavy command usage',
+          ].join('\n'),
+        },
+        {
+          name: '📊 Your Limits',
+          value: [
+            `Role: **${isOwner ? '👑 Owner' : 'User'}** · Boost: **${boosted ? `Tier ${guild!.premiumTier} ✅` : 'None'}**`,
+            `Max repetitions: **${maxReps}** · Max upload: **${formatBytes(uploadLimit)}**`,
+          ].join('\n'),
+        },
+      )
+      .setFooter({ text: 'Page 2/3 — IHTX Bot' }),
+  );
+
+  // ── Page 3: Owner-only ────────────────────────────────────────────────────
+  embeds.push(
+    new EmbedBuilder()
+      .setColor(0xf1c40f)
+      .setTitle('IHTX Bot — Commands  (3/3) — 🔒 Owner Only')
+      .addFields(
+        {
+          name: '🚫 Blocking',
+          value: [
+            '`t!blockuser` / `t!unblockuser <@user>` — Global user blocklist',
+            '`t!blockchannel` / `t!unblockchannel` — Block channels from bot commands',
+            '`t!keywordblock <kw> [#ch]` *kb* — Block a keyword (channel or global)',
+            '`t!keywordblockremove <kw> [#ch]` *kbr* — Remove keyword block',
+            '`t!keywordblockmsg <kw> <msg>` *kbmsg* — Custom reply for keyword block',
+          ].join('\n'),
+        },
+        {
+          name: '📣 Messaging',
+          value: [
+            '`t!say <msg>` — Bot sends a message',
+            '`t!sayembed <content>` — Bot sends an embed',
+            '`t!sendmsg <channelId> <msg>` *msgsend* — Send to any channel by ID',
+          ].join('\n'),
+        },
+        {
+          name: '🔄 Autoreplies',
+          value: [
+            '`t!autoreply <trigger> [#ch] <response>` *ar* — Add autoreply trigger',
+            '`t!removeautoreply <trigger>` *rar deautoreply* — Remove autoreply',
+            '`t!blockarchannel <trigger> [#ch]` *bac silencear* — Silence autoreply in channel',
+            '`t!removearmentions <trigger>` *rarm* — Strip pings from autoreply',
+            '`t!autoreplies` *arlist listautoreplies* — List all autoreplies',
+            '`t!autoreply2` *ar2* — Toggle AI auto-reply for this channel',
+            '`t!autoreply2list` *ar2list* — List AI auto-reply channels',
+            '`t!removear2mentions <@user>` *rarm2* — Stop AI autoreply pinging a user',
+          ].join('\n'),
+        },
+        {
+          name: '⚠️ Moderation',
+          value: [
+            '`t!warn <@user> [reason]` — Warn a user',
+            '`t!warnings <@user>` *warncount warnlist* — View user warnings',
+            '`t!clearwarn <@user>` *unwarn clearwarnings* — Clear all warnings for user',
+          ].join('\n'),
+        },
+        {
+          name: '⚙️ Bot Admin',
+          value: [
+            '`t!setactivity <playing|watching|listening|streaming> <text>` *activity presence*',
+            '`t!listservers` *servers guilds* — List all servers bot is in',
+            '`t!listchannels <guildId>` *channels* — List channels in a server',
+            '`t!resetlimit <@user>` *rl resetusage* — Reset a user\'s heavy command usage',
+          ].join('\n'),
+        },
+      )
+      .setFooter({ text: 'Page 3/3 — IHTX Bot • Owner commands (Python bot)' }),
+  );
+
+  await message.reply({ embeds });
 }
