@@ -15,6 +15,14 @@ def main():
         print("Set it via Replit Secrets or your shell before running.", file=sys.stderr)
         sys.exit(1)
 
+    # Use uvloop for faster async I/O if available
+    try:
+        import uvloop
+        uvloop.install()
+        print("uvloop installed — using fast event loop.")
+    except ImportError:
+        print("uvloop not available, using default asyncio event loop.")
+
     # Import and run the bot module
     from bot import ihtx_bot
     ihtx_bot.bot.run(token)

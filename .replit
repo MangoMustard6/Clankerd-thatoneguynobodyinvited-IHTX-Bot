@@ -29,7 +29,7 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python3 main.py"
+args = "PYTHONUNBUFFERED=1 python3 -u main.py"
 
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
@@ -67,4 +67,4 @@ PORT = "8081"
 
 [nix]
 channel = "stable-25_05"
-packages = ["rubberband"]
+packages = ["libuv", "rubberband"]

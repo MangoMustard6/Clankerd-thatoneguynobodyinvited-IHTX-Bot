@@ -30,3 +30,5 @@ google-genai
 python-dotenv
 replicate
 yt-dlp
+google-generativeai
+uvloop
