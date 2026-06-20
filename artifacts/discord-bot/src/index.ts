@@ -110,7 +110,7 @@ client.on('messageCreate', async (message: Message) => {
       case 'catbox':
       case 'cb':
       case 'upload':
-        await handleCatbox(message);
+        await handleCatbox(message, args);
         break;
 
       default:
