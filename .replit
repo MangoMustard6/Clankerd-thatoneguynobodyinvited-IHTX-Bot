@@ -59,8 +59,8 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "PORT=8000 node public/serve.mjs"
-waitForPort = 8000
+args = "PORT=8099 node public/serve.mjs"
+waitForPort = 8099
 
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
@@ -70,6 +70,10 @@ integrations = []
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
 
 [[ports]]
 localPort = 8080
@@ -88,8 +92,8 @@ localPort = 8084
 externalPort = 3002
 
 [[ports]]
-localPort = 8000
-externalPort = 8000
+localPort = 8099
+externalPort = 8099
 
 [userenv]
 
