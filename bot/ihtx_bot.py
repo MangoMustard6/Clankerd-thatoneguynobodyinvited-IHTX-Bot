@@ -726,6 +726,86 @@ def _run_huehsv(
         return True, ""
 
 
+# ---------- ccshue (ImageMagick haldclut — hue/sat/gamma/gain/offset) ----------
+
+def _run_ccshue(
+    input_path: str,
+    output_path: str,
+    hue: float = 0.0,
+    sat: float = 1.0,
+    gamma: float = 1.0,
+    gain: float = 1.0,
+    offset: float = 0.0,
+) -> tuple[bool, str]:
+    """Apply color-correction via ImageMagick haldclut + FFmpeg haldclut filter.
+
+    Parameters (all optional, pass only what you want to change):
+        hue    — rotation in degrees (-180…180, default 0)
+        sat    — saturation multiplier (default 1.0)
+        gamma  — gamma correction (default 1.0)
+        gain   — RGB gain / multiply (default 1.0)
+        offset — add to every channel (-1…1, default 0)
+
+    Generates ccs.ppm via:
+        magick hald:6 [hue] [sat] [gamma] [gain] [offset] ccs.ppm
+    Then applies:
+        ffmpeg -i input -vf "movie=ccs.ppm,[in]haldclut" output
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hald_path = os.path.join(tmpdir, "ccs.ppm")
+
+        cmd = ["magick", "hald:6"]
+
+        # Hue rotation (YUV-space rotation matrix via -fx)
+        if abs(hue) > 0.001:
+            angle_fx = (
+                f"angle={hue}*pi/180; "
+                "channel(u,"
+                ".5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),"
+                ".5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))"
+            )
+            cmd += ["-colorspace", "yuv", "-fx", angle_fx, "-colorspace", "srgb"]
+
+        # Saturation (YUV-space scaling)
+        if abs(sat - 1.0) > 0.001:
+            sat_fx = (
+                f"sat={sat}; "
+                "channel(u,(u-.5)*sat+.5,(u-.5)*sat+.5)"
+            )
+            cmd += ["-colorspace", "yuv", "-fx", sat_fx, "-colorspace", "srgb"]
+
+        # Gamma
+        if abs(gamma - 1.0) > 0.001:
+            cmd += ["-gamma", f"{gamma:.6g}"]
+
+        # Gain (multiply all channels)
+        if abs(gain - 1.0) > 0.001:
+            cmd += ["-evaluate", "multiply", f"{gain:.6g}"]
+
+        # Offset (add; 127.5 is half of 8-bit full range)
+        if abs(offset) > 0.001:
+            cmd += ["-evaluate", "add", f"{offset * 127.5:.4f}"]
+
+        cmd.append(hald_path)
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return False, f"ccshue: ImageMagick failed: {result.stderr.strip()}"
+
+        # Apply haldclut via FFmpeg
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+            "-vf", f"movie={hald_path},[in]haldclut",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-c:a", "copy",
+            output_path,
+        ], timeout=180)
+        if not ok:
+            return False, f"ccshue: FFmpeg haldclut failed: {err}"
+
+        return True, ""
+
 
 # ---------- Pipe effects engine ----------
 
@@ -735,7 +815,7 @@ PIPE_EFFECT_NAMES = {
     "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
     "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
-    "syncaudio", "speed", "ffmpeg",
+    "syncaudio", "speed", "ffmpeg", "frei0r",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -867,8 +947,15 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         angle = params[0] if params else "0"
         return f"rotate={angle}/180*PI"
     if name == "ccshue":
-        val = params[0] if params else "0"
-        return f"hue=h={val}"
+        # Handled as a special case in _apply_pipe_effects (needs ImageMagick preprocessing)
+        return None
+    if name == "frei0r":
+        # frei0r=plugin:p1:p2:…  (colon-separated params)
+        plugin = params[0] if params else ""
+        if not plugin:
+            return None
+        rest = ":".join(params[1:]) if len(params) > 1 else ""
+        return f"frei0r={plugin}:{rest}" if rest else f"frei0r={plugin}"
     if name == "brightness":
         val = params[0] if params else "0"
         return f"eq=brightness={val}"
@@ -1067,6 +1154,26 @@ def _apply_pipe_effects(
         for i, (name, params) in enumerate(effects):
             is_last = (i == len(effects) - 1)
             out = output_path if is_last else os.path.join(tmpdir, f"pipe_{i}.mp4")
+
+            # ccshue — ImageMagick haldclut with hue/sat/gamma/gain/offset
+            if name == "ccshue":
+                def _p(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                ok, err = _run_ccshue(
+                    current, out,
+                    hue=_p(0, 0.0),
+                    sat=_p(1, 1.0),
+                    gamma=_p(2, 1.0),
+                    gain=_p(3, 1.0),
+                    offset=_p(4, 0.0),
+                )
+                if not ok:
+                    return False, err
+                current = out
+                continue
 
             # ImageMagick huehsv
             if name == "huehsv":
@@ -3406,11 +3513,11 @@ _HELP_ENTRIES: list[dict] = [
         "name": "Pipe effects (comma-separated)",
         "value": (
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
-            "`huehsv=<val>` `ccshue=<val>` `brightness=<val>` `contrast=<val>` "
+            "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
             "**Distortion:** `mirror=<deg>` `zoom=<amt>` `swirl=angle;r;cx;cy` `pinch&punch=str;r;cx;cy`\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `areverse` `syncaudio`\n"
-            "**Raw:** `ffmpeg(<args>)` `lut=<url>` `speed=<factor>`"
+            "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
     },
     {
@@ -3420,6 +3527,31 @@ _HELP_ENTRIES: list[dict] = [
             "Run raw FFmpeg on an attachment. Args go between `-i input` and `output`.\n"
             "Example: `t!ffmpeg -vf negate` · `t!ffmpeg -af volume=2.0`\n"
             "Shows error log and elapsed time in the reply."
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "ccshue pipe effect  (hue|sat|gamma|gain|offset)",
+        "value": (
+            "Full color correction via ImageMagick haldclut. All params optional (defaults shown):\n"
+            "`ccshue=0|1|1|1|0`\n"
+            "• **hue** — rotation in degrees −180…180 (default 0)\n"
+            "• **sat** — saturation multiplier (default 1.0)\n"
+            "• **gamma** — gamma correction (default 1.0)\n"
+            "• **gain** — RGB gain/multiply (default 1.0)\n"
+            "• **offset** — add to all channels −1…1 (default 0)\n"
+            "Example: `t!ihtx 1 5 - mp4 ccshue=90|1.5|1.2|1|0`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "frei0r pipe effect  (frei0r=plugin:params)",
+        "value": (
+            "Apply any installed frei0r video effect plugin via FFmpeg.\n"
+            "Params are colon-separated floats/strings per the plugin spec.\n"
+            "Common plugins: `distort0r` `cartoon` `edgeglow` `pixelize` `plasma` `sobel` `threshold0r`\n"
+            "Example: `t!ihtx 1 5 - mp4 frei0r=distort0r:0.5:0.1`\n"
+            "Also available in tags: `{frei0r:distort0r:0.5}` or `frei0r:\\ndistort0r:0.5` prefix block"
         ),
     },
     {

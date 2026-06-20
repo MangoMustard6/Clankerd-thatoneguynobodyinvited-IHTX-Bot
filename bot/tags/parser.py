@@ -38,6 +38,10 @@ SCRIPT_ALIASES: dict[str, str] = {
     "py":          "py",
     "bash":        "bash",
     "sh":          "bash",
+    "ffmpeg":      "ffmpeg",
+    "ff":          "ffmpeg",
+    "frei0r":      "frei0r",
+    "fr0r":        "frei0r",
     # brace-syntax engines (kept for KNOWN_ENGINES)
     "text":        "text",
     "eval":        "eval",
@@ -53,6 +57,8 @@ ENGINE_DISPLAY_NAMES: dict[str, str] = {
     "mediascript": "MediaScript",
     "py":          "Python",
     "bash":        "Bash",
+    "ffmpeg":      "FFmpeg",
+    "frei0r":      "Frei0r",
     "text":        "Text",
     "eval":        "Eval",
     "attach":      "Attach",
@@ -63,6 +69,7 @@ ENGINE_DISPLAY_NAMES: dict[str, str] = {
 # Execution order — lower index = runs first
 _ENGINE_ORDER: list[str] = [
     "tagscript", "iscript", "mediascript", "py", "bash",
+    "ffmpeg", "frei0r",
     "text", "attach", "embedjson", "eval", "ihtx",
 ]
 _ENGINE_PRIORITY: dict[str, int] = {name: i for i, name in enumerate(_ENGINE_ORDER)}

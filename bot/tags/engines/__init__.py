@@ -48,6 +48,8 @@ from .text_engine import TextEngine
 from .eval_engine import EvalEngine
 from .tagscript_engine import TagScriptEngine
 from .bash_engine import BashEngine
+from .ffmpeg_engine import FFmpegScriptEngine
+from .frei0r_engine import Frei0rScriptEngine
 
 register(AttachEngine())
 register(IScriptEngine())
@@ -59,6 +61,8 @@ register(TextEngine())
 register(EvalEngine())
 register(TagScriptEngine())
 register(BashEngine())
+register(FFmpegScriptEngine())
+register(Frei0rScriptEngine())
 
 __all__ = [
     "EngineResult",
@@ -75,4 +79,6 @@ __all__ = [
     "EvalEngine",
     "TagScriptEngine",
     "BashEngine",
+    "FFmpegScriptEngine",
+    "Frei0rScriptEngine",
 ]
