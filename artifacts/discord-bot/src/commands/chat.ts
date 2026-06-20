@@ -45,7 +45,7 @@ export async function handleChat(message: Message, args: string[]): Promise<void
     if ('sendTyping' in message.channel) await message.channel.sendTyping();
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-2.0-flash',
       contents: question,
       config: {
         systemInstruction: systemIdentity,
