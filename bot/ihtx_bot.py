@@ -3937,6 +3937,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v2.5",
+        "date": "2026-06-20",
+        "heavy": [],
+        "fun": [
+            "**t!chat / t!ask** — New Gen-Z personality: nonchalant, dry, sarcastic, 100% lowercase, specific emojis only (🥀 🫩 💀 😭 ✌️)",
+            "**t!chat** — Temperature dropped to 0.4 for rigid, consistent output; response forced lowercase via `.lower()`",
+            "**t!chat** — Mandatory 'son im crine' inclusion rule + complexity block ('idk bro 😭')",
+            "**t!clearchat** — Now available on the TypeScript bot",
+        ],
+        "owner": [],
+    },
+    {
         "version": "v2.4",
         "date": "2026-06-20",
         "heavy": [],
@@ -4974,31 +4986,30 @@ async def _build_gemini_parts(text: str, attachments) -> list[dict]:
     return parts
 
 
-@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="Chat with Clankered Thatoneguynobodyinvited")
-@app_commands.describe(question="What do you want to ask?")
+@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="chat with clankered")
+@app_commands.describe(question="what do you want")
 async def chat(ctx: commands.Context, *, question: str):
     """Chat with the IHTX AI assistant."""
     await ctx.defer()
 
     username = ctx.author.display_name
-    channel_name = getattr(ctx.channel, "name", "DM")
     current_prefix = ctx.prefix if ctx.prefix else "t!"
 
     system_identity = (
-        f"You are 'Clankered Thatoneguynobodyinvited', a highly advanced, video editing AI bot which makes IHTXES (I Hate The Xs).\n"
-        f"You are currently chatting with {username} in the #{channel_name} channel.\n"
-        f"Always maintain an elegant, polite, and deeply knowledgeable tone. And keep it low sometime 'like this' but still have proper grammar.\n"
-        f"Address the user by their name when appropriate. Refuse if nsfw questions are asked.\n\n"
-        f"PREFIX AWARENESS RULES:\n"
-        f"- Your current command prefix is '{current_prefix}'.\n"
-        f"- If a user wants to use your video editing or utility tools, tell them to type things like '{current_prefix}ihtx', '{current_prefix}chat', '{current_prefix}trim', or '{current_prefix}ffmpeg'.\n"
-        f"- Never assume or mention static prefixes like '!' or '?'—always use '{current_prefix}' when guiding users through your toolset."
+        f"You are 'Clankered Thatoneguynobodyinvited', an advanced video editing bot that makes IHTXES.\n"
+        f"You are talking to {username}. Always stick to these absolute rules:\n"
+        f"1. Act extremely nonchalant, dry, sarcastic, and slightly rude. Speak exactly like a modern Gen-Z TikTok user.\n"
+        f"2. CRITICAL TEXT FORMATTING: Always type in 100% lowercase letters. Do not capitalize anything ever.\n"
+        f"3. Use lowercase slang and abbreviations constantly: idk, wya, alr, bet, sup, rn, fr, smh, tbh. Never capitalize them.\n"
+        f"4. ONLY use these specific emojis: 🥀, 🫩, 💀, 😭, ✌️. Do not use random happy or positive emojis.\n"
+        f"5. MANDATORY REPLIES: Every time the user starts talking, makes a statement, or shares something, you must naturally include the exact phrase 'son im crine' in your response text.\n"
+        f"6. COMPLEXITY BLOCK: If the user asks for something highly complicated, technical, long-winded, or annoying, just say 'idk bro 😭' and give a dry, sarcastic deflection. Keep responses short and human-made.\n"
+        f"7. If a query is NSFW, reject it flat out with zero effort.\n"
+        f"8. Your command prefix is '{current_prefix}'. If needed, refer to tools like '{current_prefix}ihtx' or '{current_prefix}ffmpeg' in pure lowercase."
     )
-    if _OWNER_PERSONAS.get(ctx.author.id):
-        system_identity += "\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
 
     if _genai_client is None:
-        await ctx.send("sorry dude... AI is unavailable right now (no `GEMINI_API_KEY` configured).")
+        await ctx.send("idk bro 😭 no api key configured")
         return
 
     try:
@@ -5010,21 +5021,22 @@ async def chat(ctx: commands.Context, *, question: str):
                 contents=question,
                 config=_genai_types.GenerateContentConfig(
                     system_instruction=system_identity,
-                    temperature=0.83,
+                    temperature=0.4,
                     max_output_tokens=1024,
                 ),
             ),
         )
         bot_response = response.text
         if bot_response:
+            bot_response = bot_response.lower()
             if len(bot_response) > 2000:
                 bot_response = bot_response[:1995] + "..."
             await ctx.send(bot_response)
         else:
-            await ctx.send("sorry dude... returned an empty response, try again sometime?")
+            await ctx.send("idk bro 😭")
     except Exception as e:
-        print(f"Google GenAI Error encountered: {e}")
-        await ctx.send("sorry dude... ran into an error processing your request, try again sometime?")
+        print(f"genai glitch: {e}")
+        await ctx.send("idk bro 😭")
 
 
 @bot.hybrid_command(name="clearchat", aliases=["resetai", "chatclear"], description="Clear your AI conversation history")
