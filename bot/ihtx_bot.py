@@ -1363,7 +1363,7 @@ def _apply_pipe_effects(
                     "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                     "-i", current, "-vf", shake_vf,
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p", "-c:a", "copy", out,
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out,
                 ]
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
@@ -1727,6 +1727,7 @@ def _run_multipitch_rb3(
         # Use -c:v copy to preserve original timestamps exactly — re-encoding
         # would reset the timebase and cause the video to play back faster.
         if has_video:
+            dur_flag = str(round(actual_dur, 6)) if actual_dur > 0 else cap
             ok, err = _run_ffmpeg_raw([
                 "ffmpeg", "-y",
                 "-t", cap, "-i", input_path,
@@ -1735,8 +1736,7 @@ def _run_multipitch_rb3(
                 "-map", "1:a",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
-                "-t", cap,
-                "-shortest",
+                "-t", dur_flag,
                 output_path,
             ], timeout=300)
         else:
