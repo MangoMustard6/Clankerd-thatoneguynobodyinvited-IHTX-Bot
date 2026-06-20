@@ -22,3 +22,11 @@ google-genai
 python-dotenv
 replicate
 yt-dlp
+aiohttp
+anthropic
+discord.py
+fal-client
+google-genai
+python-dotenv
+replicate
+yt-dlp
