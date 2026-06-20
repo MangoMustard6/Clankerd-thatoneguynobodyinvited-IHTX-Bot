@@ -1029,8 +1029,8 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         cx = params[2] if len(params) > 2 else "0.5"
         cy = params[3] if len(params) > 3 else "0.5"
         geq_expr = (
-            f"p(W*{cx}+(X-W*{cx})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))),"
-            f"H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))"
+            f"p(W*{cx}+(X-W*{cx})*max(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2)),0),"
+            f"H*{cy}+(Y-H*{cy})*max(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2)),0))"
         )
         return f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
     if name == "vreverse":
@@ -1740,72 +1740,103 @@ def _run_syncaudio(
 ) -> tuple[bool, str]:
     """Sync video and audio durations by adjusting playback speed.
 
-    Default mode: adjust video speed (setpts) to match audio duration.
-    Alt mode: adjust audio speed (atempo) to match video duration.
+    Default mode: stretch/compress video PTS to match audio duration.
+    Alt mode:     adjust audio tempo (atempo) to match video duration.
 
-    Uses itsoffset + -shortest to avoid any audio/video drift.
+    Splits the input into a video-only and audio-only temp file so that
+    -stream_loop -1 can be used on audio and -t pins the output length.
 
     Returns (ok, info_string_or_error).
     """
-    # Get durations from the original file
-    vd = _ffprobe_duration(input_path)
-    ad_out = _ffprobe(input_path, "-select_streams", "a:0",
-                       "-show_entries", "format=duration",
-                       "-of", "csv=p=0")
-    try:
-        ad = float(ad_out)
-    except (ValueError, TypeError):
-        ad = 0.0
+    import tempfile, os as _os
 
-    # Also try audio-specific duration
-    if ad <= 0:
-        ad_out2 = _ffprobe(input_path, "-select_streams", "a:0",
-                           "-show_entries", "stream=duration",
-                           "-of", "csv=p=0")
+    tmpdir = tempfile.mkdtemp(prefix="syncaudio_")
+    v_path = _os.path.join(tmpdir, "v.mp4")
+    a_path = _os.path.join(tmpdir, "a.wav")
+
+    try:
+        # Split: video-only
+        ok, err = _run_ffmpeg_raw(
+            ["ffmpeg", "-y", "-i", input_path, "-an", "-c:v", "copy", v_path],
+            timeout=120,
+        )
+        if not ok:
+            return False, f"Video split failed: {err}"
+
+        # Split: audio-only
+        ok, err = _run_ffmpeg_raw(
+            ["ffmpeg", "-y", "-i", input_path, "-vn", a_path],
+            timeout=120,
+        )
+        if not ok:
+            return False, f"Audio split failed: {err}"
+
+        # Durations from the split files (more reliable than muxed container)
+        vd = _ffprobe_duration(v_path)
+        ad_raw = _ffprobe(a_path, "-select_streams", "a:0",
+                          "-show_entries", "format=duration",
+                          "-of", "csv=p=0")
         try:
-            ad = float(ad_out2)
+            ad = float(ad_raw)
         except (ValueError, TypeError):
             ad = 0.0
 
-    if vd <= 0 or ad <= 0:
-        return False, f"Could not determine durations (video={vd:.3f}s, audio={ad:.3f}s)"
+        if vd <= 0 or ad <= 0:
+            return False, f"Could not determine durations (video={vd:.3f}s, audio={ad:.3f}s)"
 
-    if alt_mode:
-        # Alt mode: adjust audio speed (atempo) to match video duration
-        speed = ad / vd
-        atempo_filter = _build_atempo_chain(speed)
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-af", atempo_filter,
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest", "-movflags", "+faststart",
-            output_path,
-        ]
-    else:
-        # Default mode: adjust video speed (setpts) to match audio duration
-        speed = vd / ad
-        # Get frame rate for FPS passthrough
+        # Frame rate from original
         fr_out = _ffprobe(input_path, "-select_streams", "v:0",
                           "-show_entries", "stream=r_frame_rate",
                           "-of", "default=nokey=1:noprint_wrappers=1")
-        fps_filter = f"setpts=1/({speed})*PTS"
-        if fr_out:
-            fps_filter += f",fps={fr_out}"
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vf", fps_filter,
-            "-c:a", "copy",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-shortest", "-movflags", "+faststart",
-            output_path,
-        ]
 
-    ok, err = _run_ffmpeg_raw(cmd, timeout=300)
-    if not ok:
-        return False, f"Sync failed: {err}"
+        if alt_mode:
+            # Alt mode: adjust audio speed to match video duration
+            speed = ad / vd
+            atempo_filter = _build_atempo_chain(speed)
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", v_path,
+                "-stream_loop", "-1", "-i", a_path,
+                "-af", atempo_filter,
+                "-map", "0:v", "-map", "1:a",
+                "-t", str(vd),
+                "-c:v", "copy",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+        else:
+            # Default mode: stretch video PTS to match audio duration
+            speed = vd / ad
+            vf = f"setpts=1/({vd}/{ad})*PTS"
+            if fr_out:
+                vf += f",fps={fr_out}"
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", v_path,
+                "-stream_loop", "-1", "-i", a_path,
+                "-vf", vf,
+                "-map", "0:v", "-map", "1:a",
+                "-t", str(vd),
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+
+        ok, err = _run_ffmpeg_raw(cmd, timeout=300)
+        if not ok:
+            return False, f"Sync failed: {err}"
+
+    finally:
+        for p in (v_path, a_path):
+            try:
+                _os.unlink(p)
+            except OSError:
+                pass
+        try:
+            _os.rmdir(tmpdir)
+        except OSError:
+            pass
 
     diff = vd - ad
     info = (
@@ -3837,6 +3868,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v1.8",
+        "date": "2026-06-20",
+        "heavy": [
+            "**t!ihtx p&p** — geq formula now clamps distortion with `max(..., 0)` to prevent pixel wrap-around artifacts",
+            "**t!syncaudio** — rewired to split input into separate video/audio temp files before syncing",
+            "**t!syncaudio** — uses `-stream_loop -1` on audio + `-t <vd>` to pin output length (replaces `-shortest`)",
+            "**t!syncaudio** — explicit `-map 0:v -map 1:a` for clean stream selection on both modes",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v1.7",
         "date": "2026-06-20",
