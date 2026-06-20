@@ -44,6 +44,8 @@ from .mediascript import MediaScriptEngine
 from .pyscript import PyScriptEngine
 from .embedjson import EmbedJSONEngine
 from .ihtx_engine import IHTXEngine
+from .text_engine import TextEngine
+from .eval_engine import EvalEngine
 
 register(AttachEngine())
 register(IScriptEngine())
@@ -51,6 +53,8 @@ register(MediaScriptEngine())
 register(PyScriptEngine())
 register(EmbedJSONEngine())
 register(IHTXEngine())
+register(TextEngine())
+register(EvalEngine())
 
 __all__ = [
     "EngineResult",
@@ -63,4 +67,6 @@ __all__ = [
     "PyScriptEngine",
     "EmbedJSONEngine",
     "IHTXEngine",
+    "TextEngine",
+    "EvalEngine",
 ]

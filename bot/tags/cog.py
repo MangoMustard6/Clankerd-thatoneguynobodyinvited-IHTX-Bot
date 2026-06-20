@@ -589,6 +589,28 @@ class TagCog(commands.Cog, name="Tags"):
             inline=False,
         )
         embed.add_field(
+            name="{text:<source>}",
+            value=textwrap.dedent("""\
+                Load and return text content. Sources:
+                `{text:Hello World}` — inline text
+                `{text:attachment}` — attached .txt / .md / .csv / .log / .json / .yaml file
+                `{text:reply}` — attachment from replied-to message
+                `{text:https://example.com/file.txt}` — download from URL
+                Max 1 MB · 5 000 lines · 50 000 chars. Encodings: UTF-8/16/32, Latin-1, ASCII.\
+            """),
+            inline=False,
+        )
+        embed.add_field(
+            name="{eval:<tagscript>}",
+            value=textwrap.dedent("""\
+                Re-parse content as TagScript after resolving sub-engines.
+                `{eval:{text:attachment}}` — load file then execute it as a tag
+                `{eval:Hello {user}}` — resolve variables inside dynamic content
+                Nesting depth limit: 3.\
+            """),
+            inline=False,
+        )
+        embed.add_field(
             name="{embedjson:{…}}",
             value=(
                 "Build a Discord embed from JSON.\n"

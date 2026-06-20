@@ -30,10 +30,10 @@ _BLOCK_RE = re.compile(
 
 # Engines whose content may contain deeply nested braces (e.g. JSON objects).
 # These are extracted by a depth-counting pre-pass before the regex runs.
-_DEEP_ENGINES = ("embedjson",)
+_DEEP_ENGINES = ("embedjson", "eval")
 
 # All engine names — blocks with these names are dispatched to engines.
-KNOWN_ENGINES = frozenset({"attach", "iscript", "mediascript", "py", "embedjson", "ihtx"})
+KNOWN_ENGINES = frozenset({"attach", "iscript", "mediascript", "py", "embedjson", "ihtx", "text", "eval"})
 
 
 # ── Safe math ─────────────────────────────────────────────────────────────────
