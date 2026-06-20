@@ -59,8 +59,8 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "PORT=8080 node public/serve.mjs"
-waitForPort = 8080
+args = "PORT=8000 node public/serve.mjs"
+waitForPort = 8000
 
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
@@ -86,6 +86,10 @@ externalPort = 3001
 [[ports]]
 localPort = 8084
 externalPort = 3002
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
 
 [userenv]
 
