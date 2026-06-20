@@ -29,8 +29,14 @@ interface Opts {
 const ENGINE_FLAGS: Record<Engine, string> = {
   r2: '-2',
   r3: '-3',
-  r4: '-4',
+  r4: '-3',
 };
+
+function windowFlags(engine: Engine, window: WindowMode): string[] {
+  if (window === 'short') return ['--window-short'];
+  if (window === 'long' && engine === 'r2') return ['--window-long'];
+  return [];
+}
 
 function parseArgs(args: string[]): Opts | string {
   const opts: Opts = { repetitions: 20, length: 0.4, engine: 'r3', window: 'long' };
@@ -170,7 +176,7 @@ export async function handleMultipitchIHTX(
     const layerPaths: string[] = [];
 
     const engineFlag = ENGINE_FLAGS[opts.engine];
-    const windowFlag = opts.window === 'long' ? '--window-long' : '--window-short';
+    const winFlags = windowFlags(opts.engine, opts.window);
 
     for (let i = 0; i < offsets.length; i++) {
       await status.edit(`⏳ Generating pitch layer ${i + 1}/${offsets.length}…`);
@@ -182,7 +188,7 @@ export async function handleMultipitchIHTX(
         'rubberband',
         [
           engineFlag,
-          windowFlag,
+          ...winFlags,
           '--pitch', pitchSemitones,
           inputAudio,
           layerPath,
