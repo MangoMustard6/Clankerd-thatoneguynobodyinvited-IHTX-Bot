@@ -7,23 +7,27 @@ import { makeTempDir, cleanupDir, downloadUrl } from '../utils/temp.js';
 import { VIDEO_EXTENSIONS, LIMITS, PROCESS_TIMEOUTS } from '../config.js';
 
 const USAGE = [
-  '**Usage:** `t!multipitchihtx [options]` — attach a video file',
+  '**Usage:** `t!multipitchihtx [options]` — attach a video/audio file',
   '',
-  '**Options (pick one pitch mode):**',
-  '`pitches=0.1|0.2|-0.3` — explicit semitone offsets, pipe-separated (sets layer count automatically)',
-  '`repetitions=<n>` — auto-generate N evenly spaced pitch layers (default: 20)',
-  '`spread=<n>` — total semitone range for auto mode, 0.01–999 (default: 0.4)',
+  '**Pitch mode (pick one):**',
+  '`pitches=0.1|0.2|-0.3` — explicit semitone offsets, pipe-separated',
+  '`repetitions=<n>` — auto N evenly spaced pitch layers (default: 20)',
+  '`spread=<n>` — total semitone range for auto mode (default: 0.4)',
+  '',
+  '**Concatenation:**',
+  '`concat=<n>` — repeat the entire mixed output N times end-to-end (default: 1)',
   '',
   '**Time stretch:**',
-  '`duration=<seconds>` — stretch/compress output to this length in seconds (optional)',
+  '`duration=<seconds>` — stretch each layer to this length via rubberband (optional)',
   '',
-  '**Engine & window:**',
+  '**Engine:**',
   '`engine=<r2|r3|r4>` — Rubber Band engine (default: r3)',
   '`window=<long|short>` — window mode (default: long)',
   '',
   '**Examples:**',
   '`t!multipitchihtx pitches=0|-0.1|0.1|-0.2|0.2`',
-  '`t!multipitchihtx repetitions=10 spread=1.0 duration=30 engine=r2`',
+  '`t!multipitchihtx repetitions=10 spread=1.0 concat=3`',
+  '`t!multipitchihtx concat=5 duration=8 spread=0.8 engine=r2`',
 ].join('\n');
 
 type Engine = 'r2' | 'r3' | 'r4';
@@ -34,6 +38,7 @@ interface Opts {
   duration: number | null;
   repetitions: number;
   spread: number;
+  concat: number;
   engine: Engine;
   window: WindowMode;
 }
@@ -51,7 +56,15 @@ function windowFlags(engine: Engine, window: WindowMode): string[] {
 }
 
 function parseArgs(args: string[]): Opts | string {
-  const opts: Opts = { pitches: null, duration: null, repetitions: 20, spread: 0.4, engine: 'r3', window: 'long' };
+  const opts: Opts = {
+    pitches: null,
+    duration: null,
+    repetitions: 20,
+    spread: 0.4,
+    concat: 1,
+    engine: 'r3',
+    window: 'long',
+  };
 
   for (const arg of args) {
     const eqIdx = arg.indexOf('=');
@@ -86,8 +99,14 @@ function parseArgs(args: string[]): Opts | string {
         opts.spread = n;
         break;
       }
+      case 'concat': {
+        const n = Number(val);
+        if (!Number.isInteger(n) || n < 1 || n > 1000) return `❌ \`concat\` must be an integer between 1 and 1000.`;
+        opts.concat = n;
+        break;
+      }
       case 'length':
-        return `❌ \`length\` is no longer a valid option (it was ambiguous). Use \`spread\` to set pitch range, or \`pitches\` for explicit values.`;
+        return `❌ \`length\` is no longer valid. Use \`spread\` for pitch range, \`pitches\` for explicit values, or \`concat\` to repeat the output.`;
       case 'engine': {
         if (!['r2', 'r3', 'r4'].includes(val.toLowerCase())) {
           return `❌ \`engine\` must be one of: \`r2\`, \`r3\`, \`r4\`.`;
@@ -122,23 +141,47 @@ function resolvePitchOffsets(opts: Opts): number[] {
   return linspace(-half, half, opts.repetitions);
 }
 
+async function resolveAttachment(message: Message): Promise<{ url: string; name: string; ext: string } | null> {
+  // 1. Direct attachment
+  const direct = message.attachments.first();
+  if (direct) {
+    const ext = (direct.name?.split('.').pop() ?? '').toLowerCase();
+    return { url: direct.url, name: direct.name, ext };
+  }
+
+  // 2. Replied-to message attachment
+  if (message.reference?.messageId) {
+    try {
+      const ref = await message.fetchReference();
+      const refAttachment = ref.attachments.first();
+      if (refAttachment) {
+        const ext = (refAttachment.name?.split('.').pop() ?? '').toLowerCase();
+        return { url: refAttachment.url, name: refAttachment.name, ext };
+      }
+    } catch { }
+  }
+
+  return null;
+}
+
 export async function handleMultipitchIHTX(
   message: Message,
   args: string[],
   ownerId: string,
 ): Promise<void> {
-  const attachment = message.attachments.first();
+  const attachmentInfo = await resolveAttachment(message);
 
-  if (!attachment) {
-    await message.reply(`❌ No video attachment found.\n${USAGE}`);
+  if (!attachmentInfo) {
+    await message.reply(`❌ No video/audio attachment found. Attach a file or reply to a message with one.\n${USAGE}`);
     return;
   }
 
-  const ext = (attachment.name?.split('.').pop() ?? '').toLowerCase();
+  const { url: attachmentUrl, name: attachmentName, ext } = attachmentInfo;
+
   if (!VIDEO_EXTENSIONS.has(ext)) {
     const supported = [...VIDEO_EXTENSIONS].join(', ');
     await message.reply(
-      `❌ Unsupported file type \`.${ext}\`. Supported video formats: \`${supported}\`.`,
+      `❌ Unsupported file type \`.${ext}\`. Supported: \`${supported}\`.`,
     );
     return;
   }
@@ -171,11 +214,12 @@ export async function handleMultipitchIHTX(
 
   const modeDesc = opts.pitches !== null
     ? `pitches: ${offsets.map((p) => p.toFixed(3)).join(', ')}`
-    : `${layerCount} layers, spread ${opts.spread} semitones`;
+    : `${layerCount} layers, spread ${opts.spread} st`;
+  const concatDesc = opts.concat > 1 ? `, concat ×${opts.concat}` : '';
   const durationDesc = opts.duration !== null ? `, duration: ${opts.duration}s` : '';
 
   const status = await message.reply(
-    `⏳ Processing **${layerCount}** pitch layer${layerCount !== 1 ? 's' : ''}… (engine: ${opts.engine}, window: ${opts.window}, ${modeDesc}${durationDesc})`,
+    `⏳ Processing **${layerCount}** pitch layer${layerCount !== 1 ? 's' : ''}… (engine: ${opts.engine}, window: ${opts.window}, ${modeDesc}${durationDesc}${concatDesc})`,
   );
 
   const tmpDir = makeTempDir('multi');
@@ -183,7 +227,7 @@ export async function handleMultipitchIHTX(
   try {
     const inputVideo = path.join(tmpDir, `input.${ext}`);
     await status.edit(`⏳ Downloading attachment…`);
-    await downloadUrl(attachment.url, inputVideo);
+    await downloadUrl(attachmentUrl, inputVideo);
 
     const inputAudio = path.join(tmpDir, 'input.wav');
     await status.edit(`⏳ Extracting audio…`);
@@ -229,7 +273,7 @@ export async function handleMultipitchIHTX(
 
     await status.edit(`⏳ Mixing ${layerPaths.length} layers…`);
 
-    const outputPath = path.join(tmpDir, 'output.wav');
+    const mixedPath = path.join(tmpDir, 'mixed.wav');
     const ffmpegMixArgs: string[] = ['-y'];
     for (const lp of layerPaths) ffmpegMixArgs.push('-i', lp);
 
@@ -243,7 +287,7 @@ export async function handleMultipitchIHTX(
       '-acodec', 'pcm_s16le',
       '-ar', '44100',
       '-ac', '2',
-      outputPath,
+      mixedPath,
     );
 
     const mixResult = await spawnAsync('ffmpeg', ffmpegMixArgs, { timeout: PROCESS_TIMEOUTS.FFMPEG_MS });
@@ -253,6 +297,27 @@ export async function handleMultipitchIHTX(
         `❌ ffmpeg mixing failed.\n\`\`\`\n${mixResult.stderr.slice(-500)}\n\`\`\``,
       );
       return;
+    }
+
+    // ── Concatenation ─────────────────────────────────────────────────────────
+    let outputPath = mixedPath;
+
+    if (opts.concat > 1) {
+      await status.edit(`⏳ Concatenating ×${opts.concat}…`);
+      outputPath = path.join(tmpDir, 'output.wav');
+
+      const concatResult = await spawnAsync(
+        'ffmpeg',
+        ['-y', '-stream_loop', String(opts.concat - 1), '-i', mixedPath, '-c', 'copy', outputPath],
+        { timeout: PROCESS_TIMEOUTS.FFMPEG_MS },
+      );
+
+      if (concatResult.code !== 0) {
+        await status.edit(
+          `❌ ffmpeg concat failed.\n\`\`\`\n${concatResult.stderr.slice(-500)}\n\`\`\``,
+        );
+        return;
+      }
     }
 
     if (!fs.existsSync(outputPath)) {
@@ -265,15 +330,16 @@ export async function handleMultipitchIHTX(
 
     if (outputSize > uploadLimit) {
       await status.edit(
-        `❌ Output exceeds Discord upload limit — ${formatBytes(outputSize)} > ${formatBytes(uploadLimit)}.`,
+        `❌ Output (${formatBytes(outputSize)}) exceeds Discord upload limit (${formatBytes(uploadLimit)}).`,
       );
       return;
     }
 
-    const durSuffix = opts.duration !== null ? `, ${opts.duration}s` : '';
+    const durSuffix = opts.duration !== null ? `, ${opts.duration}s/layer` : '';
+    const concatSuffix = opts.concat > 1 ? ` ×${opts.concat}` : '';
     const summary = opts.pitches !== null
-      ? `pitches: ${offsets.map((p) => (p >= 0 ? '+' : '') + p.toFixed(3)).join(', ')}${durSuffix}`
-      : `${layerCount} layers, ${opts.spread} semitone spread${durSuffix}`;
+      ? `pitches: ${offsets.map((p) => (p >= 0 ? '+' : '') + p.toFixed(3)).join(', ')}${durSuffix}${concatSuffix}`
+      : `${layerCount} layers, ${opts.spread} st spread${durSuffix}${concatSuffix}`;
 
     await status.edit({
       content: `✅ Done! (${summary})`,
