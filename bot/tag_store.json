@@ -16,11 +16,11 @@
         "content": "{sh:load {iv}\n\nffmpeg -i $FILE_1 -an v.mp4\nffmpeg -i $FILE_1 a.wav\n\nvd=$(ffprobe -i v.mp4 -select_streams v:0 -show_entries format=duration -v quiet -of csv=\"p=0\")\nad=$(ffprobe -i a.wav -select_streams a:0 -show_entries format=duration -v quiet -of csv=\"p=0\")\nfr=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nokey=1:noprint_wrappers=1 $FILE_1)\n\necho '-# Use \"alt\" as the first arg to do vice-versa\n'\nif [ \"{arg:0}\" = \"alt\" ]; then\n    ffmpeg -i v.mp4 -stream_loop -1 -i a.wav -af \"atempo=$ad/$vd\" -map 0:v -map 1:a -t $vd ./output/whar.mp4\n\n    rm -f v.mp4 a.wav\n\n    diff=$(echo \"scale=6; $vd-$ad\" | bc)\n    speed=$(echo \"scale=6; $ad/$vd\" | bc)\n\n    echo \"Video: $vd\nAudio: $ad\n\nSpeed Used: $speed\nDiff: $diff\"\nelse \n    ffmpeg -i v.mp4 -stream_loop -1 -i a.wav -vf \"setpts=1/($vd/$ad)*PTS\",fps=$fr -map 0:v -map 1:a -t $vd ./output/whar.mp4\n\n    rm -f v.mp4 a.wav\n\n    diff=$(echo \"scale=6; $vd-$ad\" | bc)\n    speed=$(echo \"scale=6; $vd/$ad\" | bc)\n\n    echo \"Video: $vd\nAudio: $ad\n\nSpeed Used: $speed\nDiff: $diff\"\nfi}",
         "owner_id": 1355759019330895973,
         "created_at": "2026-06-20T00:26:48.127538+00:00",
-        "uses": 2,
+        "uses": 3,
         "aliases": [],
         "allowed_roles": [],
         "denied_users": [],
-        "edited_at": "2026-06-20T00:27:44.515094+00:00"
+        "edited_at": "2026-06-20T01:35:33.634738+00:00"
       }
     },
     "aliases": {}
