@@ -1164,9 +1164,9 @@ def _apply_pipe_effects(
                 cmd = [
                     "ffmpeg", "-y", "-i", current,
                     "-vf", f"lut3d={lut_path},format=yuv420p",
-                    "-c:a", "copy",
+                    "-c:a", "pcm_s24le",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-shortest", "-movflags", "+faststart",
+                    "-movflags", "+faststart",
                     out,
                 ]
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
@@ -1185,7 +1185,7 @@ def _apply_pipe_effects(
                     "-i", current,
                     "-vf", f"lut3d={lut_path}",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p", "-c:a", "copy",
+                    "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le",
                     out,
                 ]
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
@@ -1202,7 +1202,7 @@ def _apply_pipe_effects(
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                         "-i", current, "-vf", vf_str,
                         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                        "-pix_fmt", "yuv420p", "-c:a", "copy", out,
+                        "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", out,
                     ]
                     ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                     if not ok:
@@ -1328,7 +1328,7 @@ def _apply_pipe_effects(
                     "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                     "-i", current, "-vf", vf,
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p", "-c:a", "copy", out,
+                    "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", out,
                 ]
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
@@ -3873,6 +3873,8 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-20",
         "heavy": [
             "**t!ihtx p&p** — geq formula now clamps distortion with `max(..., 0)` to prevent pixel wrap-around artifacts",
+            "**t!ihtx p&p** — fixed FLAC-in-MP4 error: all vf pipe steps now encode audio as `pcm_s24le` instead of `copy`",
+            "**t!ihtx lut / invlum / VIDEO:** — same FLAC fix applied to those vf paths",
             "**t!syncaudio** — rewired to split input into separate video/audio temp files before syncing",
             "**t!syncaudio** — uses `-stream_loop -1` on audio + `-t <vd>` to pin output length (replaces `-shortest`)",
             "**t!syncaudio** — explicit `-map 0:v -map 1:a` for clean stream selection on both modes",
