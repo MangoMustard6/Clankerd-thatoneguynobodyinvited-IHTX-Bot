@@ -43,10 +43,18 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
       {
         name: `\`${PREFIX}multipitchihtx\` options`,
         value: [
-          `\`repetitions=<n>\` — pitch layers (default: 20, **max: ${baseReps}${boostBonus}**)`,
-          '`length=<n>` — pitch spread in semitones, 0.01–999 (default: 0.4)',
-          '`engine=<r2|r3|r4>\` — Rubber Band engine (default: r3)',
-          '`window=<long|short>\` — window mode (default: long)',
+          '**Pitch mode (pick one):**',
+          '`pitches=0|-0.1|0.1|-0.2|0.2` — explicit semitone offsets, pipe-separated',
+          `\`repetitions=<n>\` — auto N evenly spaced layers (default: 20, **max: ${baseReps}${boostBonus ? ` — ${boostBonus}` : ''}**)`,
+          '`spread=<n>` — semitone range for auto mode, 0.01–999 (default: 0.4)',
+          '',
+          '**Engine:**',
+          '`engine=<r2|r3|r4>` — Rubber Band engine (default: r3)',
+          '`window=<long|short>` — window mode (default: long)',
+          '',
+          '**Examples:**',
+          `\`${PREFIX}multipitchihtx pitches=0|-0.2|0.2|-0.5|0.5\``,
+          `\`${PREFIX}multipitchihtx repetitions=10 spread=1.0 engine=r2\``,
         ].join('\n'),
       },
       {
