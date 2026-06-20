@@ -18,6 +18,7 @@ import { handleRoulette } from './commands/games/roulette.js';
 import { handleTrivia } from './commands/games/trivia.js';
 import { handleInfo } from './commands/info.js';
 import { handleCatbox } from './commands/catbox.js';
+import { handleChat } from './commands/chat.js';
 
 if (!BOT_TOKEN) {
   console.error('ERROR: DISCORD_TOKEN environment variable is not set.');
@@ -38,7 +39,7 @@ client.once('clientReady', (c) => {
   console.log(`[IHTX-TS] Logged in as ${c.user.tag}`);
   console.log(`[IHTX-TS] Prefix: ${PREFIX}`);
   console.log(`[IHTX-TS] Owner ID: ${BOT_OWNER_ID || '(not set)'}`);
-  console.log(`[IHTX-TS] Commands: download, multipitchihtx, coinflip, dice, rps, 8ball, slots, choose, roulette, trivia, help, info, catbox`);
+  console.log(`[IHTX-TS] Commands: download, multipitchihtx, chat, ask, coinflip, dice, rps, 8ball, slots, choose, roulette, trivia, help, info, catbox`);
 });
 
 client.on('messageCreate', async (message: Message) => {
@@ -106,6 +107,13 @@ client.on('messageCreate', async (message: Message) => {
       case 'info':
         await handleInfo(message);
         break;
+
+      case 'chat':
+      case 'ask': {
+        const chatArgs = rest.trim() ? [rest.trim()] : [];
+        await handleChat(message, chatArgs);
+        break;
+      }
 
       case 'catbox':
       case 'cb':
