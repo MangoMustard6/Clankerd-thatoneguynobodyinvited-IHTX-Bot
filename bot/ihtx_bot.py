@@ -40,10 +40,13 @@ try:
     _gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if _gemini_api_key:
         _genai_client = _genai_lib.Client(api_key=_gemini_api_key)
+        print(f"[genai] Gemini client initialized ✓")
     else:
         _genai_client = None
-except ImportError:
+        print("[genai] GEMINI_API_KEY not set — chat disabled")
+except Exception as _genai_init_err:
     _genai_client = None
+    print(f"[genai] Failed to initialize Gemini client: {_genai_init_err}")
 
 try:
     from openai import OpenAI as _OpenAI_lib

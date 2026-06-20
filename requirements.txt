@@ -35,3 +35,4 @@ uvloop
 aiohttp
 discord-py
 yt-dlp
+google-genai
