@@ -3954,6 +3954,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v2.3",
+        "date": "2026-06-20",
+        "heavy": [],
+        "fun": [
+            "**t!chat** — Gemini emergency fallback now uses a single stateless content string (system + question) instead of history/parts",
+            "**t!chat** — Gemini also used directly when OpenRouter key is absent (no history overhead)",
+            "**t!chat** — OpenRouter and Gemini log messages match new routing tier labels",
+        ],
+        "owner": [],
+    },
+    {
         "version": "v2.2",
         "date": "2026-06-20",
         "heavy": [],
@@ -5004,7 +5015,7 @@ async def chat(ctx: commands.Context, *, question: str):
 
         for model_name in models_to_try:
             try:
-                print(f"[chat] Attempting: {model_name}")
+                print(f"Routing to OpenRouter: {model_name}")
                 completion = await loop.run_in_executor(
                     None,
                     lambda m=model_name: _openrouter_client.chat.completions.create(
@@ -5020,8 +5031,24 @@ async def chat(ctx: commands.Context, *, question: str):
                 bot_response = completion.choices[0].message.content
                 break
             except Exception as api_err:
-                print(f"[chat] {model_name} failed: {api_err}")
+                print(f"OpenRouter model {model_name} failed/throttled: {api_err}")
                 continue
+
+        # Emergency Gemini fallback if all OpenRouter models failed
+        if not bot_response and _genai_client is not None:
+            try:
+                print("OpenRouter completely jammed. Switching execution to Google GenAI Tier...")
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: _genai_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=f"System Context Instructions:\n{system_identity}\n\nUser Question:\n{question}",
+                    ),
+                )
+                bot_response = response.text
+            except Exception as gemini_err:
+                print(f"Emergency Google backup layer failed as well: {gemini_err}")
 
         if bot_response:
             if len(bot_response) > 2000:
@@ -5030,43 +5057,25 @@ async def chat(ctx: commands.Context, *, question: str):
         else:
             await ctx.send("sorry dude... all free AI lines are completely jammed right now, try again in like 30 seconds?")
 
-    # ── Gemini fallback ───────────────────────────────────────────────────────
+    # ── Gemini-only path (no OpenRouter key configured) ───────────────────────
     elif _genai_client is not None:
-        history = _chat_histories.setdefault(ctx.author.id, [])
-        if history and "content" in history[0]:
-            history.clear()
-
-        parts = await _build_gemini_parts(question, ctx.message.attachments)
-        history.append({"role": "user", "parts": parts})
-        if len(history) > _CHAT_MAX_HISTORY:
-            history[:] = history[-_CHAT_MAX_HISTORY:]
-
         try:
+            print("OpenRouter not configured. Routing directly to Google GenAI...")
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: _genai_client.models.generate_content(
                     model="gemini-2.5-flash",
-                    contents=history,
-                    config=_genai_types.GenerateContentConfig(
-                        system_instruction=system_identity,
-                        max_output_tokens=1024,
-                    ),
+                    contents=f"System Context Instructions:\n{system_identity}\n\nUser Question:\n{question}",
                 ),
             )
             reply_text = response.text
+            if len(reply_text) > 2000:
+                reply_text = reply_text[:1995] + "..."
+            await ctx.send(reply_text)
         except Exception as e:
-            await ctx.send(f"❌ AI error: {e}")
-            history.pop()
-            return
-
-        text_only = [p for p in parts if "text" in p] or [{"text": "[media]"}]
-        history[-1] = {"role": "user", "parts": text_only}
-        history.append({"role": "model", "parts": [{"text": reply_text}]})
-
-        if len(reply_text) > 2000:
-            reply_text = reply_text[:1995] + "..."
-        await ctx.send(reply_text)
+            print(f"Google GenAI failed: {e}")
+            await ctx.send("sorry dude... all free AI lines are completely jammed right now, try again in like 30 seconds?")
 
     else:
         await ctx.send("sorry dude... AI is unavailable right now (no API key configured).")
