@@ -32,3 +32,6 @@ replicate
 yt-dlp
 google-generativeai
 uvloop
+aiohttp
+discord-py
+yt-dlp
