@@ -5,5 +5,6 @@
     pkgs.ffmpeg
     pkgs.frei0r
     pkgs.sox
+    pkgs.google-genai
   ];
 }
