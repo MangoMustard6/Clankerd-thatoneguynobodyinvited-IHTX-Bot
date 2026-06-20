@@ -3374,33 +3374,32 @@ async def presets_command(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
-@bot.hybrid_command(name="ihtxhelp", aliases=["bothelp"], description="Show IHTX Bot help and effect list")
-async def help_command(ctx: commands.Context):
-    # ── 1. Heavy Commands ─────────────────────────────────────────────────
-    heavy = discord.Embed(
-        title="⚙️ Heavy Commands",
-        color=discord.Color.dark_red(),
-    )
-    heavy.add_field(
-        name="t!ihtx [preset]",
-        value=(
+# ── Help data ─────────────────────────────────────────────────────────────────
+# Each entry: {"name": str, "value": str, "cat": "heavy"|"fun"|"owner"}
+# "name" and "value" are searched when the user passes a query.
+_HELP_ENTRIES: list[dict] = [
+    # ── Heavy ──
+    {
+        "cat": "heavy",
+        "name": "t!ihtx [preset]",
+        "value": (
             "Apply a preset to an attached video/image. Default preset: `chaos`\n"
-            "Other presets: `glitch`, `melt`, `chaos2`, `vhs`, …  — run `t!presets` for the full list."
+            "Other presets: `glitch`, `melt`, `chaos2`, `vhs`, … — run `t!presets` for the full list."
         ),
-        inline=False,
-    )
-    heavy.add_field(
-        name="t!ihtx <reps> <dur> <noTrim> <fmt> <effects>",
-        value=(
-            "Custom effect chain (comma-delimited). Each effect can have `=` params.\n"
+    },
+    {
+        "cat": "heavy",
+        "name": "t!ihtx <reps> <dur> <noTrim> <fmt> <effects>",
+        "value": (
+            "Custom effect chain (comma-delimited). Each effect may have `=` params.\n"
             "**Example:** `t!ihtx 10 0.483 - mp4 huehsv=0.5,negate,multipitch=25|5|8.5`\n"
-            "**ffmpeg pipe step:** `t!ihtx 1 10 false mp4 ffmpeg(-vf hue=h=50),speed=1.5`"
+            "**Raw FFmpeg step:** `t!ihtx 1 10 false mp4 ffmpeg(-vf hue=h=50),speed=1.5`"
         ),
-        inline=False,
-    )
-    heavy.add_field(
-        name="Pipe effects (comma-separated)",
-        value=(
+    },
+    {
+        "cat": "heavy",
+        "name": "Pipe effects (comma-separated)",
+        "value": (
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=<val>` `brightness=<val>` `contrast=<val>` "
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
@@ -3408,186 +3407,285 @@ async def help_command(ctx: commands.Context):
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `areverse` `syncaudio`\n"
             "**Raw:** `ffmpeg(<args>)` `lut=<url>` `speed=<factor>`"
         ),
-        inline=False,
-    )
-    heavy.add_field(
-        name="t!ffmpeg <args>",
-        value=(
+    },
+    {
+        "cat": "heavy",
+        "name": "t!ffmpeg <args>",
+        "value": (
             "Run raw FFmpeg on an attachment. Args go between `-i input` and `output`.\n"
             "Example: `t!ffmpeg -vf negate` · `t!ffmpeg -af volume=2.0`\n"
-            "Shows `-# Error log:` + `-# Took: N seconds` footer."
+            "Shows error log and elapsed time in the reply."
         ),
-        inline=False,
-    )
-    heavy.add_field(
-        name="t!multipitch <semitones>  (aliases: mp, multi)",
-        value=(
+    },
+    {
+        "cat": "heavy",
+        "name": "t!multipitch <semitones>  (aliases: mp, multi)",
+        "value": (
             "Multi-voice pitch shift via Rubber Band R3.\n"
             "Pipe-separated semitones: `t!multipitch 25|5|8.5`\n"
-            "Or use inline: `t!ihtx 1 10 false mp4 multipitch=25|5|8.5`"
+            "Or inline: `t!ihtx 1 10 false mp4 multipitch=25|5|8.5`"
         ),
-        inline=False,
-    )
-    heavy.add_field(
-        name="t!preview1280 [start] [dur]",
-        value="12-segment TV-simulator montage. Defaults: start=1.85, dur=0.85",
-        inline=False,
-    )
-    heavy.add_field(
-        name="t!invlum [n]",
-        value="Apply luma-inversion progressively N times and concat all iterations.",
-        inline=False,
-    )
-    heavy.add_field(
-        name="t!lexg  (aliases: lastexportgrab)",
-        value="Re-apply the last `t!ihtx` export to a new attachment using the same effect chain.",
-        inline=False,
-    )
-    heavy.set_footer(text=f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB")
-
-    # ── 2. Fun ────────────────────────────────────────────────────────────
-    fun = discord.Embed(
-        title="🎉 Fun",
-        color=discord.Color.blurple(),
-    )
-    fun.add_field(
-        name="t!huehsv <hue>  (aliases: hhsv)",
-        value="Apply hue shift via ImageMagick haldclut. Example: `t!huehsv 0.5`",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!mirror <left|right|top|bottom|deg>",
-        value="Mirror media using FFmpeg split/flip/stack. Also works as a pipe effect.",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!syncaudio [alt]  (aliases: sa, sync)",
-        value=(
+    },
+    {
+        "cat": "heavy",
+        "name": "t!preview1280 [start] [dur]",
+        "value": "12-segment TV-simulator montage. Defaults: start=1.85, dur=0.85",
+    },
+    {
+        "cat": "heavy",
+        "name": "t!invlum [n]",
+        "value": "Apply luma-inversion progressively N times and concat all iterations.",
+    },
+    {
+        "cat": "heavy",
+        "name": "t!lexg  (aliases: lastexportgrab)",
+        "value": "Re-apply the last `t!ihtx` export to a new attachment using the same effect chain.",
+    },
+    # ── Fun ──
+    {
+        "cat": "fun",
+        "name": "t!huehsv <hue>  (aliases: hhsv)",
+        "value": "Apply hue shift via ImageMagick haldclut. Example: `t!huehsv 0.5`",
+    },
+    {
+        "cat": "fun",
+        "name": "t!mirror <left|right|top|bottom|deg>",
+        "value": "Mirror media using FFmpeg split/flip/stack. Also works as a pipe effect.",
+    },
+    {
+        "cat": "fun",
+        "name": "t!syncaudio [alt]  (aliases: sa, sync)",
+        "value": (
             "Sync video and audio durations by adjusting playback speed.\n"
             "Default: speeds up video to match audio. `alt`: speeds up audio to match video."
         ),
-        inline=False,
-    )
-    fun.add_field(
-        name="t!trim <start> <end>",
-        value="Precisely trim audio, video, or GIF. Supports HH:MM:SS.frac and plain seconds.",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!dl <url>  (aliases: dv, download, dlv)",
-        value="Download a video or image from a URL and upload it to Discord.",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!catbox  (aliases: cb, upload)",
-        value="Upload any file (up to 200 MB) to catbox.moe and get a permanent direct link.",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!chat <prompt>  (aliases: ask, ai)",
-        value="Chat with the AI assistant. Attach images or videos too.",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!img2vid [duration] <prompt>  (aliases: i2v)",
-        value=(
+    },
+    {
+        "cat": "fun",
+        "name": "t!trim <start> <end>",
+        "value": "Trim audio, video, or GIF. Supports HH:MM:SS.frac and plain seconds.",
+    },
+    {
+        "cat": "fun",
+        "name": "t!dl <url>  (aliases: dv, download, dlv)",
+        "value": "Download a video or image from a URL and upload it to Discord.",
+    },
+    {
+        "cat": "fun",
+        "name": "t!catbox  (aliases: cb, upload)",
+        "value": "Upload any file (up to 200 MB) to catbox.moe and get a permanent direct link.",
+    },
+    {
+        "cat": "fun",
+        "name": "t!chat <prompt>  (aliases: ask, ai)",
+        "value": "Chat with the AI assistant. Attach images or videos too.",
+    },
+    {
+        "cat": "fun",
+        "name": "t!img2vid [duration] <prompt>  (aliases: i2v)",
+        "value": (
             "Generate a video from a prompt (+ optional image) via Sora.\n"
             "Example: `t!img2vid 5 a cyberpunk city at night`"
         ),
-        inline=False,
-    )
-    fun.add_field(
-        name="t!tag <name> [args]  (aliases: tags)",
-        value=(
-            "Invoke a custom tag. Run `t!tag help` for the full tag scripting reference.\n"
+    },
+    {
+        "cat": "fun",
+        "name": "t!tag <name> [args]  (aliases: tags)",
+        "value": (
+            "Invoke a custom tag. Run `t!tag help` for the full scripting reference.\n"
             "Supports variables, math, conditionals, embed JSON, iscript, mediascript, and IHTX."
         ),
-        inline=False,
-    )
-    fun.add_field(
-        name="t!presets",
-        value="List all available IHTX presets.",
-        inline=False,
-    )
-    fun.add_field(
-        name="t!updatelog  (aliases: updates, changelog)",
-        value="Show recent bot updates organized by category.",
-        inline=False,
-    )
+    },
+    {
+        "cat": "fun",
+        "name": "t!presets",
+        "value": "List all available IHTX presets.",
+    },
+    {
+        "cat": "fun",
+        "name": "t!updatelog  (aliases: updates, changelog)",
+        "value": "Show recent bot updates organized by category.",
+    },
+    # ── Owner ──
+    {
+        "cat": "owner",
+        "name": "t!blockuser / t!unblockuser <@user>",
+        "value": "Add or remove a user from the global blocklist.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!blockchannel / t!unblockchannel <#channel>",
+        "value": "Block or unblock a channel from running bot commands.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!keywordblock <keyword> [#channel]",
+        "value": "Block a keyword in a specific channel (or globally). `t!keywordblockremove` to undo.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!autoreply <trigger> | <response> [#channel]",
+        "value": "Add an autoreply. Supports `{mention}` / `{user}` / `{random:a|b|c}` placeholders.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!removeautoreply <trigger>  (aliases: rar)",
+        "value": "Remove an autoreply trigger.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!autoreplies  (aliases: arlist)",
+        "value": "List all active autoreplies.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!autoreply2 [#channel]  /  t!autoreply2list",
+        "value": "Toggle AI auto-reply (responds to every message) in a channel.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!warn @user <reason>  /  t!warnings @user  /  t!clearwarn @user",
+        "value": "Warn, view, or clear warnings for a user.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!say / t!sayembed <content>",
+        "value": "Send a plain message or embed as the bot.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!setactivity <type> <text>  (aliases: activity, presence)",
+        "value": "Change the bot's activity status. Types: playing, watching, listening, streaming.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!setlimit @user <n>  /  t!usage",
+        "value": "Set per-user heavy command limit. `t!usage` checks your current count.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!listservers  /  t!listchannels <guild_id>",
+        "value": "List all guilds the bot is in, or all channels in a specific guild.",
+    },
+    {
+        "cat": "owner",
+        "name": "t!sendmsg <channel_id> <message>  (aliases: msgsend)",
+        "value": "Send a message to any channel by ID.",
+    },
+]
 
-    # ── 3. Owner ──────────────────────────────────────────────────────────
-    owner = discord.Embed(
-        title="🔒 Owner",
-        color=discord.Color.dark_grey(),
-    )
-    owner.add_field(
-        name="t!blockuser / t!unblockuser <@user>",
-        value="Add or remove a user from the global blocklist.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!blockchannel / t!unblockchannel <#channel>",
-        value="Block or unblock a channel from running bot commands.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!keywordblock <keyword> [#channel]",
-        value="Block a keyword in a specific channel (or globally). `t!keywordblockremove` to undo.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!autoreply <trigger> | <response> [#channel]",
-        value="Add an autoreply. Supports `{mention}` / `{user}` / `{random:a|b|c}` placeholders.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!removeautoreply <trigger>  (aliases: rar)",
-        value="Remove an autoreply trigger.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!autoreplies  (aliases: arlist)",
-        value="List all active autoreplies.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!autoreply2 [#channel]  / t!autoreply2list",
-        value="Toggle AI auto-reply (responds to every message) in a channel.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!warn @user <reason>  /  t!warnings @user  /  t!clearwarn @user",
-        value="Warn, view, or clear warnings for a user.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!say / t!sayembed <content>",
-        value="Send a plain message or embed as the bot.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!setactivity <type> <text>  (aliases: activity, presence)",
-        value="Change the bot's activity status. Types: playing, watching, listening, streaming.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!setlimit @user <n>  /  t!usage",
-        value="Set per-user heavy command limit. `t!usage` checks your current count.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!listservers  /  t!listchannels <guild_id>",
-        value="List all guilds the bot is in, or all channels in a specific guild.",
-        inline=False,
-    )
-    owner.add_field(
-        name="t!sendmsg <channel_id> <message>  (aliases: msgsend)",
-        value="Send a message to any channel by ID.",
-        inline=False,
-    )
-    owner.set_footer(text="All owner commands are restricted to the configured owner ID(s).")
+_HELP_CATS = {
+    "heavy": ("⚙️ Heavy Commands", discord.Color.dark_red()),
+    "fun":   ("🎉 Fun",            discord.Color.blurple()),
+    "owner": ("🔒 Owner",          discord.Color.dark_grey()),
+}
 
-    await ctx.reply(embeds=[heavy, fun, owner])
+
+def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> discord.Embed:
+    """Build a help embed for a category, or for an arbitrary list of entries (search results)."""
+    if entries is None:
+        entries = [e for e in _HELP_ENTRIES if e["cat"] == cat]
+
+    if cat and cat in _HELP_CATS:
+        title, color = _HELP_CATS[cat]
+    else:
+        title, color = "🔍 Search Results", discord.Color.gold()
+
+    embed = discord.Embed(title=title, color=color)
+    for entry in entries[:25]:
+        embed.add_field(name=entry["name"], value=entry["value"], inline=False)
+
+    if cat == "heavy":
+        embed.set_footer(
+            text=f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB"
+        )
+    elif cat == "owner":
+        embed.set_footer(text="All owner commands are restricted to the configured owner ID(s).")
+
+    return embed
+
+
+def _build_home_embed() -> discord.Embed:
+    counts = {c: sum(1 for e in _HELP_ENTRIES if e["cat"] == c) for c in _HELP_CATS}
+    embed = discord.Embed(
+        title="IHTX Bot — Help",
+        description=(
+            "Pick a category from the dropdown below, or run:\n"
+            "`t!ihtxhelp <query>` to search all commands.\n\n"
+            f"⚙️ **Heavy Commands** — {counts['heavy']} entries\n"
+            f"🎉 **Fun** — {counts['fun']} entries\n"
+            f"🔒 **Owner** — {counts['owner']} entries"
+        ),
+        color=0x5865F2,
+    )
+    embed.set_footer(text="I Hate The X — FFmpeg logo destruction bot")
+    return embed
+
+
+class _HelpSelect(discord.ui.Select):
+    def __init__(self, invoker_id: int):
+        self._invoker_id = invoker_id
+        options = [
+            discord.SelectOption(label="⚙️ Heavy Commands", value="heavy",
+                                 description="ihtx, ffmpeg, multipitch, effects reference…"),
+            discord.SelectOption(label="🎉 Fun",            value="fun",
+                                 description="huehsv, trim, dl, catbox, tag, chat, img2vid…"),
+            discord.SelectOption(label="🔒 Owner",          value="owner",
+                                 description="blockuser, autoreply, warn, say, setlimit…"),
+            discord.SelectOption(label="🏠 Home",            value="home",
+                                 description="Back to the overview"),
+        ]
+        super().__init__(placeholder="Select a category…", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self._invoker_id:
+            return await interaction.response.send_message(
+                "Only the person who ran this command can use this menu.", ephemeral=True
+            )
+        choice = self.values[0]
+        if choice == "home":
+            embed = _build_home_embed()
+        else:
+            embed = _build_help_embed(choice)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class _HelpView(discord.ui.View):
+    def __init__(self, invoker_id: int):
+        super().__init__(timeout=300)
+        self.add_item(_HelpSelect(invoker_id))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        # message ref not stored — Discord will leave it as-is after timeout
+
+
+@bot.hybrid_command(name="ihtxhelp", aliases=["bothelp"], description="Show IHTX Bot help — pick a category or search")
+async def help_command(ctx: commands.Context, *, query: str = ""):
+    query = query.strip().lower()
+
+    if query:
+        # ── Search mode ────────────────────────────────────────────────────
+        results = [
+            e for e in _HELP_ENTRIES
+            if query in e["name"].lower() or query in e["value"].lower()
+        ]
+        if not results:
+            return await ctx.reply(
+                embed=discord.Embed(
+                    description=f"🔍 No commands matched `{query}`. Try a shorter keyword.",
+                    color=discord.Color.red(),
+                )
+            )
+        embed = _build_help_embed(None, results)
+        embed.set_footer(text=f"{len(results)} result(s) for '{query}'")
+        return await ctx.reply(embed=embed)
+
+    # ── Browse mode ────────────────────────────────────────────────────────
+    embed = _build_home_embed()
+    view = _HelpView(ctx.author.id)
+    await ctx.reply(embed=embed, view=view)
 
 
 # ---------- Update Log ----------
