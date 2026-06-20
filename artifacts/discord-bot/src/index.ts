@@ -16,6 +16,7 @@ import { handleSlots } from './commands/games/slots.js';
 import { handleChoose } from './commands/games/choose.js';
 import { handleRoulette } from './commands/games/roulette.js';
 import { handleTrivia } from './commands/games/trivia.js';
+import { handleInfo } from './commands/info.js';
 
 if (!BOT_TOKEN) {
   console.error('ERROR: DISCORD_TOKEN environment variable is not set.');
@@ -36,7 +37,7 @@ client.once('clientReady', (c) => {
   console.log(`[IHTX-TS] Logged in as ${c.user.tag}`);
   console.log(`[IHTX-TS] Prefix: ${PREFIX}`);
   console.log(`[IHTX-TS] Owner ID: ${BOT_OWNER_ID || '(not set)'}`);
-  console.log(`[IHTX-TS] Commands: download, multipitchihtx, coinflip, dice, rps, 8ball, slots, choose, roulette, trivia, help`);
+  console.log(`[IHTX-TS] Commands: download, multipitchihtx, coinflip, dice, rps, 8ball, slots, choose, roulette, trivia, help, info`);
 });
 
 client.on('messageCreate', async (message: Message) => {
@@ -99,6 +100,10 @@ client.on('messageCreate', async (message: Message) => {
 
       case 'trivia':
         await handleTrivia(message, BOT_OWNER_ID);
+        break;
+
+      case 'info':
+        await handleInfo(message);
         break;
 
       default:
