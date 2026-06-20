@@ -3841,7 +3841,8 @@ def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> dis
 
     embed = discord.Embed(title=title, color=color)
     for entry in entries[:25]:
-        embed.add_field(name=entry["name"], value=entry["value"], inline=False)
+        copyable_value = f"`{entry['name']}`\n{entry['value']}"
+        embed.add_field(name=entry["name"], value=copyable_value, inline=False)
 
     if cat == "heavy":
         embed.set_footer(
@@ -3939,6 +3940,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v2.0",
+        "date": "2026-06-20",
+        "heavy": [],
+        "fun": [
+            "**t!ihtxhelp** — command syntax now shown as a copyable code block inside each help entry",
+        ],
+        "owner": [],
+    },
     {
         "version": "v1.9",
         "date": "2026-06-20",
