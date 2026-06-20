@@ -8,57 +8,58 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
   const maxReps = getMaxRepetitions(message.author.id, ownerId, guild);
   const uploadLimit = getUploadLimitBytes(guild);
   const boosted = guild && guild.premiumTier >= GuildPremiumTier.Tier1;
-  const boostBonus = boosted ? ` (+${LIMITS.BOOST_BONUS} boost)` : '';
+  const boostBonus = boosted ? ` +${LIMITS.BOOST_BONUS} boost` : '';
   const baseReps = isOwner ? LIMITS.OWNER_MAX_REPS : LIMITS.NON_OWNER_MAX_REPS;
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle('IHTX Bot — Commands')
+    .setAuthor({
+      name: isOwner ? `👑 ${message.author.displayName}` : message.author.displayName,
+      iconURL: message.author.displayAvatarURL(),
+    })
+    .setTitle('IHTX Bot — All Commands')
     .setDescription(`Prefix: \`${PREFIX}\`  •  All commands start with \`t!\``)
     .addFields(
       {
-        name: `\`${PREFIX}download <url>\``,
+        name: '🎬 Media',
         value: [
-          'Download a video via yt-dlp and send it here.',
-          '• URL must be `http://` or `https://`',
-          '• Best quality mp4',
-          `• Upload limit: **${formatBytes(uploadLimit)}**`,
+          `\`${PREFIX}download <url>\` — Download a video via yt-dlp`,
+          `\`${PREFIX}multipitchihtx [opts]\` — Multi-voice pitch shifting on a video attachment`,
         ].join('\n'),
       },
       {
-        name: `\`${PREFIX}multipitchihtx [options]\``,
+        name: '🎮 Games',
         value: [
-          'Apply multi-voice pitch shifting to an attached video.',
-          'Attach a video file (`.mp4 .mov .mkv .webm .avi`) to your message.',
-          '',
-          '**Options:**',
-          `\`repetitions=<n>\` — pitch layers (default: 20, min: 1, **max: ${maxReps}**${boostBonus ? ` — base ${baseReps}${boostBonus}` : ''})`,
+          `\`${PREFIX}coinflip\` (alias: \`cf\`) — Flip a coin`,
+          `\`${PREFIX}dice [expr]\` (alias: \`roll\`) — Roll dice, e.g. \`2d6\`, \`d20\`, \`3d8+5\``,
+          `\`${PREFIX}rps <rock|paper|scissors>\` — Rock Paper Scissors vs bot`,
+          `\`${PREFIX}8ball <question>\` — Ask the Magic 8-Ball`,
+          `\`${PREFIX}slots\` — Spin the slot machine`,
+          `\`${PREFIX}roulette <red|black|green|0-36>\` — Place a roulette bet`,
+          `\`${PREFIX}choose <a | b | c>\` (alias: \`pick\`) — Pick a random option`,
+          `\`${PREFIX}trivia\` — Answer a random trivia question`,
+        ].join('\n'),
+      },
+      {
+        name: `\`${PREFIX}multipitchihtx\` options`,
+        value: [
+          `\`repetitions=<n>\` — pitch layers (default: 20, **max: ${baseReps}${boostBonus}**)`,
           '`length=<n>` — pitch spread in semitones, 0.01–999 (default: 0.4)',
-          '`engine=<r2|r3|r4>` — Rubber Band engine (default: r3)',
-          '`window=<long|short>` — window mode (default: long)',
-          '',
-          '**Example:**',
-          `\`\`\`${PREFIX}multipitchihtx repetitions=10 length=0.6 engine=r3 window=long\`\`\``,
-          '**Output:** WAV audio file only',
-          `**Upload limit:** ${formatBytes(uploadLimit)}`,
+          '`engine=<r2|r3|r4>\` — Rubber Band engine (default: r3)',
+          '`window=<long|short>\` — window mode (default: long)',
         ].join('\n'),
       },
       {
-        name: `\`${PREFIX}help\``,
-        value: 'Show this message.',
+        name: '📊 Your Limits',
+        value: [
+          `Role: **${isOwner ? '👑 Owner' : 'User'}**`,
+          `Server boost: **${boosted ? `Tier ${guild!.premiumTier} ✅` : 'None'}**`,
+          `Max repetitions: **${maxReps}**`,
+          `Max upload: **${formatBytes(uploadLimit)}**`,
+        ].join('\n'),
       },
     )
-    .addFields({
-      name: '📊 Your Limits',
-      value: [
-        `Role: **${isOwner ? 'Owner' : 'User'}**`,
-        `Server boost: **${boosted ? `Tier ${guild!.premiumTier} ✅` : 'None'}**`,
-        `Max repetitions: **${maxReps}**`,
-        `Max upload: **${formatBytes(uploadLimit)}**`,
-      ].join('\n'),
-      inline: false,
-    })
-    .setFooter({ text: 'IHTX Bot (TypeScript) • Uses yt-dlp, ffmpeg, Rubber Band' });
+    .setFooter({ text: 'IHTX Bot (TypeScript) • yt-dlp, ffmpeg, Rubber Band' });
 
   await message.reply({ embeds: [embed] });
 }
