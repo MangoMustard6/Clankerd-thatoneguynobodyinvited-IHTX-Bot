@@ -7,6 +7,7 @@ import {
 import { BOT_TOKEN, BOT_OWNER_ID, PREFIX } from './config.js';
 import { handleDownload } from './commands/download.js';
 import { handleMultipitchIHTX } from './commands/multipitchihtx.js';
+import { handleHelp } from './commands/help.js';
 
 if (!BOT_TOKEN) {
   console.error('ERROR: DISCORD_TOKEN environment variable is not set.');
@@ -46,6 +47,10 @@ client.on('messageCreate', async (message: Message) => {
 
       case 'multipitchihtx':
         await handleMultipitchIHTX(message, args, BOT_OWNER_ID);
+        break;
+
+      case 'help':
+        await handleHelp(message, BOT_OWNER_ID);
         break;
 
       default:
