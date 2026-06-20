@@ -58,15 +58,6 @@ try:
 except ImportError:
     _openrouter_client = None
 
-try:
-    import fal_client as _fal_client
-except ImportError:
-    _fal_client = None
-
-try:
-    import replicate as _replicate
-except ImportError:
-    _replicate = None
 
 # ---------- Configuration & constants ----------
 
@@ -3739,15 +3730,7 @@ _HELP_ENTRIES: list[dict] = [
     {
         "cat": "fun",
         "name": "t!chat <prompt>  (aliases: ask, ai)",
-        "value": "Chat with the AI assistant. Uses OpenRouter (qwen3-coder) when configured, falls back to Gemini. Attach images or videos too.",
-    },
-    {
-        "cat": "fun",
-        "name": "t!img2vid [duration] <prompt>  (aliases: i2v)",
-        "value": (
-            "Generate a video from a prompt (+ optional image) via Sora.\n"
-            "Example: `t!img2vid 5 a cyberpunk city at night`"
-        ),
+        "value": "Chat with Clankered Thatoneguynobodyinvited using Gemini 2.5 Flash. Pure Google GenAI pipeline.",
     },
     {
         "cat": "fun",
@@ -3891,7 +3874,7 @@ class _HelpSelect(discord.ui.Select):
             discord.SelectOption(label="⚙️ Heavy Commands", value="heavy",
                                  description="ihtx, ffmpeg, multipitch, effects reference…"),
             discord.SelectOption(label="🎉 Fun",            value="fun",
-                                 description="huehsv, trim, dl, catbox, tag, chat, img2vid…"),
+                                 description="huehsv, trim, dl, catbox, tag, chat, ask…"),
             discord.SelectOption(label="🔒 Owner",          value="owner",
                                  description="blockuser, autoreply, warn, say, setlimit…"),
             discord.SelectOption(label="🏠 Home",            value="home",
@@ -3953,6 +3936,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v2.4",
+        "date": "2026-06-20",
+        "heavy": [],
+        "fun": [
+            "**t!chat / t!ask** — Rebuilt on pure Google GenAI pipeline: `types.GenerateContentConfig` with `system_instruction`, temperature 0.83, max 1024 tokens",
+            "**t!chat** — OpenRouter dependency removed from chat entirely; Gemini 2.5 Flash is the sole engine",
+            "**t!chat / t!ask** — Now available on the TypeScript bot too via `@google/genai` Node.js SDK",
+            "**t!img2vid / t!imagevideo / t!video** — AI video generation commands removed",
+        ],
+        "owner": [],
+    },
     {
         "version": "v2.3",
         "date": "2026-06-20",
@@ -4990,9 +4985,9 @@ async def chat(ctx: commands.Context, *, question: str):
     current_prefix = ctx.prefix if ctx.prefix else "t!"
 
     system_identity = (
-        f"You are 'Clankered Thatoneguynobodyinvited', a highly advanced, video editing AI bot which makes IHTXES (I Hate The Xs). "
-        f"You are currently chatting with {username} in the #{channel_name} channel. "
-        f"Always maintain an elegant, polite, and deeply knowledgeable tone. And keep it low sometime 'like this' but still have proper grammar. "
+        f"You are 'Clankered Thatoneguynobodyinvited', a highly advanced, video editing AI bot which makes IHTXES (I Hate The Xs).\n"
+        f"You are currently chatting with {username} in the #{channel_name} channel.\n"
+        f"Always maintain an elegant, polite, and deeply knowledgeable tone. And keep it low sometime 'like this' but still have proper grammar.\n"
         f"Address the user by their name when appropriate. Refuse if nsfw questions are asked.\n\n"
         f"PREFIX AWARENESS RULES:\n"
         f"- Your current command prefix is '{current_prefix}'.\n"
@@ -5002,83 +4997,34 @@ async def chat(ctx: commands.Context, *, question: str):
     if _OWNER_PERSONAS.get(ctx.author.id):
         system_identity += "\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
 
-    # ── OpenRouter with model fallback list ───────────────────────────────────
-    if _openrouter_client is not None:
-        models_to_try = [
-            "qwen/qwen3-coder:free",                   # Preferred primary
-            "meta-llama/llama-3.3-70b-instruct:free",  # Fast backup
-            "openrouter/auto",                         # Automated global fallback
-        ]
+    if _genai_client is None:
+        await ctx.send("sorry dude... AI is unavailable right now (no `GEMINI_API_KEY` configured).")
+        return
 
-        bot_response = None
+    try:
         loop = asyncio.get_event_loop()
-
-        for model_name in models_to_try:
-            try:
-                print(f"Routing to OpenRouter: {model_name}")
-                completion = await loop.run_in_executor(
-                    None,
-                    lambda m=model_name: _openrouter_client.chat.completions.create(
-                        model=m,
-                        messages=[
-                            {"role": "system", "content": system_identity},
-                            {"role": "user",   "content": question},
-                        ],
-                        max_tokens=1024,
-                        temperature=0.83,
-                    ),
-                )
-                bot_response = completion.choices[0].message.content
-                break
-            except Exception as api_err:
-                print(f"OpenRouter model {model_name} failed/throttled: {api_err}")
-                continue
-
-        # Emergency Gemini fallback if all OpenRouter models failed
-        if not bot_response and _genai_client is not None:
-            try:
-                print("OpenRouter completely jammed. Switching execution to Google GenAI Tier...")
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: _genai_client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=f"System Context Instructions:\n{system_identity}\n\nUser Question:\n{question}",
-                    ),
-                )
-                bot_response = response.text
-            except Exception as gemini_err:
-                print(f"Emergency Google backup layer failed as well: {gemini_err}")
-
+        response = await loop.run_in_executor(
+            None,
+            lambda: _genai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=question,
+                config=_genai_types.GenerateContentConfig(
+                    system_instruction=system_identity,
+                    temperature=0.83,
+                    max_output_tokens=1024,
+                ),
+            ),
+        )
+        bot_response = response.text
         if bot_response:
             if len(bot_response) > 2000:
                 bot_response = bot_response[:1995] + "..."
             await ctx.send(bot_response)
         else:
-            await ctx.send("sorry dude... all free AI lines are completely jammed right now, try again in like 30 seconds?")
-
-    # ── Gemini-only path (no OpenRouter key configured) ───────────────────────
-    elif _genai_client is not None:
-        try:
-            print("OpenRouter not configured. Routing directly to Google GenAI...")
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: _genai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=f"System Context Instructions:\n{system_identity}\n\nUser Question:\n{question}",
-                ),
-            )
-            reply_text = response.text
-            if len(reply_text) > 2000:
-                reply_text = reply_text[:1995] + "..."
-            await ctx.send(reply_text)
-        except Exception as e:
-            print(f"Google GenAI failed: {e}")
-            await ctx.send("sorry dude... all free AI lines are completely jammed right now, try again in like 30 seconds?")
-
-    else:
-        await ctx.send("sorry dude... AI is unavailable right now (no API key configured).")
+            await ctx.send("sorry dude... returned an empty response, try again sometime?")
+    except Exception as e:
+        print(f"Google GenAI Error encountered: {e}")
+        await ctx.send("sorry dude... ran into an error processing your request, try again sometime?")
 
 
 @bot.hybrid_command(name="clearchat", aliases=["resetai", "chatclear"], description="Clear your AI conversation history")
@@ -5500,340 +5446,6 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
     # Re-process as a fresh command invocation
     await bot.process_commands(after)
-
-
-# ---------- Image-to-video (fal.ai HappyHorse) ----------
-
-async def _imagevideo_core(
-    send_fn,
-    reply_fn,
-    fetch_ref_fn,
-    message_attachments: list,
-    message_reference,
-    prompt: str,
-    duration: int,
-    image_url: str = None,
-    attachment: discord.Attachment = None,
-):
-    """Shared logic for imagevideo prefix and slash commands."""
-    if _fal_client is None:
-        await reply_fn("❌ `fal-client` is not installed. Ask the bot owner to install it.")
-        return
-    if not os.environ.get("FAL_KEY"):
-        await reply_fn("❌ `FAL_KEY` is not configured. Ask the bot owner to add it.")
-        return
-
-    duration = max(1, min(duration, 30))
-
-    resolved_url = image_url
-    if resolved_url is None:
-        if attachment is not None:
-            resolved_url = attachment.url
-        elif message_attachments:
-            resolved_url = message_attachments[0].url
-        elif message_reference:
-            try:
-                ref = await fetch_ref_fn(message_reference.message_id)
-                if ref.attachments:
-                    resolved_url = ref.attachments[0].url
-            except Exception:
-                pass
-
-    if not resolved_url:
-        await reply_fn(
-            "❌ No image found. Please:\n"
-            "• Attach an image to your message, or\n"
-            "• Pass an image URL via the `image_url` option, or\n"
-            "• Reply to a message that contains an image."
-        )
-        return
-
-    status_msg = await reply_fn(f"🎬 Generating {duration}s video with HappyHorse AI… this may take a minute.")
-
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: _fal_client.subscribe(
-                "fal-ai/happyhorse-1.0/image-to-video",
-                arguments={"prompt": prompt, "image_url": resolved_url, "duration": duration},
-            ),
-        )
-        video_url = result["video"]["url"]
-        await status_msg.edit(content="✅ Done!")
-        await send_fn(video_url)
-    except Exception as e:
-        await status_msg.edit(content=f"❌ Error generating video:\n```\n{e}\n```")
-
-
-@bot.command(name="imagevideo", aliases=["iv", "vidgen"])
-async def imagevideo_prefix(ctx: commands.Context, duration: int = 10, image_url: str = None, *, prompt: str = "cinematic scene"):
-    """Generate a video from an attached image using HappyHorse AI.
-    Usage: t!imagevideo [duration] [image_url] [prompt]
-    """
-    await _imagevideo_core(
-        send_fn=ctx.send,
-        reply_fn=ctx.reply,
-        fetch_ref_fn=ctx.channel.fetch_message,
-        message_attachments=ctx.message.attachments,
-        message_reference=ctx.message.reference,
-        prompt=prompt,
-        duration=duration,
-        image_url=image_url,
-    )
-
-
-@bot.tree.command(name="imagevideo", description="Generate a video from an image using HappyHorse AI")
-@app_commands.describe(
-    prompt="Description of the motion/scene (default: cinematic scene)",
-    duration="Video duration in seconds, 1–30 (default: 10)",
-    image_url="Image URL to use instead of an attachment",
-    attachment="Image file to generate video from",
-)
-async def imagevideo_slash(
-    interaction: discord.Interaction,
-    duration: int = 10,
-    image_url: str = None,
-    attachment: discord.Attachment = None,
-    prompt: str = "cinematic scene",
-):
-    await interaction.response.defer()
-
-    async def reply_fn(content):
-        return await interaction.followup.send(content)
-
-    async def send_fn(content):
-        await interaction.followup.send(content)
-
-    async def fetch_ref_fn(message_id):
-        return await interaction.channel.fetch_message(message_id)
-
-    await _imagevideo_core(
-        send_fn=send_fn,
-        reply_fn=reply_fn,
-        fetch_ref_fn=fetch_ref_fn,
-        message_attachments=[],
-        message_reference=None,
-        prompt=prompt,
-        duration=duration,
-        image_url=image_url,
-        attachment=attachment,
-    )
-
-
-# ---------- Text/image-to-video (Replicate Seedance 2.0) ----------
-
-async def _video_core(
-    send_fn,
-    reply_fn,
-    fetch_ref_fn,
-    message_attachments: list,
-    message_reference,
-    prompt: str,
-    duration: int,
-    resolution: str,
-    aspect_ratio: str,
-    image_url: str = None,
-    attachment: discord.Attachment = None,
-):
-    """Shared logic for video prefix and slash commands."""
-    if _replicate is None:
-        await reply_fn("❌ `replicate` is not installed. Ask the bot owner to install it.")
-        return
-    if not os.environ.get("REPLICATE_API_TOKEN"):
-        await reply_fn("❌ `REPLICATE_API_TOKEN` is not configured. Ask the bot owner to add it.")
-        return
-
-    duration = max(4, min(duration, 15))
-    if resolution not in ("480p", "720p", "1080p"):
-        resolution = "720p"
-    if aspect_ratio not in ("16:9", "9:16", "1:1"):
-        aspect_ratio = "16:9"
-
-    resolved_image = image_url
-    if resolved_image is None:
-        if attachment is not None:
-            resolved_image = attachment.url
-        elif message_attachments:
-            resolved_image = message_attachments[0].url
-        elif message_reference:
-            try:
-                ref = await fetch_ref_fn(message_reference.message_id)
-                if ref.attachments:
-                    resolved_image = ref.attachments[0].url
-            except Exception:
-                pass
-
-    mode = "image-to-video" if resolved_image else "text-to-video"
-    status_msg = await reply_fn(f"🎬 Generating {duration}s {resolution} video ({mode})… this may take a few minutes.")
-
-    try:
-        input_data = {
-            "prompt": prompt,
-            "duration": duration,
-            "resolution": resolution,
-            "aspect_ratio": aspect_ratio,
-            "generate_audio": True,
-        }
-        if resolved_image:
-            input_data["image"] = resolved_image
-
-        replicate_token = os.environ.get("REPLICATE_API_TOKEN")
-        loop = asyncio.get_event_loop()
-        output = await loop.run_in_executor(
-            None,
-            lambda: _replicate.Client(api_token=replicate_token).run(
-                "bytedance/seedance-2.0", input=input_data
-            ),
-        )
-
-        video_url = str(output[0]) if isinstance(output, list) else str(output)
-        await status_msg.edit(content="✅ Done!")
-        await send_fn(video_url)
-    except Exception as e:
-        await status_msg.edit(content=f"❌ Error generating video:\n```\n{e}\n```")
-
-
-@bot.command(name="video", aliases=["vid", "seedance"])
-async def video_prefix(ctx: commands.Context, duration: int = 5, resolution: str = "720p", aspect_ratio: str = "16:9", image_url: str = None, *, prompt: str = "cinematic video"):
-    """Generate a video using Seedance 2.0 via Replicate.
-    Usage: t!video [duration] [resolution] [aspect_ratio] [image_url] [prompt]
-    Attach an image or reply to one to use image-to-video mode.
-    """
-    await _video_core(
-        send_fn=ctx.send,
-        reply_fn=ctx.reply,
-        fetch_ref_fn=ctx.channel.fetch_message,
-        message_attachments=ctx.message.attachments,
-        message_reference=ctx.message.reference,
-        prompt=prompt,
-        duration=duration,
-        resolution=resolution,
-        aspect_ratio=aspect_ratio,
-        image_url=image_url,
-    )
-
-
-@bot.tree.command(name="video", description="Generate a video from a prompt or image using Seedance 2.0")
-@app_commands.describe(
-    prompt="What to generate (default: cinematic video)",
-    duration="Duration in seconds, 4–15 (default: 5)",
-    resolution="Output resolution: 480p, 720p, or 1080p (default: 720p)",
-    aspect_ratio="Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)",
-    image_url="Image URL for image-to-video mode",
-    attachment="Image attachment for image-to-video mode",
-)
-async def video_slash(
-    interaction: discord.Interaction,
-    duration: int = 5,
-    resolution: str = "720p",
-    aspect_ratio: str = "16:9",
-    image_url: str = None,
-    attachment: discord.Attachment = None,
-    prompt: str = "cinematic video",
-):
-    await interaction.response.defer()
-
-    async def reply_fn(content):
-        return await interaction.followup.send(content)
-
-    async def send_fn(content):
-        await interaction.followup.send(content)
-
-    async def fetch_ref_fn(message_id):
-        return await interaction.channel.fetch_message(message_id)
-
-    await _video_core(
-        send_fn=send_fn,
-        reply_fn=reply_fn,
-        fetch_ref_fn=fetch_ref_fn,
-        message_attachments=[],
-        message_reference=None,
-        prompt=prompt,
-        duration=duration,
-        resolution=resolution,
-        aspect_ratio=aspect_ratio,
-        image_url=image_url,
-        attachment=attachment,
-    )
-
-
-# ---------- img2vid (TikHub / Sora) ----------
-
-try:
-    from openai import OpenAI as _OpenAI
-except ImportError:
-    _OpenAI = None
-
-
-def _tikhub_pick_model(prompt: str, has_image: bool) -> str:
-    p = prompt.lower()
-    if has_image:
-        return "sora-image-1" if "fast" in p else "sora-2"
-    return "sora-2-pro" if "cinematic" in p else "sora-2"
-
-
-def _tikhub_generate(prompt: str, duration: int, image_url: str | None) -> tuple[str | None, str]:
-    """Synchronous TikHub call — run in executor. Retries on transient 503 channel errors."""
-    import time as _time
-    api_key = os.environ.get("TIKHUB_API_KEY")
-    client = _OpenAI(api_key=api_key, base_url="https://ai.tikhub.io/v1")
-    model = _tikhub_pick_model(prompt, image_url is not None)
-    kwargs = dict(model=model, prompt=prompt, n=1, extra_body={"duration": duration})
-    if image_url:
-        kwargs["extra_body"]["image"] = image_url
-    last_err = None
-    for attempt in range(5):
-        try:
-            response = client.images.generate(**kwargs)
-            return response.data[0].url, model
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            # Retry on transient "no available channel" / 503 / overload errors
-            if any(x in msg for x in ("503", "no available channel", "overload", "rate limit", "529")):
-                wait = 6 + attempt * 5
-                _time.sleep(wait)
-                continue
-            raise
-    raise last_err
-
-
-async def _run_img2vid(ctx: commands.Context, prompt: str, duration: int,
-                       image_url: str | None, status_msg: discord.Message):
-    try:
-        model = _tikhub_pick_model(prompt, image_url is not None)
-        await status_msg.edit(content=f"🎬 generating with `{model}`… 🙏 (may take a minute)")
-        loop = asyncio.get_event_loop()
-        video_url, model = await loop.run_in_executor(
-            None, lambda: _tikhub_generate(prompt, duration, image_url)
-        )
-        await status_msg.edit(content=f"✅ model: `{model}` | duration: `{duration}s`")
-        await ctx.send(video_url)
-    except Exception as e:
-        await status_msg.edit(content=f"❌ failed: {e}")
-
-
-@bot.hybrid_command(name="img2vid", aliases=["i2v"], description="Generate a video from a prompt (and optional image) using Sora")
-@app_commands.describe(
-    duration="Video length in seconds (default 5)",
-    prompt="Describe the video you want",
-)
-async def img2vid(ctx: commands.Context, duration: int = 5, *, prompt: str = "cinematic scene"):
-    """Generate a video via TikHub's Sora models.
-
-    Optionally attach an image to animate it.
-
-      t!img2vid 5 a cyberpunk city at night
-      t!img2vid 8 anime girl walking  (with image attached)
-    """
-    if _OpenAI is None:
-        await ctx.reply("❌ `openai` package not installed.")
-        return
-
-    image_url = ctx.message.attachments[0].url if ctx.message.attachments else None
-    status_msg = await ctx.reply("⏳ starting generation…")
-    asyncio.create_task(_run_img2vid(ctx, prompt, duration, image_url, status_msg))
 
 
 # ---------- Catbox upload ----------

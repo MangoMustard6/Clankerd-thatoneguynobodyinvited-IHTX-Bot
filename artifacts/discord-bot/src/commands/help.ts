@@ -103,11 +103,8 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
         {
           name: '🤖 AI & Utility',
           value: [
-            '`t!chat <prompt>` *ask ai* — Chat with AI (Gemini/Anthropic), supports image/video attachments',
+            '`t!chat <prompt>` *ask* — Chat with Clankered (Gemini 2.5 Flash), both bots',
             '`t!clearchat` *resetai chatclear* — Clear your AI conversation history',
-            '`t!img2vid [dur] <prompt>` *i2v* — Generate video from prompt (Sora)',
-            '`t!imagevideo [dur] [url] <prompt>` *iv vidgen* — Image-to-video via fal',
-            '`t!video [dur] [res] [ar] <prompt>` *vid seedance* — Text-to-video generation',
             '`t!random [sub]` *rand* — Random media from pool; `add`/`remove`/`list`/`clear` sub-commands',
             '`t!tag <name> [args]` *tags* — Custom scripting tags (variables, math, conditionals, iscript, IHTX)',
           ].join('\n'),
