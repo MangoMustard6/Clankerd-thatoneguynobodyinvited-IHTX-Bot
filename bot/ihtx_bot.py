@@ -812,8 +812,8 @@ def _run_ccshue(
 PIPE_EFFECT_NAMES = {
     "hflip", "vflip", "invert", "negate", "grayscale", "sepia", "rotate",
     "ccshue", "brightness", "contrast", "saturation", "swapuv", "mirror",
-    "zoom", "pinch&punch", "p&p", "pinchpunch", "swirl", "gm91deform",
-    "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse",
+    "zoom", "pinch&punch", "p&p", "pinchpunch", "gm91deform",
+    "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse", "vreverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio", "speed", "ffmpeg", "frei0r",
 }
@@ -1033,58 +1033,8 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f"H*{cy}+(Y-H*{cy})*(1-({strength})*gauss(-3.3333*pow(hypot((X-W*{cx})/(W*{radius}),(Y-H*{cy})/(H*{radius})),2))))"
         )
         return f"format=yuv444p,geq='{geq_expr}',scale=iw:ih,format=yuv420p"
-    if name == "swirl":
-        # Named preset options (1-4 or by name)
-        _swirl_presets = {
-            "1": "maximumclockwise",
-            "maximumclockwise": "maximumclockwise",
-            "2": "maximumcounterclockwise",
-            "maximumcounterclockwise": "maximumcounterclockwise",
-            "3": "mediumclockwise",
-            "mediumclockwise": "mediumclockwise",
-            "4": "mediumcounterclockwise",
-            "mediumcounterclockwise": "mediumcounterclockwise",
-        }
-        _cx0 = "W*(0.5+(0))"
-        _cy0 = "H*(0.5+(0))"
-        _r0 = "min(W,H)*(0.5*1)"
-        _hyp = f"hypot(X-{_cx0},Y-{_cy0})+1e-6"
-        _ang = f"atan2(Y-{_cy0},X-{_cx0})"
-        def _swirl_preset_filter(mul: str) -> str:
-            ang_factor = f"(({mul}*PI*-255)/180*PI)"
-            falloff = f"(if(lt({_hyp},{_r0}),1-{_hyp}/{_r0},0)^2)"
-            geq = (
-                f"p({_cx0}+{_hyp}*cos(({_ang})+{ang_factor}*{falloff}),"
-                f"{_cy0}+{_hyp}*sin(({_ang})+{ang_factor}*{falloff}))"
-            )
-            return f"format=yuv444p,scale=ih:ih,geq='{geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
-
-        preset_key = (params[0].lower() if params else "").strip()
-        if preset_key in _swirl_presets:
-            preset_name = _swirl_presets[preset_key]
-            mul_map = {
-                "maximumclockwise": "1",
-                "maximumcounterclockwise": "-1",
-                "mediumclockwise": "0.5",
-                "mediumcounterclockwise": "-.5",
-            }
-            return _swirl_preset_filter(mul_map[preset_name])
-
-        angle = params[0] if len(params) > 0 else "180"
-        radius = params[1] if len(params) > 1 else "0.5"
-        cx = params[2] if len(params) > 2 else "0.5"
-        cy = params[3] if len(params) > 3 else "0.5"
-        fallout = params[4] if len(params) > 4 else "quad"
-        lockaspectratio = params[5] if len(params) > 5 else "false"
-        exp_str = "" if fallout == "linear" else "^2"
-        min_wh = "min(W,H)"
-        swirl_geq = (
-            f"p(W*{cx}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*cos((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})),"
-            f"H*{cy}+(hypot(X-W*{cx},Y-H*{cy})+1e-6)*sin((atan2(Y-H*{cy},X-W*{cx}))+(({angle})/180*PI)*(if(lt(hypot(X-W*{cx},Y-H*{cy})+1e-6,{min_wh}*{radius}),1-(hypot(X-W*{cx},Y-H*{cy})+1e-6)/({min_wh}*{radius}),0){exp_str})))"
-        )
-        if lockaspectratio.lower() in ("1", "true", "t", "y", "yes", "+", "on"):
-            return f"format=yuv444p,scale=ih:ih,geq='{swirl_geq}',scale=iw:ih,setsar=1:1,format=yuv420p"
-        return f"format=yuv444p,geq='{swirl_geq}',scale=iw:ih,format=yuv420p"
+    if name == "vreverse":
+        return "reverse"
     if name == "gm91deform":
         deform_geq = (
             "p((W/2)+((X-W/2)/lerp(1,asin(sin(-Y/H)),0.164))/1.22"
@@ -1363,7 +1313,7 @@ def _apply_pipe_effects(
                     "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                     "-i", current, "-vf", shake_vf,
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out,
+                    "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", out,
                 ]
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
@@ -3551,8 +3501,9 @@ _HELP_ENTRIES: list[dict] = [
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
-            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `swirl=angle;r;cx;cy` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>`\n"
-            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `areverse` `syncaudio`\n"
+            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>`\n"
+            "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
+            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
     },
@@ -3599,6 +3550,17 @@ _HELP_ENTRIES: list[dict] = [
             "• **v** — vertical shake strength in pixels (default 0)\n"
             "Example: `t!ihtx 3 1.0 - mp4 shake=3`\n"
             "Example with both axes: `t!ihtx 3 1.0 - mp4 shake=5|3`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "vreverse / areverse pipe effects",
+        "value": (
+            "Reverse video frames or audio independently.\n"
+            "• **`vreverse`** — reverses video frames only (audio unaffected)\n"
+            "• **`areverse`** — reverses audio only (video unaffected)\n"
+            "Chain both to fully reverse: `t!ihtx 1 5 - mp4 vreverse,areverse`\n"
+            "Note: `vreverse` loads all frames into memory — keep clips short."
         ),
     },
     {
