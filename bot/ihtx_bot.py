@@ -3954,6 +3954,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v2.2",
+        "date": "2026-06-20",
+        "heavy": [],
+        "fun": [
+            "**t!chat / t!ask** — model fallback chain: qwen3-coder:free → llama-3.3-70b:free → openrouter/auto",
+            "**t!chat** — switched to `ctx.defer()` for reliable hybrid (slash + prefix) response handling",
+            "**t!chat** — prefix-aware system prompt with structured PREFIX AWARENESS RULES section",
+        ],
+        "owner": [],
+    },
+    {
         "version": "v2.1",
         "date": "2026-06-20",
         "heavy": [],
@@ -4957,110 +4968,108 @@ async def _build_gemini_parts(text: str, attachments) -> list[dict]:
     return parts
 
 
-@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="Chat with the AI assistant (attach images/videos too)")
-@app_commands.describe(message="Your message to the AI (optional if attaching media)")
-async def chat(ctx: commands.Context, *, message: str = ""):
-    """Chat with the IHTX AI assistant. Attach images or videos and the bot will see them."""
-    if not message and not ctx.message.attachments:
-        await ctx.reply("❌ Send a message or attach an image/video.")
-        return
+@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="Chat with Clankered Thatoneguynobodyinvited")
+@app_commands.describe(question="What do you want to ask?")
+async def chat(ctx: commands.Context, *, question: str):
+    """Chat with the IHTX AI assistant."""
+    await ctx.defer()
 
-    user_id = ctx.author.id
     username = ctx.author.display_name
     channel_name = getattr(ctx.channel, "name", "DM")
-    prefix = ctx.prefix or "t!"
+    current_prefix = ctx.prefix if ctx.prefix else "t!"
 
-    system = (
-        f"You are 'Clankered Thatoneguynobodyinvited', a highly advanced video editing AI bot which makes IHTXes (I Hate The Xs). "
-        f"You are currently chatting with {username} in #{channel_name}. "
-        f"Always maintain an elegant, polite, and deeply knowledgeable tone. Keep it low sometimes but still have proper grammar. "
-        f"Address the user by their name when appropriate. Refuse NSFW questions.\n\n"
-        f"When guiding users through commands, always use the active prefix '{prefix}' "
-        f"(e.g. {prefix}ihtx, {prefix}chat, {prefix}trim, {prefix}ffmpeg). Never assume a different prefix.\n\n"
-        f"Speak like a chill Gen Z friend. Use modern slang, meme culture references, and occasional AAVE-inspired internet terms naturally. "
-        f"Keep responses short, casual, and conversational. Match the user's energy. "
-        f"Use modern emojis naturally (😭🥹🙏🔥💔🥀🤝). Don't spam emojis in every sentence."
+    system_identity = (
+        f"You are 'Clankered Thatoneguynobodyinvited', a highly advanced, video editing AI bot which makes IHTXES (I Hate The Xs). "
+        f"You are currently chatting with {username} in the #{channel_name} channel. "
+        f"Always maintain an elegant, polite, and deeply knowledgeable tone. And keep it low sometime 'like this' but still have proper grammar. "
+        f"Address the user by their name when appropriate. Refuse if nsfw questions are asked.\n\n"
+        f"PREFIX AWARENESS RULES:\n"
+        f"- Your current command prefix is '{current_prefix}'.\n"
+        f"- If a user wants to use your video editing or utility tools, tell them to type things like '{current_prefix}ihtx', '{current_prefix}chat', '{current_prefix}trim', or '{current_prefix}ffmpeg'.\n"
+        f"- Never assume or mention static prefixes like '!' or '?'—always use '{current_prefix}' when guiding users through your toolset."
     )
-    if _OWNER_PERSONAS.get(user_id):
-        system += "\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
+    if _OWNER_PERSONAS.get(ctx.author.id):
+        system_identity += "\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
 
-    history = _chat_histories.setdefault(user_id, [])
-
-    # ── OpenRouter (qwen3-coder) ──────────────────────────────────────────────
+    # ── OpenRouter with model fallback list ───────────────────────────────────
     if _openrouter_client is not None:
-        # Ensure history is in OpenAI format; reset if it's Gemini-format
-        if history and "parts" in history[0]:
-            history.clear()
+        models_to_try = [
+            "qwen/qwen3-coder:free",                   # Preferred primary
+            "meta-llama/llama-3.3-70b-instruct:free",  # Fast backup
+            "openrouter/auto",                         # Automated global fallback
+        ]
 
-        history.append({"role": "user", "content": message or "[media attached]"})
-        if len(history) > _CHAT_MAX_HISTORY:
-            history[:] = history[-_CHAT_MAX_HISTORY:]
+        bot_response = None
+        loop = asyncio.get_event_loop()
 
-        async with ctx.typing():
+        for model_name in models_to_try:
             try:
-                loop = asyncio.get_event_loop()
+                print(f"[chat] Attempting: {model_name}")
                 completion = await loop.run_in_executor(
                     None,
-                    lambda: _openrouter_client.chat.completions.create(
-                        model="qwen/qwen3-coder:free",
-                        messages=[{"role": "system", "content": system}] + history,
+                    lambda m=model_name: _openrouter_client.chat.completions.create(
+                        model=m,
+                        messages=[
+                            {"role": "system", "content": system_identity},
+                            {"role": "user",   "content": question},
+                        ],
                         max_tokens=1024,
                         temperature=0.83,
                     ),
                 )
-                reply_text = completion.choices[0].message.content
-            except Exception as e:
-                await ctx.reply(f"❌ AI error: {e}")
-                history.pop()
-                return
+                bot_response = completion.choices[0].message.content
+                break
+            except Exception as api_err:
+                print(f"[chat] {model_name} failed: {api_err}")
+                continue
 
-        history.append({"role": "assistant", "content": reply_text})
+        if bot_response:
+            if len(bot_response) > 2000:
+                bot_response = bot_response[:1995] + "..."
+            await ctx.send(bot_response)
+        else:
+            await ctx.send("sorry dude... all free AI lines are completely jammed right now, try again in like 30 seconds?")
 
     # ── Gemini fallback ───────────────────────────────────────────────────────
     elif _genai_client is not None:
-        # Ensure history is in Gemini format; reset if it's OpenAI-format
+        history = _chat_histories.setdefault(ctx.author.id, [])
         if history and "content" in history[0]:
             history.clear()
 
-        parts = await _build_gemini_parts(message, ctx.message.attachments)
+        parts = await _build_gemini_parts(question, ctx.message.attachments)
         history.append({"role": "user", "parts": parts})
         if len(history) > _CHAT_MAX_HISTORY:
             history[:] = history[-_CHAT_MAX_HISTORY:]
 
-        async with ctx.typing():
-            try:
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: _genai_client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=history,
-                        config=_genai_types.GenerateContentConfig(
-                            system_instruction=system,
-                            max_output_tokens=1024,
-                        ),
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _genai_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=history,
+                    config=_genai_types.GenerateContentConfig(
+                        system_instruction=system_identity,
+                        max_output_tokens=1024,
                     ),
-                )
-                reply_text = response.text
-            except Exception as e:
-                await ctx.reply(f"❌ AI error: {e}")
-                history.pop()
-                return
+                ),
+            )
+            reply_text = response.text
+        except Exception as e:
+            await ctx.send(f"❌ AI error: {e}")
+            history.pop()
+            return
 
         text_only = [p for p in parts if "text" in p] or [{"text": "[media]"}]
         history[-1] = {"role": "user", "parts": text_only}
         history.append({"role": "model", "parts": [{"text": reply_text}]})
 
-    else:
-        await ctx.reply("❌ AI chat is unavailable — no API key configured (`OPENROUTER_API_KEY` or `GEMINI_API_KEY`).")
-        return
+        if len(reply_text) > 2000:
+            reply_text = reply_text[:1995] + "..."
+        await ctx.send(reply_text)
 
-    if len(reply_text) > 1900:
-        chunks = [reply_text[i:i+1900] for i in range(0, len(reply_text), 1900)]
-        for chunk in chunks:
-            await ctx.reply(chunk)
     else:
-        await ctx.reply(reply_text)
+        await ctx.send("sorry dude... AI is unavailable right now (no API key configured).")
 
 
 @bot.hybrid_command(name="clearchat", aliases=["resetai", "chatclear"], description="Clear your AI conversation history")
