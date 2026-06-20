@@ -11,6 +11,7 @@ ImageMagick/sox/etc. depending on advanced effects.
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from bot.tags.cog import TagCog
 import asyncio
 import json
 import math
@@ -2035,6 +2036,10 @@ async def _process_pending_resets():
 async def on_ready():
     print(f"IHTX Bot online as {bot.user} (ID: {bot.user.id})")
     print("------")
+    # Load cogs
+    if not bot.cogs.get("Tags"):
+        await bot.add_cog(TagCog(bot))
+        print("TagCog loaded")
     # Sync slash commands
     try:
         synced = await bot.tree.sync()
