@@ -5020,7 +5020,7 @@ async def chat(ctx: commands.Context, *, question: str):
         response = await loop.run_in_executor(
             None,
             lambda: _genai_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=question,
                 config=_genai_types.GenerateContentConfig(
                     system_instruction=system_identity,
@@ -5029,16 +5029,31 @@ async def chat(ctx: commands.Context, *, question: str):
                 ),
             ),
         )
-        bot_response = response.text
+        # Safely extract text — response.text raises ValueError on safety blocks
+        try:
+            bot_response = response.text
+        except Exception:
+            bot_response = None
+
+        # Fallback: walk candidates manually if .text failed
+        if not bot_response:
+            try:
+                bot_response = response.candidates[0].content.parts[0].text
+            except Exception:
+                bot_response = None
+
         if bot_response:
             bot_response = bot_response.lower()
             if len(bot_response) > 2000:
                 bot_response = bot_response[:1995] + "..."
             await ctx.send(bot_response)
         else:
-            await ctx.send("idk bro 😭")
+            print(f"[chat] empty/blocked response for query: {question[:80]!r}")
+            await ctx.send("idk bro 😭 gemini blocked that one, try rewording it")
     except Exception as e:
-        print(f"genai glitch: {e}")
+        import traceback
+        print(f"genai glitch: {type(e).__name__}: {e}")
+        traceback.print_exc()
         await ctx.send("idk bro 😭")
 
 
