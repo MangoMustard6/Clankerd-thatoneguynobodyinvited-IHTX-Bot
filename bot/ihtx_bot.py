@@ -1335,6 +1335,42 @@ def _apply_pipe_effects(
                     current = out
                     continue
 
+            # shake — pixel-displacement shake using geq, crops back to original dims
+            if name == "shake":
+                try:
+                    h_amt = float(params[0]) if len(params) > 0 else 3.0
+                except (ValueError, TypeError):
+                    h_amt = 3.0
+                try:
+                    v_amt = float(params[1]) if len(params) > 1 else 0.0
+                except (ValueError, TypeError):
+                    v_amt = 0.0
+                try:
+                    vinfo = _ffprobe_video_info(current)
+                    vid_w = int(vinfo["width"])
+                    vid_h = int(vinfo["height"])
+                except Exception:
+                    vid_w, vid_h = 0, 0
+                if vid_w <= 0 or vid_h <= 0:
+                    return False, "shake: could not probe video dimensions."
+                shake_vf = (
+                    f"rotate=0:iw*1.1:ih*1.1,format=yuv444p,"
+                    f"geq='p(X+{h_amt}*(2*mod(1000*sin(N*12.9898),1)-1),"
+                    f"Y+{v_amt}*(2*mod(1000*sin(N+1000)*78.233,1)-1))',"
+                    f"crop={vid_w}:{vid_h},format=yuv420p"
+                )
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-vf", shake_vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"shake failed: {err}"
+                current = out
+                continue
+
             # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
             if vf:
@@ -3515,7 +3551,7 @@ _HELP_ENTRIES: list[dict] = [
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
-            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `swirl=angle;r;cx;cy` `pinch&punch=str;r;cx;cy`\n"
+            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `swirl=angle;r;cx;cy` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>`\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `areverse` `syncaudio`\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
@@ -3552,6 +3588,17 @@ _HELP_ENTRIES: list[dict] = [
             "Common plugins: `distort0r` `cartoon` `edgeglow` `pixelize` `plasma` `sobel` `threshold0r`\n"
             "Example: `t!ihtx 1 5 - mp4 frei0r=distort0r:0.5:0.1`\n"
             "Also available in tags: `{frei0r:distort0r:0.5}` or `frei0r:\\ndistort0r:0.5` prefix block"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "shake pipe effect  (shake=<h>|<v>)",
+        "value": (
+            "Random per-frame pixel displacement shake using geq. Crops output back to original dimensions.\n"
+            "• **h** — horizontal shake strength in pixels (default 3)\n"
+            "• **v** — vertical shake strength in pixels (default 0)\n"
+            "Example: `t!ihtx 3 1.0 - mp4 shake=3`\n"
+            "Example with both axes: `t!ihtx 3 1.0 - mp4 shake=5|3`"
         ),
     },
     {
