@@ -1,0 +1,1 @@
+- [Update log policy](updatelog-policy.md) — always add/update _UPDATELOG in bot/ihtx_bot.py when changing the bot; newest entry goes at top of list.

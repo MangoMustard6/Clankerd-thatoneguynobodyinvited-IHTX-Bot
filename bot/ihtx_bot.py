@@ -3838,6 +3838,20 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v1.7",
+        "date": "2026-06-20",
+        "heavy": [
+            "**t!ihtx** — new `shake=<h>|<v>` pipe effect: per-frame pixel displacement via geq, crops to original dims",
+            "**t!ihtx** — `vreverse` pipe effect added: reverses video frames (chain with `areverse` for full reverse)",
+            "**t!ihtx** — `swirl` removed from pipe engine (now handled by iscript tag)",
+            "**t!ihtx shake** — audio now encoded as `pcm_s24le`; fixes FLAC-in-container error on certain inputs",
+            "**t!multipitch** — audio now encoded as `pcm_s24le` instead of AAC",
+            "**t!multipitch** — duration fixed: replaced `-shortest` with explicit `-t <video_duration>` to prevent clipping",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
         "version": "v1.6",
         "date": "2026-06-19",
         "heavy": [
