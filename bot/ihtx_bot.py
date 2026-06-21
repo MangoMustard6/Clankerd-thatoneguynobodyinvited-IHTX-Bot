@@ -5303,6 +5303,28 @@ async def eightball(ctx: commands.Context, *, question: str):
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="ping")
+async def ping(ctx: commands.Context):
+    """Check bot latency — shows receive, send, and total times."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    receive_ms = (now - ctx.message.created_at).total_seconds() * 1000
+
+    send_start = time.perf_counter()
+    msg = await ctx.reply("🏓 Pong!")
+    send_ms = (time.perf_counter() - send_start) * 1000
+
+    total_ms = receive_ms + send_ms
+    await msg.edit(content=(
+        f"🏓 Pong!\n"
+        f"```\n"
+        f"Receiving your message: {receive_ms:.0f}ms\n"
+        f"Sending my message:     {send_ms:.0f}ms\n"
+        f"Total time:             {total_ms:.0f}ms\n"
+        f"```"
+    ))
+
+
 @bot.command(name="coinflip", aliases=["flip", "coin"])
 async def coinflip(ctx: commands.Context):
     """Flip a coin — heads or tails."""
