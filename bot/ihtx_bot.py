@@ -986,7 +986,7 @@ def _run_swirl(
     xc: float = 0.5,
     yc: float = 0.5,
     fallout: str = "quad",
-    is1to1: bool = False,
+    is1to1: bool = True,
 ) -> tuple[bool, str]:
     """Apply a swirl/vortex distortion via FFmpeg geq.
 
@@ -1728,7 +1728,7 @@ def _apply_pipe_effects(
                     except (ValueError, TypeError):
                         return default
                 fallout_val = _sp(4, "quad")
-                is1to1_raw = _sp(5, "false")
+                is1to1_raw = _sp(5, "true")
                 is1to1_val = str(is1to1_raw).lower() in ("1", "true", "t", "y", "yes", "+", "on")
                 ok, err = _run_swirl(
                     current, out,
@@ -3974,7 +3974,7 @@ async def swirl_command(ctx: commands.Context, *, args: str = ""):
       xc        — horizontal center 0–1 (default 0.5)
       yc        — vertical center 0–1 (default 0.5)
       fallout   — attenuation curve: 'linear' or 'quad' (default quad)
-      is1to1    — true/false, scale to square before swirl (default false)
+      is1to1    — true/false, scale to square before swirl (default true)
 
     Examples:
       t!swirl 180
@@ -4012,7 +4012,7 @@ async def swirl_command(ctx: commands.Context, *, args: str = ""):
     if fallout not in ("linear", "quad"):
         await ctx.reply("❌ `fallout` must be `linear` or `quad`.")
         return
-    is1to1_raw = _sps(5, "false")
+    is1to1_raw = _sps(5, "true")
     is1to1 = is1to1_raw.lower() in ("1", "true", "t", "y", "yes", "+", "on")
 
     attachment = None
@@ -4362,7 +4362,7 @@ _HELP_ENTRIES: list[dict] = [
             "• `radius` — normalized radius 0–1 of min(W,H) where swirl reaches (default 0.5)\n"
             "• `xc` / `yc` — normalized center position 0–1 (default 0.5 = center)\n"
             "• `fallout` — attenuation curve: `linear` or `quad` (default `quad`)\n"
-            "• `is1to1` — `true`/`false`, scale to square before swirl then restore (default `false`)\n\n"
+            "• `is1to1` — `true`/`false`, scale to square before swirl then restore (default `true`)\n\n"
             "**Examples:**\n"
             "`t!swirl 180` — half-turn swirl from center\n"
             "`t!swirl 360 0.5 0.5 0.5 quad` — full spin, quadratic falloff\n"
@@ -4657,6 +4657,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.3",
+        "date": "2026-06-21",
+        "heavy": [
+            "**Tag system** — `{set:var|value}` / `{get:var}` mutable variables with nested-block resolution; `{foreach:N|template}` count loop (re-evaluates each iteration so set mutations persist) and `{foreach:template|i1|i2|i3}` item loop with custom separator prefix; `{if:a|op|b|then:x|else:y}` else branch; `{arg:n}` 0-indexed args, `{arg:*}` all args; `{range:min|max}` random int/float; `{repeat:N:text}` colon separator; `{substring:text|start[|end]}`; `{indexof:needle|haystack}`; `{math:}` resolves inner blocks first; unknown `{tagname}` vars auto-expand to `{tag:tagname}` shorthand; `{tag:name}` / `{js:code}` (owner-only Node.js ESM) engines.",
+            "**Tag commands** — `t!t <name> [args]` shorthand; `t!tag random` (run a random tag); `t!tag forceremove <name>` (owner-only); `t!tag alias <new> <existing>` arg order corrected; `t!tag create` now upserts (edit your own existing tag instead of erroring).",
+        ],
+        "fun": [
+            "**t!swirl** — `is1to1` now defaults to `true` (square-before-swirl mode enabled by default).",
+        ],
+        "owner": [],
+    },
     {
         "version": "v3.2",
         "date": "2026-06-21",
