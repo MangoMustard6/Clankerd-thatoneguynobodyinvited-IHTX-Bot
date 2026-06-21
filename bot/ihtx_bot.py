@@ -727,6 +727,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
             "-strict", "experimental",
             "-c:a", audio_codec,
             "-t", str(d),
+            "-f", "mp4",
             output_path,
         ]
         return _run_ffmpeg_raw(cmd)
