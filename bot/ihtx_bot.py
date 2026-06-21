@@ -2517,11 +2517,11 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
         try:
             embed = discord.Embed(
-                title="IHTX / thatoneguynobodyinvited's bot",
-                description="Use t!syncaudio / t!syncaudio alt",
-                color=discord.Color.blurple(),
+                title="IHTX Bot - The IHTX command:",
+                description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
+                color=11578404,
             )
-            embed.set_thumbnail(url="https://files.catbox.moe/s6m6h3.gif")
+            embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/1507947387031650304/1517856881857531974/Untitled216_20260620164144.png?ex=6a37cde1&is=6a367c61&hm=251129cd4598cb2a954014285055da6fb96b07442ad80154e4d9a5b3d24ea00b&")
             await ctx.reply(
                 embed=embed,
                 file=discord.File(output_path, filename=out_filename),
@@ -4044,6 +4044,7 @@ _UPDATELOG: list[dict] = [
         ],
         "fun": [
             "**t!ihtx** (custom) — New processing status: '⏳ Processing your IHTX using pipe effects: `effects`×N', then '⌛ Done!' when finished",
+            "**t!ihtx** — Updated result embed: new title, description, color, and thumbnail",
             "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
             "**ffmpeg-full** installed — rubberband filter now available for pitch/tempo effects",
         ],
