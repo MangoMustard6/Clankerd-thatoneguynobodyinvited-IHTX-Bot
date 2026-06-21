@@ -36,3 +36,8 @@ aiohttp
 discord-py
 yt-dlp
 google-genai
+aiohttp
+discord.py
+google-genai
+openai
+yt-dlp
