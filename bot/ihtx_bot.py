@@ -854,6 +854,129 @@ def _run_huehsv(
         return True, ""
 
 
+# ---------- TV Simulator ----------
+
+_TVSIM_DISPLACE_MAP = Path(__file__).parent / "displacemaps" / "tvsimulator.mov"
+
+
+def _run_tvsim(
+    input_path: str,
+    output_path: str,
+    line_sync: float = 0.5,
+    detail_zoom: float = 1.0,
+    vertical_sync: float = 1.0,
+    phosphorescence: float = 0.0,
+    interlacing: float = 0.0,
+    scan_phasing: float = 0.0,
+) -> tuple[bool, str]:
+    """Apply TV-simulator CRT effect via FFmpeg displacement map.
+
+    Args:
+        line_sync       — 0-1, displacement strength (0=max, 1=none). Required.
+        detail_zoom     — crop factor on the displacement map (default 1)
+        vertical_sync   — vertical scroll speed (default 1 = none)
+        phosphorescence — CRT phosphor glow tint (default 0 = off)
+        interlacing     — scanline darkening strength (default 0 = off)
+        scan_phasing    — ripple/phasing on scanlines (default 0 = off)
+    """
+    line_sync = max(0.0, min(1.0, line_sync))
+
+    vinfo = _ffprobe_video_info(input_path)
+    w = vinfo["width"] or 854
+    h = vinfo["height"] or 480
+    r_frame_rate = vinfo.get("r_frame_rate", "30")
+    try:
+        fn, fd = r_frame_rate.split("/")
+        fr = float(fn) / float(fd)
+    except Exception:
+        fr = 30.0
+
+    # Build optional filter list (order matches original TS script)
+    optional: list[str] = []
+
+    if vertical_sync != 1.0:
+        optional.append(f"scroll=v='lerp(8/{fr},0,({vertical_sync})^(1/3))'")
+
+    if phosphorescence != 0.0:
+        p = phosphorescence
+        optional.append(
+            f"lutrgb='lerp(val,val*1.15,{p})':'lerp(val,val*1.15+48,{p})':'lerp(val,val*1.15+64,{p})'"
+        )
+
+    def _interlace_filter(il: float) -> str:
+        return (
+            f"geq=r='p(X,Y)*lerp(1,(sin(Y/H*300)+1)/2,{il})':"
+            f"g='p(X,Y)*lerp(1,(sin(Y/H*300)+1)/2,{il})':"
+            f"b='p(X,Y)*lerp(1,(sin(Y/H*300)+1)/2,{il})'"
+        )
+
+    def _scanphase_filter(sp: float) -> str:
+        return (
+            f"geq=r='min(p(X,Y)+max(cos(Y/H*5-mod(T*16.666666*{sp},5))*128-64,0),255)':"
+            f"g='min(p(X,Y)+max(cos(Y/H*5-mod(T*16.666666*{sp},5))*128-64,0),255)':"
+            f"b='min(p(X,Y)+max(cos(Y/H*5-mod(T*16.666666*{sp},5))*128-64,0),255)'"
+        )
+
+    # Order of interlacing vs scan_phasing depends on line_sync (matches TS)
+    if line_sync == 1.0:
+        if scan_phasing != 0.0:
+            optional.append(_scanphase_filter(scan_phasing))
+        if interlacing != 0.0:
+            optional.append(_interlace_filter(interlacing))
+    else:
+        if interlacing != 0.0:
+            optional.append(_interlace_filter(interlacing))
+        if scan_phasing != 0.0:
+            optional.append(_scanphase_filter(scan_phasing))
+
+    if line_sync == 1.0:
+        # No displacement map — just apply optional filters
+        if optional:
+            vf = ",".join(optional) + ",format=yuv420p"
+            cmd = [
+                "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                "-i", input_path,
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac",
+                output_path,
+            ]
+        else:
+            cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                   "-i", input_path, "-c", "copy", output_path]
+    else:
+        if not _TVSIM_DISPLACE_MAP.exists():
+            return False, f"TV simulator displacement map not found: {_TVSIM_DISPLACE_MAP}"
+
+        contrast = (1.0 - line_sync) * 2.366666
+        base_fc = (
+            f"[0]scale=854:854,format=bgr32[00];"
+            f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
+            f"eq=contrast={contrast:.6f}:eval=frame,format=bgr32,hue=b=-0.033[x];"
+            f"color=s=854x854:c=#808080,format=bgr32[y];"
+            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
+        )
+        if optional:
+            full_fc = base_fc + "," + ",".join(optional)
+        else:
+            full_fc = base_fc
+
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+            "-stream_loop", "-1", "-i", str(_TVSIM_DISPLACE_MAP),
+            "-filter_complex", full_fc,
+            "-map", "0:a",
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac",
+            "-shortest",
+            output_path,
+        ]
+
+    return _run_ffmpeg_raw(cmd, timeout=300)
+
+
 # ---------- ccshue (ImageMagick haldclut — hue/sat/gamma/gain/offset) ----------
 
 def _run_ccshue(
@@ -945,6 +1068,7 @@ PIPE_EFFECT_NAMES = {
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio", "speed", "ffmpeg", "frei0r",
     "wave",
+    "tvsim", "tv",
     "sierpinskiransomware",
 }
 
@@ -1519,6 +1643,27 @@ def _apply_pipe_effects(
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
                     return False, f"Filter '{name}' failed: {err}"
+                current = out
+                continue
+
+            # tvsim — TV simulator CRT displacement effect
+            if name in ("tvsim", "tv"):
+                def _tp(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                ok, err = _run_tvsim(
+                    current, out,
+                    line_sync=_tp(0, 0.5),
+                    detail_zoom=_tp(1, 1.0),
+                    vertical_sync=_tp(2, 1.0),
+                    phosphorescence=_tp(3, 0.0),
+                    interlacing=_tp(4, 0.0),
+                    scan_phasing=_tp(5, 0.0),
+                )
+                if not ok:
+                    return False, f"tvsim failed: {err}"
                 current = out
                 continue
 
