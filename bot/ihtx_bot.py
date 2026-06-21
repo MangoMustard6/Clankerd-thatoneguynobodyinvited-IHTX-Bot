@@ -970,7 +970,6 @@ def _run_tvsim(
             "-pix_fmt", "yuv420p",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac",
-            "-shortest",
             output_path,
         ]
 
