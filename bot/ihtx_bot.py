@@ -5657,52 +5657,285 @@ async def tictactoe(ctx: commands.Context):
         await msg.edit(content=board_msg("\n\nYour turn — pick a square (1–9):"))
 
 
-_TRIVIA_QUESTIONS = [
-    ("How many bits are in a byte?", ["4", "8", "16", "32"], 1),
-    ("What does 'FPS' stand for in video?", ["Frames Per Second", "Files Per Session", "Fast Processing Speed", "Full Pixel Scan"], 0),
-    ("Which color model does video typically use?", ["RGB", "CMYK", "YUV", "HSL"], 2),
-    ("What is the standard frame rate for NTSC video?", ["24", "25", "29.97", "60"], 2),
-    ("What does 'codec' stand for?", ["Coded Decoder", "Coder Decoder", "Compress Decompress", "Convert Decode"], 1),
-    ("Which FFmpeg flag overwrites output files?", ["-f", "-y", "-o", "-w"], 1),
-    ("What does 'bitrate' measure?", ["Image resolution", "Data per second", "File size", "Frame size"], 1),
-    ("What audio format is lossless?", ["MP3", "AAC", "FLAC", "OGG"], 2),
-    ("What does 'Hz' measure in audio?", ["Volume", "Bitrate", "Frequency", "Latency"], 2),
-    ("What is 2^10?", ["512", "1000", "1024", "2048"], 2),
-    ("Which container supports both video and audio?", ["WAV", "MP3", "MP4", "PNG"], 2),
-    ("What does 'SAR' mean in FFmpeg?", ["Sample Audio Rate", "Sample Aspect Ratio", "Stream Audio Rate", "Source Aspect Ratio"], 1),
-    ("How many semitones are in an octave?", ["7", "10", "12", "16"], 2),
-    ("What does 'VBR' stand for?", ["Variable Bitrate", "Video Buffer Rate", "Variable Buffer Rate", "Video Bit Rate"], 0),
-    ("What is the resolution of 4K video?", ["1920×1080", "2560×1440", "3840×2160", "4096×2160"], 2),
+# ---------- XP / Leveling system ----------
+
+_XP_DATA_FILE = Path("bot/xp_data.json")
+_xp_data: dict[str, dict] = {}
+_XP_MOD_ROLE_NAME = "Moderator"
+_XP_PER_CORRECT = 100
+_MAX_LEVEL = 15
+
+
+def _xp_threshold(level: int) -> int:
+    """XP required to advance FROM this level to the next."""
+    if level <= 3:
+        return 1000
+    if level <= 6:
+        return 1250
+    if level <= 9:
+        return 1750
+    return 2000
+
+
+def _load_xp_data() -> None:
+    global _xp_data
+    try:
+        if _XP_DATA_FILE.exists():
+            with _XP_DATA_FILE.open() as f:
+                _xp_data = json.load(f)
+        else:
+            _xp_data = {}
+    except Exception:
+        _xp_data = {}
+
+
+def _save_xp_data() -> None:
+    try:
+        with _XP_DATA_FILE.open("w") as f:
+            json.dump(_xp_data, f, indent=2)
+    except Exception as e:
+        print(f"[xp] Failed to save xp_data: {e}")
+
+
+def _get_user_xp(user_id: int) -> dict:
+    key = str(user_id)
+    if key not in _xp_data:
+        _xp_data[key] = {"xp": 0, "level": 1}
+    return _xp_data[key]
+
+
+def _level_progress(data: dict) -> tuple[int, int, int]:
+    """Returns (current_xp_in_level, threshold, level)."""
+    level = data["level"]
+    xp = data["xp"]
+    # XP is cumulative; compute how much belongs to current level
+    spent = 0
+    for lv in range(1, level):
+        spent += _xp_threshold(lv)
+    return xp - spent, _xp_threshold(level), level
+
+
+async def _award_xp(ctx: commands.Context, amount: int) -> list[str]:
+    """Award XP to the command author. Returns list of level-up messages."""
+    _load_xp_data()
+    uid = ctx.author.id
+    data = _get_user_xp(uid)
+    messages: list[str] = []
+
+    if data["level"] >= _MAX_LEVEL:
+        _save_xp_data()
+        return messages
+
+    data["xp"] += amount
+
+    # Check for level ups
+    while data["level"] < _MAX_LEVEL:
+        thresh = _xp_threshold(data["level"])
+        current_in_level, _, _ = _level_progress(data)
+        if current_in_level >= thresh:
+            data["level"] += 1
+            new_level = data["level"]
+            if new_level >= _MAX_LEVEL:
+                messages.append(
+                    f"🏆 **MAX LEVEL!** {ctx.author.mention} reached **Level {_MAX_LEVEL}**! "
+                    f"You've been granted the **{_XP_MOD_ROLE_NAME}** role!"
+                )
+                # Try to assign Moderator role
+                if ctx.guild:
+                    role = discord.utils.get(ctx.guild.roles, name=_XP_MOD_ROLE_NAME)
+                    if role:
+                        try:
+                            await ctx.guild.get_member(uid).add_roles(role, reason="Reached max XP level")
+                        except Exception as e:
+                            print(f"[xp] Failed to assign role: {e}")
+                    else:
+                        print(f"[xp] Role '{_XP_MOD_ROLE_NAME}' not found in guild.")
+                break
+            else:
+                messages.append(
+                    f"⬆️ **Level up!** {ctx.author.mention} is now **Level {new_level}**!"
+                )
+        else:
+            break
+
+    _save_xp_data()
+    return messages
+
+
+_load_xp_data()
+
+
+@bot.command(name="level", aliases=["rank", "xp"])
+async def level_cmd(ctx: commands.Context, member: discord.Member = None):
+    """Check your XP level and progress."""
+    _load_xp_data()
+    target = member or ctx.author
+    data = _get_user_xp(target.id)
+    level = data["level"]
+
+    if level >= _MAX_LEVEL:
+        embed = discord.Embed(
+            title=f"🏆 {target.display_name} — MAX LEVEL",
+            description=f"**Level {_MAX_LEVEL}** • Total XP: **{data['xp']}**\n\nYou've earned the **{_XP_MOD_ROLE_NAME}** role!",
+            color=discord.Color.gold()
+        )
+    else:
+        current_in_level, thresh, _ = _level_progress(data)
+        bar_filled = int((current_in_level / thresh) * 20)
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+        embed = discord.Embed(
+            title=f"⭐ {target.display_name}",
+            description=(
+                f"**Level {level}** → Level {level + 1}\n"
+                f"`{bar}` {current_in_level}/{thresh} XP\n\n"
+                f"Total XP: **{data['xp']}**"
+            ),
+            color=discord.Color.blurple()
+        )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="leaderboard", aliases=["lb", "top"])
+async def leaderboard(ctx: commands.Context):
+    """Show the top 10 XP earners."""
+    _load_xp_data()
+    if not _xp_data:
+        await ctx.reply("No one has any XP yet! Play `t!trivia` to earn some.")
+        return
+
+    sorted_users = sorted(_xp_data.items(), key=lambda x: x[1]["xp"], reverse=True)[:10]
+    medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
+    lines = []
+    for i, (uid, data) in enumerate(sorted_users):
+        member = ctx.guild.get_member(int(uid)) if ctx.guild else None
+        name = member.display_name if member else f"User {uid}"
+        lv = data["level"]
+        lv_str = f"**MAX**" if lv >= _MAX_LEVEL else f"Lv {lv}"
+        lines.append(f"{medals[i]} **{name}** — {lv_str} • {data['xp']} XP")
+
+    embed = discord.Embed(
+        title="🏆 XP Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    await ctx.reply(embed=embed)
+
+
+# ---------- Music trivia ----------
+
+_MUSIC_TRIVIA = [
+    ("How many strings does a standard guitar have?", ["4", "5", "6", "7"], 2),
+    ("Which musical symbol indicates a piece should be played softly?", ["f", "p", "ff", "mf"], 1),
+    ("What does 'BPM' stand for?", ["Beats Per Minute", "Bass Per Measure", "Bars Per Melody", "Beats Per Measure"], 0),
+    ("Which instrument has black and white keys?", ["Violin", "Trumpet", "Piano", "Harp"], 2),
+    ("How many notes are in a standard musical scale (e.g. C major)?", ["5", "6", "7", "8"], 2),
+    ("What is the lowest male singing voice called?", ["Tenor", "Baritone", "Bass", "Alto"], 2),
+    ("Which time signature is also called 'common time'?", ["3/4", "4/4", "2/2", "6/8"], 1),
+    ("What does 'forte' mean in music?", ["Slow", "Soft", "Loud", "Fast"], 2),
+    ("How many semitones are in an octave?", ["8", "10", "12", "14"], 2),
+    ("Which instrument is Beethoven famous for playing?", ["Violin", "Flute", "Piano", "Cello"], 2),
+    ("What does 'a cappella' mean?", ["With full orchestra", "Without instrumental accompaniment", "Very slowly", "Repeated section"], 1),
+    ("Which genre originated in New Orleans in the early 1900s?", ["Blues", "Jazz", "Rock", "Soul"], 1),
+    ("What is the correct order of a standard orchestra from front to back?", ["Brass, Strings, Woodwinds, Percussion", "Strings, Woodwinds, Brass, Percussion", "Percussion, Brass, Strings, Woodwinds", "Woodwinds, Strings, Brass, Percussion"], 1),
+    ("Which note is one half-step above C?", ["D", "C#", "B", "Cb"], 1),
+    ("What does 'legato' mean?", ["Detached notes", "Smooth and connected", "Very fast", "Getting louder"], 1),
+    ("How many beats does a whole note receive in 4/4 time?", ["1", "2", "3", "4"], 3),
+    ("What family of instruments does the trumpet belong to?", ["Woodwind", "String", "Brass", "Percussion"], 2),
+    ("Which term means gradually getting louder?", ["Diminuendo", "Staccato", "Crescendo", "Fermata"], 2),
+    ("What is the standard concert pitch for the note A?", ["420 Hz", "432 Hz", "440 Hz", "450 Hz"], 2),
+    ("Which clef is most commonly used for piano treble parts?", ["Bass clef", "Alto clef", "Treble clef", "Tenor clef"], 2),
+    ("What does 'D.C. al Fine' mean in sheet music?", ["Go to the sign", "Repeat from the beginning to the end mark", "Play very softly", "Slow down"], 1),
+    ("How many lines are on a standard musical staff?", ["3", "4", "5", "6"], 2),
+    ("Which instrument uses a bow?", ["Flute", "Oboe", "Violin", "Tuba"], 2),
+    ("What is the name for the speed of a piece of music?", ["Pitch", "Tempo", "Dynamics", "Timbre"], 1),
+    ("Which scale uses only the black keys of the piano?", ["Major scale", "Minor scale", "Chromatic scale", "Pentatonic scale"], 3),
+    ("What does 'ritardando' (rit.) mean?", ["Getting louder", "Getting softer", "Gradually slowing down", "Gradually speeding up"], 2),
+    ("Which instrument is NOT a woodwind?", ["Flute", "Clarinet", "French Horn", "Bassoon"], 2),
+    ("What is the Italian word for 'moderate tempo'?", ["Allegro", "Andante", "Moderato", "Presto"], 2),
+    ("Which interval contains two half-steps?", ["Unison", "Half step", "Whole step", "Minor third"], 2),
+    ("What is the highest woodwind instrument?", ["Oboe", "Flute", "Piccolo", "Clarinet"], 2),
 ]
 
 
 @bot.command(name="trivia")
 async def trivia(ctx: commands.Context):
-    """Answer a random trivia question — type A, B, C, or D."""
-    q, options, correct_idx = random.choice(_TRIVIA_QUESTIONS)
+    """Play a 10-question music trivia game — earn 100 XP per correct answer!"""
     labels = ["A", "B", "C", "D"]
-    choices_text = "\n".join(f"**{labels[i]}**  {opt}" for i, opt in enumerate(options))
+    questions = random.sample(_MUSIC_TRIVIA, 10)
+    score = 0
 
-    msg = await ctx.reply(f"❓ **Trivia**\n\n{q}\n\n{choices_text}\n\n*Type A, B, C, or D*")
+    intro = await ctx.reply(
+        "🎵 **Music Trivia — 10 Questions!**\n"
+        "Answer each question with **A**, **B**, **C**, or **D**.\n"
+        "You earn **100 XP** per correct answer!\n\n"
+        "Starting in 3 seconds..."
+    )
+    await asyncio.sleep(3)
 
-    def check(m: discord.Message) -> bool:
-        return (
-            m.author == ctx.author
-            and m.channel == ctx.channel
-            and m.content.upper().strip() in labels
+    for i, (q, options, correct_idx) in enumerate(questions, 1):
+        choices_text = "\n".join(f"**{labels[j]}**  {opt}" for j, opt in enumerate(options))
+        msg = await ctx.reply(
+            f"🎵 **Question {i}/10**\n\n"
+            f"{q}\n\n"
+            f"{choices_text}\n\n"
+            f"*Type A, B, C, or D — 20 seconds*"
         )
 
-    try:
-        answer_msg = await bot.wait_for("message", check=check, timeout=30)
-    except asyncio.TimeoutError:
-        await msg.edit(content=f"⏱️ Time's up! The answer was **{labels[correct_idx]}** — {options[correct_idx]}")
-        return
+        def check(m: discord.Message) -> bool:
+            return (
+                m.author == ctx.author
+                and m.channel == ctx.channel
+                and m.content.upper().strip() in labels
+            )
 
-    picked = labels.index(answer_msg.content.upper().strip())
-    if picked == correct_idx:
-        await msg.edit(content=f"✅ **Correct!** {labels[correct_idx]} — {options[correct_idx]}\n\n❓ {q}\n\n{choices_text}")
+        try:
+            answer_msg = await bot.wait_for("message", check=check, timeout=20)
+            picked = labels.index(answer_msg.content.upper().strip())
+        except asyncio.TimeoutError:
+            await msg.edit(content=(
+                f"🎵 **Question {i}/10** — ⏱️ Time's up!\n\n"
+                f"{q}\n\n{choices_text}\n\n"
+                f"✅ Correct answer: **{labels[correct_idx]}** — {options[correct_idx]}"
+            ))
+            await asyncio.sleep(1.5)
+            continue
+
+        if picked == correct_idx:
+            score += 1
+            await msg.edit(content=(
+                f"🎵 **Question {i}/10** — ✅ Correct! (+100 XP)\n\n"
+                f"{q}\n\n{choices_text}"
+            ))
+        else:
+            await msg.edit(content=(
+                f"🎵 **Question {i}/10** — ❌ Wrong! "
+                f"You said **{labels[picked]}**, answer was **{labels[correct_idx]}** — {options[correct_idx]}\n\n"
+                f"{q}\n\n{choices_text}"
+            ))
+        await asyncio.sleep(1.5)
+
+    # Award XP
+    xp_earned = score * _XP_PER_CORRECT
+    levelup_msgs = await _award_xp(ctx, xp_earned)
+    _load_xp_data()
+    data = _get_user_xp(ctx.author.id)
+    level = data["level"]
+
+    if level >= _MAX_LEVEL:
+        progress_line = f"**Level MAX** 🏆 — {data['xp']} total XP"
     else:
-        await msg.edit(content=f"❌ **Wrong!** You said **{labels[picked]}**, the answer was **{labels[correct_idx]}** — {options[correct_idx]}\n\n❓ {q}\n\n{choices_text}")
+        cur, thresh, _ = _level_progress(data)
+        progress_line = f"**Level {level}** — {cur}/{thresh} XP toward next level"
+
+    summary = (
+        f"🎵 **Trivia Complete!** {ctx.author.mention}\n\n"
+        f"Score: **{score}/10** correct — **+{xp_earned} XP** earned\n"
+        f"{progress_line}"
+    )
+    await ctx.send(summary)
+
+    for lm in levelup_msgs:
+        await ctx.send(lm)
 
 
 # ---------- Random media pool ----------
