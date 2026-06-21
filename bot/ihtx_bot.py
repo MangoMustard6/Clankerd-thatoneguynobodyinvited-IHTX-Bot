@@ -10,7 +10,6 @@ ImageMagick/sox/etc. depending on advanced effects.
 
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
 from bot.tags.cog import TagCog
 import asyncio
 import json
@@ -2339,15 +2338,6 @@ async def on_ready():
     if not bot.cogs.get("Tags"):
         await bot.add_cog(TagCog(bot))
         print("TagCog loaded")
-    # Sync slash commands
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
-    except discord.HTTPException as e:
-        if "50240" in str(e):
-            print("Entry Point command conflict — skipping bulk sync (slash commands already registered)")
-        else:
-            print(f"Failed to sync slash commands: {e}")
     _activity_file = Path("bot/activity.json")
     _default_activity = discord.Activity(
         type=discord.ActivityType.watching,
@@ -2391,9 +2381,8 @@ async def on_ready():
             print(f"Warning: tag system failed to load — {_tags_exc}")
 
 
-@bot.hybrid_command(name="ihtx", aliases=["effect", "destroy"], description="HEAVY COMMAND: replicates ihtx from FFmpeg")
-@app_commands.describe(args="Preset name or effect chain (e.g. chaos, huehsv 0.5;negate;multipitch=1|6|7)", attachment="Video or image file to process")
-async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment: discord.Attachment = None):
+@bot.command(name="ihtx", aliases=["effect", "destroy"])
+async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
     """HEAVY COMMAND: replicates ihtx from FFmpeg.
 
     Apply an IHTX FFmpeg effect to an attached video or image.
@@ -2662,12 +2651,8 @@ def _run_ihtxcustom_workflow(
     return True, ""
 
 
-@bot.hybrid_command(name="invlum", aliases=["il"], description="Apply luma-inversion progressively N times and concatenate all iterations")
-@app_commands.describe(
-    args="<powers> [duration] [PIPE: effect;effect]",
-    attachment="Video to process",
-)
-async def invlum_command(ctx: commands.Context, *, args: str = "1", attachment: discord.Attachment = None):
+@bot.command(name="invlum", aliases=["il"])
+async def invlum_command(ctx: commands.Context, *, args: str = "1"):
     """Powers-based luma-inversion stacker.
 
     Applies curves=all='0/1 1/0' (full luma inversion) powers times progressively
@@ -2794,16 +2779,15 @@ async def invlum_command(ctx: commands.Context, *, args: str = "1", attachment: 
             await status_msg.edit(content=f"❌ Failed to upload: {e}")
 
 
-@bot.hybrid_command(name="preview1280", aliases=["p1280", "preview", "pv1280"], description="Create a 12-segment TV-simulator preview montage")
-@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)")
+@bot.command(name="preview1280", aliases=["p1280", "preview", "pv1280"])
 async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
     """Create a 12-segment TV-simulator preview montage from an attached video.
 
     Usage: t!preview1280 [start_offset] [segment_duration]
     Default: start=1.85, duration=0.85
     """
-    # Resolve attachment: slash commands pass it as a parameter;
-    # prefix commands need us to look at the message or referenced message.
+    attachment = None
+    # Resolve attachment from message or referenced message.
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
@@ -2900,9 +2884,8 @@ _MULTIPITCH_AUDIO_EXTS = {
 _MULTIPITCH_MAX = 20
 
 
-@bot.hybrid_command(name="multipitch", aliases=["mp", "multi"], description="Multi-voice pitch shift via Rubber Band R3")
-@app_commands.describe(args="Semicolon-separated semitone values (e.g. -7;12;19)", attachment="Video or audio file to pitch-shift")
-async def multipitch_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
+@bot.command(name="multipitch", aliases=["mp", "multi"])
+async def multipitch_command(ctx: commands.Context, *, args: str = ""):
     """Apply multi-voice pitch shifting using Rubber Band R3 (-3 engine).
 
     Usage:
@@ -3032,12 +3015,8 @@ async def multipitch_command(ctx: commands.Context, *, args: str = "", attachmen
 
 # ---------- t!ffmpeg — raw FFmpeg command ----------
 
-@bot.hybrid_command(name="ffmpeg", description="Run FFmpeg with custom args on an attachment")
-@app_commands.describe(
-    args="FFmpeg args inserted between -i <input> and <output> (e.g. -vf negate -c:a copy)",
-    attachment="File to process",
-)
-async def ffmpeg_raw_command(ctx: commands.Context, *, args: str = "", attachment: discord.Attachment = None):
+@bot.command(name="ffmpeg")
+async def ffmpeg_raw_command(ctx: commands.Context, *, args: str = ""):
     """Run raw FFmpeg on an attached file.
 
     Args go between -i <input> and <output>. Output filename matches input.
@@ -3175,7 +3154,7 @@ def _parse_trim_timestamp(ts: str) -> Decimal:
         raise ValueError("invalid_format")
 
 
-@bot.command(name="trim", description="Trim audio/video/GIF to a precise time range")
+@bot.command(name="trim")
 async def trim_command(ctx: commands.Context, *, args: str = ""):
     """Trim media from <start> to <end> with up to 10 decimal places of precision.
 
@@ -3396,7 +3375,7 @@ _MIRROR_SUPPORTED_EXTS = {
 }
 
 
-@bot.command(name="mirror", description="Mirror media using FFmpeg split/flip/stack")
+@bot.command(name="mirror")
 async def mirror_command(ctx: commands.Context, preset: str = "", *, args: str = ""):
     """Mirror media along an axis.
 
@@ -3536,9 +3515,8 @@ async def mirror_command(ctx: commands.Context, preset: str = "", *, args: str =
             await status_msg.edit(content=f"❌ Failed to upload result: {exc}")
 
 
-@bot.hybrid_command(name="huehsv", aliases=["hhsv"], description="Apply hue shift via ImageMagick haldclut")
-@app_commands.describe(hue="Hue value (e.g. 0.5)", attachment="Video or image to hue-shift")
-async def huehsv_command(ctx: commands.Context, hue: float = 0.5, attachment: discord.Attachment = None):
+@bot.command(name="huehsv", aliases=["hhsv"])
+async def huehsv_command(ctx: commands.Context, hue: float = 0.5):
     """Apply hue shift using ImageMagick haldclut + FFmpeg.
 
     Usage:
@@ -3621,9 +3599,8 @@ async def huehsv_command(ctx: commands.Context, hue: float = 0.5, attachment: di
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
-@bot.hybrid_command(name="syncaudio", aliases=["sa", "sync"], description="Sync video and audio durations by adjusting playback speed")
-@app_commands.describe(mode="Use 'alt' to adjust audio speed instead of video speed", attachment="Video file to sync")
-async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: discord.Attachment = None):
+@bot.command(name="syncaudio", aliases=["sa", "sync"])
+async def syncaudio_command(ctx: commands.Context, mode: str = ""):
     """Sync video and audio durations.
 
     Default: adjusts video speed to match audio.
@@ -3715,7 +3692,7 @@ async def syncaudio_command(ctx: commands.Context, mode: str = "", attachment: d
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
-@bot.hybrid_command(name="presets", aliases=["effects", "list"], description="List all available IHTX presets")
+@bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
     lines = [f"`{name}` — {PRESET_FILTERS[name]['vf'] or PRESET_FILTERS[name]['complex']}" for name in sorted(PRESET_FILTERS)]
@@ -4075,7 +4052,7 @@ class _HelpView(discord.ui.View):
         # message ref not stored — Discord will leave it as-is after timeout
 
 
-@bot.hybrid_command(name="ihtxhelp", aliases=["bothelp"], description="Show IHTX Bot help — pick a category or search")
+@bot.command(name="ihtxhelp", aliases=["bothelp"])
 async def help_command(ctx: commands.Context, *, query: str = ""):
     query = query.strip().lower()
 
@@ -4255,7 +4232,7 @@ _UPDATELOG: list[dict] = [
     },
 ]
 
-@bot.hybrid_command(name="updatelog", aliases=["updates", "changelog"], description="Show recent bot updates by category")
+@bot.command(name="updatelog", aliases=["updates", "changelog"])
 async def updatelog_command(ctx: commands.Context):
     """Show recent bot updates organized by category."""
     for entry in _UPDATELOG:
@@ -4289,8 +4266,7 @@ async def updatelog_command(ctx: commands.Context):
 
 # ---------- Last Export Grab ----------
 
-@bot.hybrid_command(name="lexg", aliases=["lastexportgrab", "lec"], description="Grab the last N seconds of a video (reverse-trim-reverse)")
-@app_commands.describe(duration="How many seconds to grab from the end (default: 5)")
+@bot.command(name="lexg", aliases=["lastexportgrab", "lec"])
 async def lexg_command(ctx: commands.Context, duration: float = 5.0):
     """Grab the last N seconds of a video using reverse→trim→reverse.
 
@@ -4406,9 +4382,8 @@ async def lexg_command(ctx: commands.Context, duration: float = 5.0):
 
 # ---------- Download video ----------
 
-@bot.hybrid_command(name="dl", aliases=["dv", "download", "dlv"], description="Download a video or image from a URL")
-@app_commands.describe(url="URL to download from", attachment="Optional file to include in the message")
-async def dl_command(ctx: commands.Context, url: str = "", attachment: discord.Attachment = None):
+@bot.command(name="dl", aliases=["dv", "download", "dlv"])
+async def dl_command(ctx: commands.Context, url: str = ""):
     """Download a video or image from a URL.
 
     Works with:
@@ -4516,8 +4491,7 @@ def _parse_digits(s: str) -> int:
         raise ValueError("Could not parse id")
 
 
-@bot.hybrid_command(name="blockuser", description="Owner-only: add a user to the blocklist")
-@app_commands.describe(user="User mention or ID to block")
+@bot.command(name="blockuser")
 @commands.check(_is_owner)
 async def blockuser(ctx: commands.Context, user: str):
     """Owner-only: add a user ID or mention to the user blocklist."""
@@ -4534,8 +4508,7 @@ async def blockuser(ctx: commands.Context, user: str):
     await ctx.reply(f"✅ Blocked user `{user_id}`.")
 
 
-@bot.hybrid_command(name="unblockuser", description="Owner-only: remove a user from the blocklist")
-@app_commands.describe(user="User mention or ID to unblock")
+@bot.command(name="unblockuser")
 @commands.check(_is_owner)
 async def unblockuser(ctx: commands.Context, user: str):
     """Owner-only: remove a user ID or mention from the user blocklist."""
@@ -4552,8 +4525,7 @@ async def unblockuser(ctx: commands.Context, user: str):
     await ctx.reply(f"✅ Unblocked user `{user_id}`.")
 
 
-@bot.hybrid_command(name="blockchannel", description="Owner-only: add a channel to the blocklist")
-@app_commands.describe(channel="Channel mention or ID to block (omit for current channel)")
+@bot.command(name="blockchannel")
 @commands.check(_is_owner)
 async def blockchannel(ctx: commands.Context, channel: str = None):
     """Owner-only: add a channel to the channel blocklist. If omitted, blocks current channel."""
@@ -4573,8 +4545,7 @@ async def blockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Blocked channel `{channel_id}`.")
 
 
-@bot.hybrid_command(name="unblockchannel", description="Owner-only: remove a channel from the blocklist")
-@app_commands.describe(channel="Channel mention or ID to unblock (omit for current channel)")
+@bot.command(name="unblockchannel")
 @commands.check(_is_owner)
 async def unblockchannel(ctx: commands.Context, channel: str = None):
     """Owner-only: remove a channel from the channel blocklist. If omitted, unblocks current channel."""
@@ -4594,8 +4565,7 @@ async def unblockchannel(ctx: commands.Context, channel: str = None):
     await ctx.reply(f"✅ Unblocked channel `{channel_id}`.")
 
 
-@bot.hybrid_command(name="keywordblock", aliases=["blockkeyword", "kb"], description="Owner-only: block a keyword in one channel")
-@app_commands.describe(keyword="Keyword or phrase to block", channel="Channel mention or ID (omit for current channel)")
+@bot.command(name="keywordblock", aliases=["blockkeyword", "kb"])
 @commands.check(_is_owner)
 async def keywordblock(ctx: commands.Context, keyword: str, channel: str = None):
     """Owner-only: block a keyword in a single channel.
@@ -4624,8 +4594,7 @@ async def keywordblock(ctx: commands.Context, keyword: str, channel: str = None)
     await ctx.reply(f"✅ Blocked keyword `{normalized}` in channel `{channel_id}`.")
 
 
-@bot.hybrid_command(name="keywordblockremove", aliases=["unblockkeyword", "removekeywordblock", "kbr"], description="Owner-only: remove a keyword block from one channel")
-@app_commands.describe(keyword="Keyword or phrase to unblock", channel="Channel mention or ID (omit for current channel)")
+@bot.command(name="keywordblockremove", aliases=["unblockkeyword", "removekeywordblock", "kbr"])
 @commands.check(_is_owner)
 async def keywordblockremove(ctx: commands.Context, keyword: str, channel: str = None):
     """Owner-only: remove a keyword block from a single channel."""
@@ -4658,8 +4627,7 @@ async def keywordblockremove(ctx: commands.Context, keyword: str, channel: str =
     await ctx.reply(f"✅ Removed keyword block `{normalized}` from channel `{channel_id}`.")
 
 
-@bot.hybrid_command(name="say", description="Owner-only: make the bot send a message")
-@app_commands.describe(message="Message content to send")
+@bot.command(name="say")
 @commands.check(_is_owner)
 async def say(ctx: commands.Context, *, message: str):
     """Owner-only: make the bot send a plain message in the current channel."""
@@ -4671,8 +4639,7 @@ async def say(ctx: commands.Context, *, message: str):
         await ctx.reply(f"❌ Failed to send message: {e}")
 
 
-@bot.hybrid_command(name="sayembed", description="Owner-only: make the bot send an embed")
-@app_commands.describe(content="Embed content (use | to split title|description)")
+@bot.command(name="sayembed")
 @commands.check(_is_owner)
 async def sayembed(ctx: commands.Context, *, content: str):
     """
@@ -4695,8 +4662,7 @@ async def sayembed(ctx: commands.Context, *, content: str):
         await ctx.reply(f"❌ Failed to send embed: {e}")
 
 
-@bot.hybrid_command(name="keywordblockmsg", aliases=["kbmsg", "blockmsg"], description="Owner-only: set a custom message for a keyword block")
-@app_commands.describe(keyword="Keyword to customize message for", message="Message to send (use {mention} or {user} for user mention)")
+@bot.command(name="keywordblockmsg", aliases=["kbmsg", "blockmsg"])
 @commands.check(_is_owner)
 async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
     """Owner-only: set a custom message for a keyword block.
@@ -4725,12 +4691,7 @@ async def keywordblockmsg(ctx: commands.Context, keyword: str, *, message: str):
 
 # ---------- Autoreplies ----------
 
-@bot.hybrid_command(name="autoreply", aliases=["ar"], description="Owner-only: add an autoreply trigger (optionally channel-specific)")
-@app_commands.describe(
-    trigger="Word or phrase that triggers the reply",
-    channel='Optional: only reply in this channel (leave blank = all channels)',
-    response="What the bot replies (use {mention} for user)",
-)
+@bot.command(name="autoreply", aliases=["ar"])
 @commands.check(_is_owner)
 async def autoreply(ctx: commands.Context, trigger: str, channel: discord.TextChannel = None, *, response: str):
     """Owner-only: add an autoreply. When anyone says the trigger, the bot replies.
@@ -4760,11 +4721,7 @@ async def autoreply(ctx: commands.Context, trigger: str, channel: discord.TextCh
     await ctx.reply(f"✅ Autoreply set{channel_note}: `{trigger_norm}` → {response}")
 
 
-@bot.hybrid_command(name="blockarchannel", aliases=["bac", "silencear"], description="Owner-only: stop an autoreply from firing in a specific channel")
-@app_commands.describe(
-    trigger="The autoreply trigger to silence",
-    channel="Channel to block it in (leave blank = current channel)",
-)
+@bot.command(name="blockarchannel", aliases=["bac", "silencear"])
 @commands.check(_is_owner)
 async def blockarchannel(ctx: commands.Context, trigger: str, channel: discord.TextChannel = None):
     """Owner-only: prevent an autoreply trigger from firing in a specific channel.
@@ -4801,8 +4758,7 @@ async def blockarchannel(ctx: commands.Context, trigger: str, channel: discord.T
         await ctx.reply(f"✅ Autoreply `{trigger_norm}` **silenced** in {target_channel.mention} — it won't fire there anymore.")
 
 
-@bot.hybrid_command(name="removeautoreply", aliases=["rar", "deautoreply"], description="Owner-only: remove an autoreply trigger")
-@app_commands.describe(trigger="The trigger to remove")
+@bot.command(name="removeautoreply", aliases=["rar", "deautoreply"])
 @commands.check(_is_owner)
 async def removeautoreply(ctx: commands.Context, *, trigger: str):
     """Owner-only: remove an autoreply trigger."""
@@ -4815,8 +4771,7 @@ async def removeautoreply(ctx: commands.Context, *, trigger: str):
     await ctx.reply(f"✅ Removed autoreply for `{trigger_norm}`.")
 
 
-@bot.hybrid_command(name="removearmentions", aliases=["rarm", "noarping"], description="Owner-only: strip {mention}/{user} pings from an autoreply response")
-@app_commands.describe(trigger="The autoreply trigger to remove mentions from")
+@bot.command(name="removearmentions", aliases=["rarm", "noarping"])
 @commands.check(_is_owner)
 async def removearmentions(ctx: commands.Context, *, trigger: str):
     """Owner-only: remove {mention} and {user} tokens from an autoreply's response.
@@ -4849,7 +4804,7 @@ async def removearmentions(ctx: commands.Context, *, trigger: str):
     await ctx.reply(f"✅ Removed mention pings from `{trigger_norm}`.\nNew response: {cleaned}")
 
 
-@bot.hybrid_command(name="autoreplies", aliases=["listautoreplies", "arlist"], description="List all active autoreplies")
+@bot.command(name="autoreplies", aliases=["listautoreplies", "arlist"])
 async def listautoreplies(ctx: commands.Context):
     """List all active autoreply triggers and their responses."""
     if not autoreplies:
@@ -4877,7 +4832,7 @@ async def listautoreplies(ctx: commands.Context):
 
 # ---------- Autoreply2 ----------
 
-@bot.hybrid_command(name="autoreply2", aliases=["ar2"], description="Owner-only: toggle AI auto-reply for every message in this channel")
+@bot.command(name="autoreply2", aliases=["ar2"])
 @commands.check(_is_owner)
 async def autoreply2_cmd(ctx: commands.Context):
     """Owner-only: toggle AI auto-reply on/off for the current channel.
@@ -4900,7 +4855,7 @@ async def autoreply2_cmd(ctx: commands.Context):
         await ctx.reply(f"✅ AI auto-reply **enabled** in {ctx.channel.mention}. The bot will reply to every message using AI.")
 
 
-@bot.hybrid_command(name="autoreply2list", aliases=["ar2list"], description="Owner-only: list all channels with AI auto-reply enabled")
+@bot.command(name="autoreply2list", aliases=["ar2list"])
 @commands.check(_is_owner)
 async def autoreply2list(ctx: commands.Context):
     """Owner-only: list all channels with autoreply2 active."""
@@ -4911,8 +4866,7 @@ async def autoreply2list(ctx: commands.Context):
     await ctx.reply("AI auto-reply enabled in:\n" + "\n".join(lines))
 
 
-@bot.hybrid_command(name="removear2mentions", aliases=["rarm2", "noar2ping"], description="Owner-only: stop autoreply2 from pinging a specific user")
-@app_commands.describe(user="The user to stop pinging in autoreply2 responses")
+@bot.command(name="removear2mentions", aliases=["rarm2", "noar2ping"])
 @commands.check(_is_owner)
 async def removear2mentions(ctx: commands.Context, user: discord.Member):
     """Owner-only: toggle off @mention pings for a user in autoreply2 responses.
@@ -4937,8 +4891,7 @@ async def removear2mentions(ctx: commands.Context, user: discord.Member):
 
 # ---------- Warnings ----------
 
-@bot.hybrid_command(name="warn", description="Owner-only: warn a user")
-@app_commands.describe(user="The user to warn", reason="Reason for the warning")
+@bot.command(name="warn")
 @commands.check(_is_owner)
 async def warn(ctx: commands.Context, user: discord.Member, *, reason: str = "No reason given."):
     """Owner-only: warn a user and track their warning count."""
@@ -4962,8 +4915,7 @@ async def warn(ctx: commands.Context, user: discord.Member, *, reason: str = "No
         pass
 
 
-@bot.hybrid_command(name="warnings", aliases=["warncount", "warnlist"], description="Owner-only: check a user's warnings")
-@app_commands.describe(user="The user to check")
+@bot.command(name="warnings", aliases=["warncount", "warnlist"])
 @commands.check(_is_owner)
 async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     """Owner-only: view all warnings for a user."""
@@ -4987,8 +4939,7 @@ async def warnings_cmd(ctx: commands.Context, user: discord.Member):
     await ctx.reply(embed=embed)
 
 
-@bot.hybrid_command(name="clearwarn", aliases=["clearwarnings", "unwarn"], description="Owner-only: clear all warnings for a user")
-@app_commands.describe(user="The user to clear warnings for")
+@bot.command(name="clearwarn", aliases=["clearwarnings", "unwarn"])
 @commands.check(_is_owner)
 async def clearwarn(ctx: commands.Context, user: discord.Member):
     """Owner-only: clear all warnings for a user."""
@@ -5000,11 +4951,7 @@ async def clearwarn(ctx: commands.Context, user: discord.Member):
 
 # ---------- Owner: activity control ----------
 
-@bot.hybrid_command(name="setactivity", aliases=["activity", "presence"], description="Owner-only: change the bot's activity status")
-@app_commands.describe(
-    activity_type="Type of activity: watching, listening, playing, or streaming",
-    text="The activity text to display (streaming: use 'Title | https://twitch.tv/...' to include a URL)"
-)
+@bot.command(name="setactivity", aliases=["activity", "presence"])
 @commands.check(_is_owner)
 async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
     """Owner-only: change the bot's activity.
@@ -5053,7 +5000,7 @@ async def setactivity(ctx: commands.Context, activity_type: str, *, text: str):
 
 # ---------- Owner: cross-server messaging ----------
 
-@bot.command(name="sendmsg", aliases=["msgsend"], description="Owner-only: send a message to any channel by ID")
+@bot.command(name="sendmsg", aliases=["msgsend"])
 @commands.check(_is_owner)
 async def sendmsg(ctx: commands.Context, channel_id: str, *, text: str):
     """Owner-only: send a message to any channel the bot can access, by channel ID.
@@ -5201,8 +5148,7 @@ async def _build_gemini_parts(text: str, attachments) -> list[dict]:
     return parts
 
 
-@bot.hybrid_command(name="chat", aliases=["ask", "ai"], description="chat with clankered")
-@app_commands.describe(question="what do you want")
+@bot.command(name="chat", aliases=["ask", "ai"])
 async def chat(ctx: commands.Context, *, question: str):
     """Chat with the IHTX AI assistant."""
     await ctx.defer()
@@ -5269,7 +5215,7 @@ async def chat(ctx: commands.Context, *, question: str):
         await ctx.send("idk bro 😭")
 
 
-@bot.hybrid_command(name="clearchat", aliases=["resetai", "chatclear"], description="Clear your AI conversation history")
+@bot.command(name="clearchat", aliases=["resetai", "chatclear"])
 async def clearchat(ctx: commands.Context):
     """Clear your personal AI conversation history."""
     _chat_histories.pop(ctx.author.id, None)
@@ -5279,7 +5225,7 @@ async def clearchat(ctx: commands.Context):
 
 # ---------- Heavy limit usage check ----------
 
-@bot.hybrid_command(name="usage", aliases=["heavyusage", "limit", "checklimit"], description="Check how many heavy commands you've used today")
+@bot.command(name="usage", aliases=["heavyusage", "limit", "checklimit"])
 async def usage(ctx: commands.Context):
     """Check your heavy command usage for the current 24-hour window."""
     user_id = ctx.author.id
@@ -5345,8 +5291,7 @@ _8BALL_RESPONSES = [
     "Outlook not so good.", "Very doubtful.",
 ]
 
-@bot.hybrid_command(name="8ball", aliases=["eightball"], description="Ask the magic 8-ball a question")
-@app_commands.describe(question="The question to ask")
+@bot.command(name="8ball", aliases=["eightball"])
 async def eightball(ctx: commands.Context, *, question: str):
     """Ask the magic 8-ball a yes/no question."""
     response = random.choice(_8BALL_RESPONSES)
@@ -5358,15 +5303,14 @@ async def eightball(ctx: commands.Context, *, question: str):
     await ctx.reply(embed=embed)
 
 
-@bot.hybrid_command(name="coinflip", aliases=["flip", "coin"], description="Flip a coin")
+@bot.command(name="coinflip", aliases=["flip", "coin"])
 async def coinflip(ctx: commands.Context):
     """Flip a coin — heads or tails."""
     result = random.choice(["Heads 🪙", "Tails 🪙"])
     await ctx.reply(f"**{result}**!")
 
 
-@bot.hybrid_command(name="roll", aliases=["dice", "d"], description="Roll a die (default: d6)")
-@app_commands.describe(sides="Number of sides on the die (default 6)")
+@bot.command(name="roll", aliases=["dice", "d"])
 async def roll(ctx: commands.Context, sides: int = 6):
     """Roll a die with the given number of sides."""
     if sides < 2:
@@ -5379,8 +5323,7 @@ async def roll(ctx: commands.Context, sides: int = 6):
     await ctx.reply(f"🎲 You rolled a **d{sides}** and got **{result}**!")
 
 
-@bot.hybrid_command(name="rps", aliases=["rockpaperscissors"], description="Play rock, paper, scissors")
-@app_commands.describe(choice="Your choice: rock, paper, or scissors")
+@bot.command(name="rps", aliases=["rockpaperscissors"])
 async def rps(ctx: commands.Context, choice: str):
     """Play rock, paper, scissors against the bot."""
     choice = choice.lower().strip()
@@ -5408,8 +5351,7 @@ async def rps(ctx: commands.Context, choice: str):
     await ctx.reply(embed=embed)
 
 
-@bot.hybrid_command(name="choose", aliases=["pick"], description="Choose between options (separate with |)")
-@app_commands.describe(options="Options separated by | (e.g. pizza | burgers | tacos)")
+@bot.command(name="choose", aliases=["pick"])
 async def choose(ctx: commands.Context, *, options: str):
     """Pick one option from a pipe-separated list."""
     choices = [o.strip() for o in options.split("|") if o.strip()]
@@ -5420,8 +5362,7 @@ async def choose(ctx: commands.Context, *, options: str):
     await ctx.reply(f"🎯 I choose: **{picked}**")
 
 
-@bot.hybrid_command(name="rate", description="Rate anything out of 10")
-@app_commands.describe(thing="What to rate")
+@bot.command(name="rate")
 async def rate(ctx: commands.Context, *, thing: str):
     """Rate something out of 10."""
     score = (hash(thing.lower()) % 11 + 11) % 11
@@ -5456,7 +5397,7 @@ def _save_random_pool() -> None:
 _load_random_pool()
 
 
-@bot.command(name="random", aliases=["rand"], description="Roll a random media item from the persistent pool, or manage the pool")
+@bot.command(name="random", aliases=["rand"])
 async def random_command(ctx: commands.Context, subcommand: str = "", *, args: str = ""):
     """Persistent random media pool.
 
@@ -5692,9 +5633,8 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
 # ---------- Catbox upload ----------
 
-@bot.hybrid_command(name="catbox", aliases=["cb", "upload"], description="Upload a file to catbox.moe and get a direct link")
-@app_commands.describe(attachment="File to upload (or reply to a message with an attachment)")
-async def catbox_upload(ctx: commands.Context, attachment: discord.Attachment = None):
+@bot.command(name="catbox", aliases=["cb", "upload"])
+async def catbox_upload(ctx: commands.Context):
     """Upload any file to catbox.moe and return a permanent direct link.
 
       t!catbox   (with file attached, or reply to a message with a file)
