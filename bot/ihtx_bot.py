@@ -98,6 +98,23 @@ def _is_owner(ctx: commands.Context) -> bool:
 def _is_owner_by_id(user_id: int) -> bool:
     return user_id in owner_ids
 
+
+def _is_bot_mod(ctx: commands.Context) -> bool:
+    """True if the user is an owner OR has reached max XP level (bot moderator)."""
+    if ctx.author.id in owner_ids:
+        return True
+    try:
+        from pathlib import Path as _Path
+        import json as _json
+        _xp_file = _Path("bot/xp_data.json")
+        if _xp_file.exists():
+            with _xp_file.open() as _f:
+                _xd = _json.load(_f)
+            return bool(_xd.get(str(ctx.author.id), {}).get("is_mod", False))
+    except Exception:
+        pass
+    return False
+
 _load_owner_ids()
 
 # Heavy command rate limiting
@@ -5255,10 +5272,38 @@ async def usage(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="setlimit", aliases=["sl"])
+@commands.check(_is_bot_mod)
+async def setlimit(ctx: commands.Context, user: discord.User, limit: int):
+    """[Bot Mod] Set a user's heavy command limit per 24h."""
+    if limit < 0:
+        await ctx.reply("❌ Limit must be 0 or greater.")
+        return
+    heavy_limits[user.id] = limit
+    _save_limits()
+    embed = discord.Embed(
+        title="✅ Limit Set",
+        description=f"Heavy command limit for {user.mention} set to **{limit}/24h**.",
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"Set by {ctx.author}")
+    await ctx.reply(embed=embed)
+
+
+@setlimit.error
+async def setlimit_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.reply("❌ Only bot owners and Level 15 moderators can set limits.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.reply("❌ Usage: `t!setlimit @user <number>`")
+    else:
+        await ctx.reply(f"❌ Error: {error}")
+
+
 @bot.command(name="resetlimit", aliases=["rl", "resetusage"])
-@commands.check(_is_owner)
+@commands.check(_is_bot_mod)
 async def resetlimit(ctx: commands.Context, user: discord.User):
-    """[Owner] Reset a user's heavy command usage back to zero."""
+    """[Bot Mod] Reset a user's heavy command usage back to zero."""
     heavy_usage.pop(user.id, None)
     _save_usage()
     embed = discord.Embed(
@@ -5273,7 +5318,7 @@ async def resetlimit(ctx: commands.Context, user: discord.User):
 @resetlimit.error
 async def resetlimit_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CheckFailure):
-        await ctx.reply("❌ Only bot owners can reset usage limits.")
+        await ctx.reply("❌ Only bot owners and Level 15 moderators can reset usage limits.")
     elif isinstance(error, commands.BadArgument):
         await ctx.reply("❌ Couldn't find that user. Try mentioning them or using their user ID.")
     else:
@@ -5736,20 +5781,11 @@ async def _award_xp(ctx: commands.Context, amount: int) -> list[str]:
             data["level"] += 1
             new_level = data["level"]
             if new_level >= _MAX_LEVEL:
+                data["is_mod"] = True
                 messages.append(
                     f"🏆 **MAX LEVEL!** {ctx.author.mention} reached **Level {_MAX_LEVEL}**! "
-                    f"You've been granted the **{_XP_MOD_ROLE_NAME}** role!"
+                    f"You are now a **Bot Moderator** and can use `t!setlimit` and `t!resetlimit`!"
                 )
-                # Try to assign Moderator role
-                if ctx.guild:
-                    role = discord.utils.get(ctx.guild.roles, name=_XP_MOD_ROLE_NAME)
-                    if role:
-                        try:
-                            await ctx.guild.get_member(uid).add_roles(role, reason="Reached max XP level")
-                        except Exception as e:
-                            print(f"[xp] Failed to assign role: {e}")
-                    else:
-                        print(f"[xp] Role '{_XP_MOD_ROLE_NAME}' not found in guild.")
                 break
             else:
                 messages.append(
