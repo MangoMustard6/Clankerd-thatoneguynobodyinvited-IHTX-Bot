@@ -753,7 +753,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
         fr = round(fps)
         fc = cfg["complex_template"].format(d=d, fr=fr)
         maps = cfg.get("maps", [])
-        audio_codec = cfg.get("audio_codec", "pcm_s16le")
+        audio_codec = cfg.get("audio_codec", "aac")
         extra_codec_args = cfg.get("extra_codec_args", ["-preset", "fast", "-crf", "23"])
         map_flags: list[str] = []
         for m in maps:
@@ -777,7 +777,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
                 "ffmpeg", "-y", "-i", input_path,
                 "-filter_complex", cfg["complex"],
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "pcm_s16le",
+                "-c:a", "aac",
                 "-t", "30",
                 output_path
             ]
@@ -786,7 +786,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
                 "ffmpeg", "-y", "-i", input_path,
                 "-vf", cfg["vf"],
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "pcm_s16le",
+                "-c:a", "aac",
                 "-t", "30",
                 output_path
             ]
@@ -815,7 +815,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
 
 
 def get_output_ext(input_ext: str, is_video: bool) -> str:
-    return ".mov" if is_video else ".gif"
+    return ".mp4" if is_video else ".gif"
 
 # ---------- HueHSV (ImageMagick haldclut) ----------
 
@@ -2652,14 +2652,14 @@ def _run_ihtxcustom_workflow(
             if not ok:
                 return False, f"Step {i + 1} failed: {err}"
 
-        # Concatenate 1.ts through powers.ts into .mov with h264 + pcm_s16le
+        # Concatenate 1.ts through powers.ts into .mp4 with h264 + aac
         concat_str = "|".join(ts(i) for i in range(1, powers + 1))
         concat_cmd = [
             "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
             "-i", f"concat:{concat_str}",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-pix_fmt", "yuv420p",
-            "-c:a", "pcm_s16le",
+            "-c:a", "aac",
             output_path,
         ]
         ok, err = _run_ffmpeg_raw(concat_cmd, timeout=300)
@@ -4105,6 +4105,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v2.8",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!ihtx, t!invlum** — Output changed from .mov to .mp4 and audio codec changed from pcm_s16le to aac; videos now play inline in Discord instead of appearing as a download-only attachment",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v2.7",
         "date": "2026-06-21",
