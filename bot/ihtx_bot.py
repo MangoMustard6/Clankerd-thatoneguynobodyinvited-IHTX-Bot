@@ -1597,15 +1597,27 @@ def _apply_pipe_effects(
             if name in ("volume", "vibrato", "areverse"):
                 af = _build_ffmpeg_pipe_vf(name, params)
                 if af:
+                    # pcm_s16le is lossless but requires a container that supports it.
+                    # Use .mkv for intermediates; for the final output honour the extension.
+                    _pcm_exts = {".mkv", ".wav", ".avi", ".mka"}
+                    if is_last:
+                        audio_out = out
+                        _out_ext = os.path.splitext(out)[1].lower()
+                        audio_codec_args = ["-c:a", "pcm_s16le"] if _out_ext in _pcm_exts else ["-c:a", "aac", "-b:a", "192k"]
+                    else:
+                        audio_out = os.path.join(tmpdir, f"pipe_{i}.mkv")
+                        audio_codec_args = ["-c:a", "pcm_s16le"]
                     cmd = [
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                         "-i", current, "-af", af,
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out,
+                        "-c:v", "copy",
+                        *audio_codec_args,
+                        audio_out,
                     ]
                     ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                     if not ok:
                         return False, f"Audio filter '{name}' failed: {err}"
-                    current = out
+                    current = audio_out
                     continue
 
             # shake — pixel-displacement shake using geq, crops back to original dims
