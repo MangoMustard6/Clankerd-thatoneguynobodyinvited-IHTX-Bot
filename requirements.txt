@@ -41,3 +41,8 @@ discord.py
 google-genai
 openai
 yt-dlp
+aiohttp
+discord-py
+google-genai
+openai
+yt-dlp
