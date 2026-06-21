@@ -512,6 +512,35 @@ PRESET_FILTERS: dict[str, dict] = {
         "vf": f"drawgrid=x=0:y=0:w=iw:h=5:t=1:color=white@0.1,{_BASE_NOISE},eq=gamma=1.5:saturation=0.3:contrast=2",
         "complex": None,
     },
+    "sierpinskiransomware": {
+        "vf": None,
+        "complex": None,
+        "complex_template": (
+            "[0:v]null,trim=0:{d}[outv1];"
+            "[0:a]atrim=0:{d}[outa1];"
+            "[0:v]trim=0:{d}[v1];"
+            "[0:v]negate,trim=0:{d}[v2];"
+            "[v1][v2]concat=2:1:0,setpts=1/2*PTS,fps={fr},trim=0:{d}[outv2];"
+            "[0:a]rubberband=pitch=2:tempo=2,atrim=0:{d}[a1];"
+            "[0:a]rubberband=pitch=2:tempo=2,atrim=0:{d}[a2];"
+            "[a1][a2]concat=2:0:1,atrim=0:{d}[outa2];"
+            "[0:v]null,trim=0:{d}[v3];"
+            "[0:v]negate,trim=0:{d}[v4];"
+            "[v3][v4]concat=2:1:0,setpts=1/1.333*PTS,fps={fr},trim=0:{d}[outv3];"
+            "[0:a]rubberband=pitch=1.333:tempo=1.333,atrim=0:{d}[a3];"
+            "[0:a]rubberband=pitch=1.333:tempo=1.333,atrim=0:{d}[a4];"
+            "[a3][a4]concat=2:0:1,atrim=0:{d}[outa3];"
+            "[0:v]setpts=1/0.5*PTS,fps={fr},trim=0:{d}[outv4];"
+            "[0:a]rubberband=pitch=0.5:tempo=0.5,atrim=0:{d}[outa4];"
+            "[outv1][outv2]hstack[tmp1];"
+            "[outv3][outv4]hstack[tmp2];"
+            "[tmp1][tmp2]vstack,scale=iw/2:ih/2[outv];"
+            "[outa1][outa2][outa3][outa4]amix=4,alimiter=2:latency=1,highpass=40[outa]"
+        ),
+        "maps": ["[outv]", "[outa]"],
+        "audio_codec": "flac",
+        "extra_codec_args": ["-preset", "ultrafast"],
+    },
 }
 
 VISUAL_PRESETS = set(PRESET_FILTERS.keys())
@@ -647,11 +676,58 @@ def _run_ffmpeg_raw(cmd: list[str], timeout: int = 180) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _probe_video_info(input_path: str) -> tuple[float, float]:
+    """Return (duration_seconds, fps) for a video file via ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-show_format", input_path,
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    data = json.loads(result.stdout) if result.stdout else {}
+    duration = float(data.get("format", {}).get("duration", 30))
+    fps = 30.0
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            r = stream.get("r_frame_rate", "30/1")
+            try:
+                num, den = r.split("/")
+                fps = float(num) / float(den)
+            except Exception:
+                pass
+            break
+    return duration, fps
+
+
 def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -> tuple[bool, str]:
     """Run ffmpeg using PRESET_FILTERS. Returns (ok, stderr-or-empty)."""
     cfg = PRESET_FILTERS.get(preset)
     if cfg is None:
         cfg = PRESET_FILTERS["chaos"]
+
+    # Presets with a dynamic filter_complex template (e.g. sierpinskiransomware)
+    if cfg.get("complex_template") and is_video:
+        duration, fps = _probe_video_info(input_path)
+        d = min(duration, 30.0)
+        fr = round(fps)
+        fc = cfg["complex_template"].format(d=d, fr=fr)
+        maps = cfg.get("maps", [])
+        audio_codec = cfg.get("audio_codec", "pcm_s16le")
+        extra_codec_args = cfg.get("extra_codec_args", ["-preset", "fast", "-crf", "23"])
+        map_flags: list[str] = []
+        for m in maps:
+            map_flags += ["-map", m]
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-filter_complex", fc,
+            *map_flags,
+            "-c:v", "libx264", *extra_codec_args,
+            "-c:a", audio_codec,
+            "-t", str(d),
+            output_path,
+        ]
+        return _run_ffmpeg_raw(cmd)
 
     if is_video:
         if cfg["complex"]:
@@ -3940,6 +4016,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v2.6",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!ihtx sierpinskiransomware** — New preset: 2×2 Sierpinski-style video grid (normal / 2× / 1.333× / 0.5× speed+pitch) using FFmpeg rubberband pitch-shifting; outputs FLAC audio",
+        ],
+        "fun": [
+            "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
+            "**ffmpeg-full** installed — rubberband filter now available for pitch/tempo effects",
+        ],
+        "owner": [],
+    },
+    {
         "version": "v2.5",
         "date": "2026-06-20",
         "heavy": [],
@@ -5001,7 +5089,7 @@ async def chat(ctx: commands.Context, *, question: str):
     system_identity = (
         f"You are 'Clankered Thatoneguynobodyinvited', an advanced video editing bot that makes IHTXES.\n"
         f"You are talking to {username}. Always stick to these absolute rules:\n"
-        f"1. Act extremely nonchalant, dry, sarcastic, and slightly rude. Speak exactly like a modern Gen-Z TikTok user.\n"
+        f"1. Act extremely nonchalant, dry, and sarcastic. Speak exactly like a modern Gen-Z TikTok user.\n"
         f"2. CRITICAL TEXT FORMATTING: Always type in 100% lowercase letters. Do not capitalize anything ever.\n"
         f"3. Use lowercase slang and abbreviations constantly: idk, wya, alr, bet, sup, rn, fr, smh, tbh. Never capitalize them.\n"
         f"4. ONLY use these specific emojis: 🥀, 🫩, 💀, 😭, ✌️. Do not use random happy or positive emojis.\n"
