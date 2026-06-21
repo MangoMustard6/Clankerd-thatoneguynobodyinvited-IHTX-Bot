@@ -65,6 +65,7 @@ except ImportError:
 # ---------- Configuration & constants ----------
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
+CATBOX_USERHASH = os.environ.get("CATBOX_USERHASH", "")
 
 # Default owner (can be extended via owner file)
 OWNER_ID = 1355759019330895973
@@ -599,6 +600,28 @@ async def download_url(url: str, dest: str):
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, dest)
+
+
+async def _upload_to_catbox(file_path: str) -> str | None:
+    """Upload a file to catbox.moe and return the URL, or None on failure."""
+    try:
+        with open(file_path, "rb") as fh:
+            file_bytes = fh.read()
+        filename = Path(file_path).name
+        form = aiohttp.FormData()
+        form.add_field("reqtype", "fileupload")
+        form.add_field("userhash", CATBOX_USERHASH)
+        form.add_field("fileToUpload", file_bytes, filename=filename)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://catbox.moe/user/api.php", data=form, timeout=aiohttp.ClientTimeout(total=60)
+            ) as resp:
+                text = await resp.text()
+                if resp.status == 200 and text.startswith("https://"):
+                    return text.strip()
+                return None
+    except Exception:
+        return None
 
 
 def _ffprobe(input_path: str, *args: str) -> str:
@@ -2538,6 +2561,9 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             _res_str = _ar_str = _fps_str = "N/A"
             _size_str = f"{out_size / (1024 * 1024):.2f} MB"
 
+        # Upload to Catbox
+        _catbox_url = await _upload_to_catbox(output_path)
+
         try:
             embed = discord.Embed(
                 title="IHTX Bot - The IHTX command:",
@@ -2549,6 +2575,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             embed.add_field(name="Aspect Ratio", value=_ar_str, inline=True)
             embed.add_field(name="FPS", value=_fps_str, inline=True)
             embed.add_field(name="File Size", value=_size_str, inline=True)
+            if _catbox_url:
+                embed.add_field(name="Catbox", value=f"[Download]({_catbox_url})\n{_catbox_url}", inline=False)
             await ctx.reply(
                 embed=embed,
                 file=discord.File(output_path, filename=out_filename),
@@ -4071,6 +4099,7 @@ _UPDATELOG: list[dict] = [
         ],
         "fun": [
             "**t!ihtx** (custom) — New processing status: '⏳ Processing your IHTX using pipe effects: `effects`×N', then '⌛ Done!' when finished",
+            "**t!ihtx** — Catbox upload after processing; result embed includes direct Catbox link",
             "**t!ihtx** — Result embed now shows Resolution, Aspect Ratio, FPS, and File Size of output; new icon",
             "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
             "**ffmpeg-full** installed — rubberband filter now available for pitch/tempo effects",
