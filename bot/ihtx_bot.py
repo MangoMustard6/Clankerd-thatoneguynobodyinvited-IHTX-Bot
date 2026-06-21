@@ -976,6 +976,74 @@ def _run_tvsim(
     return _run_ffmpeg_raw(cmd, timeout=300)
 
 
+# ---------- Swirl ----------
+
+def _run_swirl(
+    input_path: str,
+    output_path: str,
+    strength: float = 180.0,
+    radius: float = 0.5,
+    xc: float = 0.5,
+    yc: float = 0.5,
+    fallout: str = "quad",
+    is1to1: bool = False,
+) -> tuple[bool, str]:
+    """Apply a swirl/vortex distortion via FFmpeg geq.
+
+    Args:
+        strength  — swirl angle in degrees (can be negative to reverse spin)
+        radius    — normalized radius 0–1 of min(W,H) (default 0.5)
+        xc / yc  — normalized center 0–1 (default 0.5 = center)
+        fallout   — attenuation curve: 'linear' or 'quad' (default quad)
+        is1to1    — scale to square before swirl then restore aspect ratio
+    """
+    fallout = fallout.lower()
+    if fallout not in ("linear", "quad"):
+        fallout = "quad"
+
+    vinfo = _ffprobe_video_info(input_path)
+    w = vinfo["width"] or 854
+    h = vinfo["height"] or 480
+    is_video = vinfo.get("codec_type") == "video" and vinfo.get("nb_frames", 0) > 1
+
+    power = "" if fallout == "linear" else "^2"
+    atten = (
+        f"(if(lt(hypot(X-W*{xc},Y-H*{yc})+1e-6,min(W,H)*{radius}),"
+        f"1-(hypot(X-W*{xc},Y-H*{yc})+1e-6)/(min(W,H)*{radius}),0){power})"
+    )
+    calc_cos = f"cos((atan2(Y-H*{yc},X-W*{xc}))+({strength}/180*PI)*{atten})"
+    calc_sin = f"sin((atan2(Y-H*{yc},X-W*{xc}))+({strength}/180*PI)*{atten})"
+    expr = (
+        f"p(W*{xc}+(hypot(X-W*{xc},Y-H*{yc})+1e-6)*{calc_cos},"
+        f"H*{yc}+(hypot(X-W*{xc},Y-H*{yc})+1e-6)*{calc_sin})"
+    )
+    geq_core = f"geq=lum='{expr}':cb='{expr}':cr='{expr}'"
+
+    if is1to1:
+        vf = f"format=yuv444p,scale={h}:{h},{geq_core},scale={w}:{h},setsar=1:1,format=yuv420p"
+    else:
+        vf = f"format=yuv444p,{geq_core},scale=iw:ih,format=yuv420p"
+
+    if is_video:
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac",
+            output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+            "-vf", vf,
+            output_path,
+        ]
+
+    return _run_ffmpeg_raw(cmd, timeout=300)
+
+
 # ---------- ccshue (ImageMagick haldclut — hue/sat/gamma/gain/offset) ----------
 
 def _run_ccshue(
@@ -1068,6 +1136,7 @@ PIPE_EFFECT_NAMES = {
     "syncaudio", "speed", "ffmpeg", "frei0r",
     "wave",
     "tvsim", "tv",
+    "swirl",
     "sierpinskiransomware",
 }
 
@@ -1642,6 +1711,35 @@ def _apply_pipe_effects(
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
                     return False, f"Filter '{name}' failed: {err}"
+                current = out
+                continue
+
+            # swirl — vortex/swirl distortion via geq
+            if name == "swirl":
+                def _sp(idx, default):
+                    try:
+                        return params[idx] if idx < len(params) else default
+                    except (IndexError, TypeError):
+                        return default
+                def _spf(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                fallout_val = _sp(4, "quad")
+                is1to1_raw = _sp(5, "false")
+                is1to1_val = str(is1to1_raw).lower() in ("1", "true", "t", "y", "yes", "+", "on")
+                ok, err = _run_swirl(
+                    current, out,
+                    strength=_spf(0, 180.0),
+                    radius=_spf(1, 0.5),
+                    xc=_spf(2, 0.5),
+                    yc=_spf(3, 0.5),
+                    fallout=fallout_val,
+                    is1to1=is1to1_val,
+                )
+                if not ok:
+                    return False, f"swirl failed: {err}"
                 current = out
                 continue
 
@@ -3862,6 +3960,142 @@ async def syncaudio_command(ctx: commands.Context, mode: str = ""):
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
+@bot.command(name="swirl", aliases=["vortex"])
+async def swirl_command(ctx: commands.Context, *, args: str = ""):
+    """Apply a swirl/vortex distortion to an attached video or image.
+
+    Usage:
+      t!swirl <strength> [radius] [xc] [yc] [fallout] [is1to1]
+
+    Parameters (space- or pipe-separated):
+      strength  — swirl angle in degrees (can be negative). Required.
+      radius    — normalized radius 0–1 of min(W,H) (default 0.5)
+      xc        — horizontal center 0–1 (default 0.5)
+      yc        — vertical center 0–1 (default 0.5)
+      fallout   — attenuation curve: 'linear' or 'quad' (default quad)
+      is1to1    — true/false, scale to square before swirl (default false)
+
+    Examples:
+      t!swirl 180
+      t!swirl 360 0.5 0.5 0.5 quad false
+      t!swirl -90 0.3 0.25 0.75 linear
+    """
+    tokens = re.split(r"[|\s]+", args.strip()) if args.strip() else []
+
+    def _spf(idx, default):
+        try:
+            return float(tokens[idx]) if idx < len(tokens) else default
+        except (ValueError, TypeError):
+            return default
+
+    def _sps(idx, default):
+        return tokens[idx] if idx < len(tokens) else default
+
+    if not tokens:
+        await ctx.reply(
+            "**t!swirl** — vortex/swirl distortion\n"
+            "Attach a video or image and provide `strength` (degrees).\n\n"
+            "**Usage:** `t!swirl <strength> [radius] [xc] [yc] [fallout] [is1to1]`\n"
+            "**Examples:** `t!swirl 180` · `t!swirl 360 0.5 0.5 0.5 quad` · `t!swirl -90 0.3 0.25 0.75 linear`\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 swirl=180`\n"
+            "Full pipe syntax: `swirl=strength;radius;xc;yc;fallout;is1to1`\n"
+            "Alias: `t!vortex`"
+        )
+        return
+
+    strength = _spf(0, 180.0)
+    radius   = _spf(1, 0.5)
+    xc       = _spf(2, 0.5)
+    yc       = _spf(3, 0.5)
+    fallout  = _sps(4, "quad").lower()
+    if fallout not in ("linear", "quad"):
+        await ctx.reply("❌ `fallout` must be `linear` or `quad`.")
+        return
+    is1to1_raw = _sps(5, "false")
+    is1to1 = is1to1_raw.lower() in ("1", "true", "t", "y", "yes", "+", "on")
+
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "❌ Attach a video or image to use `t!swirl`.\n"
+            "**Usage:** `t!swirl <strength> [radius] [xc] [yc] [fallout] [is1to1]`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply("❌ File too large (max 25 MB).")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    is_video = suffix in VIDEO_EXTENSIONS
+    is_image = suffix in IMAGE_EXTENSIONS
+    if not is_video and not is_image:
+        await ctx.reply(f"❌ Unsupported file type `{suffix}`. Attach a video or image.")
+        return
+
+    status_msg = await ctx.reply(f"⏳ Applying swirl (strength={strength}°)…")
+
+    out_suffix = suffix if is_image else ".mp4"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path  = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, f"swirl{out_suffix}")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_swirl,
+            input_path, output_path,
+            strength, radius, xc, yc, fallout, is1to1,
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ Swirl failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="⬆️ Output too large — uploading to Catbox…")
+            cb_url = await _upload_to_catbox(output_path)
+            if cb_url:
+                await ctx.reply(f"✅ **Swirl** done! [Download]({cb_url})\n{cb_url}")
+                await status_msg.delete()
+            else:
+                await status_msg.edit(content="❌ Output too large (>25 MB) and Catbox upload failed.")
+            return
+
+        out_filename = f"swirl_{Path(attachment.filename).stem}{out_suffix}"
+        try:
+            embed = discord.Embed(
+                title="IHTX Bot — t!swirl",
+                description=(
+                    f"strength={strength}° · radius={radius} · center=({xc},{yc}) · "
+                    f"fallout={fallout} · 1:1={is1to1}"
+                ),
+                color=4886754,
+            )
+            embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
+            embed.add_field(name="File Size", value=f"{out_size/(1024*1024):.2f} MB", inline=True)
+            await ctx.reply(embed=embed, file=discord.File(output_path, filename=out_filename))
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
 @bot.command(name="tvsim", aliases=["tv", "tvsimulator"])
 async def tvsim_command(ctx: commands.Context, *, args: str = ""):
     """Apply a TV/CRT simulator effect to an attached video.
@@ -4043,6 +4277,7 @@ _HELP_ENTRIES: list[dict] = [
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
+            "**Swirl:** `swirl=strength[;radius;xc;yc;fallout;is1to1]`\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
     },
@@ -4114,6 +4349,25 @@ _HELP_ENTRIES: list[dict] = [
             "• **`areverse`** — reverses audio only (video unaffected)\n"
             "Chain both to fully reverse: `t!ihtx 1 5 - mp4 vreverse,areverse`\n"
             "Note: `vreverse` loads all frames into memory — keep clips short."
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "t!swirl <strength> [...]  (alias: vortex)",
+        "value": (
+            "Apply a vortex/swirl distortion to a video or image using FFmpeg geq.\n"
+            "**Parameters** (space- or pipe-separated):\n"
+            "• `strength` — swirl angle in degrees (negative = reverse spin). **Required.**\n"
+            "• `radius` — normalized radius 0–1 of min(W,H) where swirl reaches (default 0.5)\n"
+            "• `xc` / `yc` — normalized center position 0–1 (default 0.5 = center)\n"
+            "• `fallout` — attenuation curve: `linear` or `quad` (default `quad`)\n"
+            "• `is1to1` — `true`/`false`, scale to square before swirl then restore (default `false`)\n\n"
+            "**Examples:**\n"
+            "`t!swirl 180` — half-turn swirl from center\n"
+            "`t!swirl 360 0.5 0.5 0.5 quad` — full spin, quadratic falloff\n"
+            "`t!swirl -90 0.3 0.25 0.75 linear` — reverse swirl, off-center, linear falloff\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 swirl=180`\n"
+            "Full pipe syntax: `swirl=strength;radius;xc;yc;fallout;is1to1`"
         ),
     },
     {
@@ -4402,6 +4656,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.1",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!swirl** — New vortex/swirl distortion command using FFmpeg geq. Works on videos and images. Params: `strength` (degrees), `radius`, `xc`, `yc`, `fallout` (linear/quad), `is1to1`. Alias: `t!vortex`",
+            "**t!ihtx pipe** — Added `swirl` pipe effect. Usage: `swirl=strength;radius;xc;yc;fallout;is1to1`",
+            "**t!ihtxhelp** — Added swirl entry; pipe effects list updated with Swirl section",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v3.0",
         "date": "2026-06-21",
