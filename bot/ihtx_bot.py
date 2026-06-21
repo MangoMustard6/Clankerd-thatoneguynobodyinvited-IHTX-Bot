@@ -1009,23 +1009,40 @@ def _run_swirl(
     power = "^2" if fallout == "quad" else ""
     angle = f"({strength}/180*PI)"
 
-    # is1to1=True  → swirl computed on a square frame → circular swirl
-    # is1to1=False → swirl computed on the full frame using max(W,H)
-    #                so the swirl covers the entire image, not just a
-    #                square centre region (which is what caused the "1:1" look)
-    dim_ref = "min(W,H)" if is1to1 else "max(W,H)"
+    # is1to1=True  → circular swirl (scale to square, apply, restore)
+    # is1to1=False → elliptical swirl proportional to the video's W×H,
+    #                so the swirl region is wide on wide videos and tall
+    #                on tall videos, matching the actual frame shape
 
-    # Use FFmpeg st/ld registers to avoid repeating sub-expressions
-    # reg 0 — pixel distance from centre (+eps)
-    # reg 1 — attenuation weight (0 outside radius, fades to 0 at edge)
-    # reg 2 — original angle of the pixel relative to centre
-    expr = (
-        f"st(0,hypot(X-W*{xc},Y-H*{yc})+1e-6);"
-        f"st(1,(if(lt(ld(0),{dim_ref}*{radius}),1-ld(0)/({dim_ref}*{radius}),0)){power});"
-        f"st(2,atan2(Y-H*{yc},X-W*{xc}));"
-        f"p(W*{xc}+ld(0)*cos(ld(2)+{angle}*ld(1)),"
-        f"H*{yc}+ld(0)*sin(ld(2)+{angle}*ld(1)))"
-    )
+    # FFmpeg st/ld registers (re-evaluated per pixel, per plane):
+    # reg 0 — actual pixel distance from centre (+eps), used for displacement
+    # reg 1 — attenuation weight [0,1]
+    # reg 2 — pixel angle (atan2), used for swirl direction
+    # reg 3 — (is1to1=False only) normalised ellipse distance
+
+    if is1to1:
+        # Circular: attenuation based on pixel distance vs min(W,H)*radius
+        expr = (
+            f"st(0,hypot(X-W*{xc},Y-H*{yc})+1e-6);"
+            f"st(1,(if(lt(ld(0),min(W,H)*{radius}),1-ld(0)/(min(W,H)*{radius}),0)){power});"
+            f"st(2,atan2(Y-H*{yc},X-W*{xc}));"
+            f"p(W*{xc}+ld(0)*cos(ld(2)+{angle}*ld(1)),"
+            f"H*{yc}+ld(0)*sin(ld(2)+{angle}*ld(1)))"
+        )
+    else:
+        # Elliptical: attenuation based on normalised ellipse distance
+        # (1.0 at the edge of a W*radius × H*radius ellipse).
+        # Displacement still uses the real pixel distance so the swirl
+        # magnitude is natural; only the *falloff region* is wide.
+        expr = (
+            f"st(0,hypot(X-W*{xc},Y-H*{yc})+1e-6);"
+            f"st(2,atan2(Y-H*{yc},X-W*{xc}));"
+            f"st(3,hypot((X-W*{xc})/(W*{radius}),(Y-H*{yc})/(H*{radius})));"
+            f"st(1,(if(lt(ld(3),1),1-ld(3),0)){power});"
+            f"p(W*{xc}+ld(0)*cos(ld(2)+{angle}*ld(1)),"
+            f"H*{yc}+ld(0)*sin(ld(2)+{angle}*ld(1)))"
+        )
+
     geq_core = f"geq=lum='{expr}':cb='{expr}':cr='{expr}'"
 
     if is1to1:
