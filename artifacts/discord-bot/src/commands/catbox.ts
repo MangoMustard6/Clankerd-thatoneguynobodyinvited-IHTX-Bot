@@ -5,7 +5,7 @@ import { Message, EmbedBuilder, Attachment } from 'discord.js';
 import { spawnAsync } from '../utils/spawn.js';
 import { BOT_OWNER_ID } from '../config.js';
 
-const CATBOX_UPLOAD_SCRIPT = path.resolve('bot/catbox_upload.py');
+const CATBOX_UPLOAD_SCRIPT = path.resolve('../../bot/catbox_upload.py');
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // catbox.moe limit: 200 MB
 const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
