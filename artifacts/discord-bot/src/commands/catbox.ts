@@ -13,6 +13,8 @@ function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `ihtx-${prefix}-`));
 }
 
+const ENV_USERHASH = process.env.CATBOX_USERHASH ?? '';
+
 function parseArgs(args: string[]): { userhash: string | null } {
   let userhash: string | null = null;
   for (const arg of args) {
@@ -22,6 +24,8 @@ function parseArgs(args: string[]): { userhash: string | null } {
     const val = arg.slice(eqIdx + 1).trim();
     if (key === 'userhash' && val) userhash = val;
   }
+  // Fall back to the secret from environment if no arg supplied
+  if (!userhash && ENV_USERHASH) userhash = ENV_USERHASH;
   return { userhash };
 }
 
