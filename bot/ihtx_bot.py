@@ -2216,7 +2216,7 @@ def _run_preview1280(
                 f"movie={clut_180}[h];"
                 f"[0][h]haldclut,hflip,crop=iw/2:ih:0:0,split[left][tmp];"
                 f"[tmp]hflip[right];[left][right]hstack,format=yuv420p,format=bgr32[00];"
-                f"[1]crop=iw:ih/1:0:0,scale={avi_w}:{avi_h},eq=contrast=0.4,format=bgr32,hue=b=-0.033[x];"
+                f"[1]crop=iw:ih/1:0:0,scale={avi_w}:{avi_h},eq=contrast=0.375,format=bgr32,hue=b=-0.033[x];"
                 f"nullsrc=1x1,geq=r=128:g=128:b=128,scale={avi_w}:{avi_h},format=bgr32[y];"
                 f"[00][x][y]displace=edge=wrap[v]"
             )
@@ -2795,8 +2795,8 @@ async def invlum_command(ctx: commands.Context, *, args: str = "1", attachment: 
 
 
 @bot.hybrid_command(name="preview1280", aliases=["p1280", "preview", "pv1280"], description="Create a 12-segment TV-simulator preview montage")
-@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)", attachment="Video file to preview")
-async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85, attachment: discord.Attachment = None):
+@app_commands.describe(start="Start offset in seconds (default: 1.85)", duration="Segment duration in seconds (default: 0.85)")
+async def preview1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
     """Create a 12-segment TV-simulator preview montage from an attached video.
 
     Usage: t!preview1280 [start_offset] [segment_duration]
@@ -2875,8 +2875,14 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
 
         out_filename = f"p1280_{Path(attachment.filename).stem}.mp4"
         try:
+            embed_p1280 = discord.Embed(
+                title="Preview 1280 - FFmpeg command originally made by `MWTVE7691` then transported to typescript:",
+                description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
+                color=11578404,
+            )
+            embed_p1280.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
             await ctx.reply(
-                content=f"✅ **IHTX preview1280** applied!",
+                embed=embed_p1280,
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -4109,7 +4115,8 @@ _UPDATELOG: list[dict] = [
         ],
         "fun": [
             "**t!ihtx** (custom) — New processing status: '⏳ Processing your IHTX using pipe effects: `effects`×N', then '⌛ Done!' when finished",
-            "**t!lexg** — Rebuilt: grabs last N seconds via reverse→trim→reverse (t!lexg [duration]); outputs lec.mp4; Catbox fallback for large files",
+            "**t!preview1280** — New result embed (MWTVE7691 credit, sync tip, thumbnail); segment 3 contrast fixed to 0.375",
+            "**t!lexg / t!lec** — Fixed MissingRequiredAttachment crash; attachment now resolved from message context only",
             "**t!ihtx** — Auto-uploads to Catbox when output exceeds Discord 25 MB limit; sends embed with download link instead of erroring",
             "**t!ihtx** — Result embed now shows Resolution, Aspect Ratio, FPS, and File Size of output; new icon",
             "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
@@ -4283,11 +4290,8 @@ async def updatelog_command(ctx: commands.Context):
 # ---------- Last Export Grab ----------
 
 @bot.hybrid_command(name="lexg", aliases=["lastexportgrab", "lec"], description="Grab the last N seconds of a video (reverse-trim-reverse)")
-@app_commands.describe(
-    duration="How many seconds to grab from the end (default: 5)",
-    attachment="Video/audio file to grab from",
-)
-async def lexg_command(ctx: commands.Context, duration: float = 5.0, attachment: discord.Attachment = None):
+@app_commands.describe(duration="How many seconds to grab from the end (default: 5)")
+async def lexg_command(ctx: commands.Context, duration: float = 5.0):
     """Grab the last N seconds of a video using reverse→trim→reverse.
 
     Usage: t!lexg [duration] — attach a video or reply to one.
