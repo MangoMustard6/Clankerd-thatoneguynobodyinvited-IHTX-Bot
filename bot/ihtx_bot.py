@@ -2408,6 +2408,7 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
       t!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
       t!ihtx <exports> <duration> <no_trim> <export_fmt> <pipe effects>   — custom TagScript workflow
     """
+    attachment = None
     # Parse arguments: preset name or TagScript-style custom icf+ workflow.
     parts = args.split()
     first = parts[0].lower() if parts else "chaos"
@@ -2713,6 +2714,7 @@ async def invlum_command(ctx: commands.Context, *, args: str = "1"):
         )
         return
 
+    attachment = None
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
@@ -2958,6 +2960,7 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
 
     # Resolve attachment: slash commands pass it as a parameter;
     # prefix commands need us to look at the message or referenced message.
+    attachment = None
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
@@ -3055,6 +3058,7 @@ async def ffmpeg_raw_command(ctx: commands.Context, *, args: str = ""):
         )
         return
 
+    attachment = None
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
@@ -3544,6 +3548,7 @@ async def huehsv_command(ctx: commands.Context, hue: float = 0.5):
     Then: ffmpeg -vf "movie=hsv.ppm,[in]haldclut,format=rgba" -pix_fmt yuv420p
     """
     # Resolve attachment
+    attachment = None
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
@@ -3633,6 +3638,7 @@ async def syncaudio_command(ctx: commands.Context, mode: str = ""):
 
     # Resolve attachment: slash commands pass it as a parameter;
     # prefix commands need us to look at the message or referenced message.
+    attachment = None
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
@@ -4100,6 +4106,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v2.7",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!ihtx, t!invlum, t!multipitch, t!ffmpeg, t!huehsv, t!syncaudio, t!lexg** — Fixed NameError crash: attachment variable was used before being initialized in all 7 commands; they now work correctly with attached files",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
         "version": "v2.6",
         "date": "2026-06-21",
         "heavy": [
@@ -4291,6 +4306,7 @@ async def lexg_command(ctx: commands.Context, duration: float = 5.0):
     Default duration is 5 seconds.
     """
     # Resolve attachment
+    attachment = None
     if attachment is None:
         if ctx.message and ctx.message.attachments:
             attachment = ctx.message.attachments[0]
