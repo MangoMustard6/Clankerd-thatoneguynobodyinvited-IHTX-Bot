@@ -1004,27 +1004,36 @@ def _run_swirl(
     vinfo = _ffprobe_video_info(input_path)
     w = vinfo["width"] or 854
     h = vinfo["height"] or 480
-    is_video = vinfo.get("codec_type") == "video" and vinfo.get("nb_frames", 0) > 1
+    has_audio = vinfo.get("duration", 0) > 0 and Path(input_path).suffix.lower() in VIDEO_EXTENSIONS
 
-    power = "" if fallout == "linear" else "^2"
-    atten = (
-        f"(if(lt(hypot(X-W*{xc},Y-H*{yc})+1e-6,min(W,H)*{radius}),"
-        f"1-(hypot(X-W*{xc},Y-H*{yc})+1e-6)/(min(W,H)*{radius}),0){power})"
-    )
-    calc_cos = f"cos((atan2(Y-H*{yc},X-W*{xc}))+({strength}/180*PI)*{atten})"
-    calc_sin = f"sin((atan2(Y-H*{yc},X-W*{xc}))+({strength}/180*PI)*{atten})"
+    power = "^2" if fallout == "quad" else ""
+    angle = f"({strength}/180*PI)"
+
+    # is1to1=True  → swirl computed on a square frame → circular swirl
+    # is1to1=False → swirl computed on the full frame using max(W,H)
+    #                so the swirl covers the entire image, not just a
+    #                square centre region (which is what caused the "1:1" look)
+    dim_ref = "min(W,H)" if is1to1 else "max(W,H)"
+
+    # Use FFmpeg st/ld registers to avoid repeating sub-expressions
+    # reg 0 — pixel distance from centre (+eps)
+    # reg 1 — attenuation weight (0 outside radius, fades to 0 at edge)
+    # reg 2 — original angle of the pixel relative to centre
     expr = (
-        f"p(W*{xc}+(hypot(X-W*{xc},Y-H*{yc})+1e-6)*{calc_cos},"
-        f"H*{yc}+(hypot(X-W*{xc},Y-H*{yc})+1e-6)*{calc_sin})"
+        f"st(0,hypot(X-W*{xc},Y-H*{yc})+1e-6);"
+        f"st(1,(if(lt(ld(0),{dim_ref}*{radius}),1-ld(0)/({dim_ref}*{radius}),0)){power});"
+        f"st(2,atan2(Y-H*{yc},X-W*{xc}));"
+        f"p(W*{xc}+ld(0)*cos(ld(2)+{angle}*ld(1)),"
+        f"H*{yc}+ld(0)*sin(ld(2)+{angle}*ld(1)))"
     )
     geq_core = f"geq=lum='{expr}':cb='{expr}':cr='{expr}'"
 
     if is1to1:
-        vf = f"format=yuv444p,scale={h}:{h},{geq_core},scale={w}:{h},setsar=1:1,format=yuv420p"
+        vf = f"format=yuv444p,scale={h}:{h},{geq_core},scale={w}:{h},format=yuv420p"
     else:
-        vf = f"format=yuv444p,{geq_core},scale=iw:ih,format=yuv420p"
+        vf = f"format=yuv444p,{geq_core},format=yuv420p"
 
-    if is_video:
+    if has_audio:
         cmd = [
             "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
             "-i", input_path,
