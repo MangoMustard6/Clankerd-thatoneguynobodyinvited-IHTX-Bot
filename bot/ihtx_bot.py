@@ -2515,13 +2515,40 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             }
             out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mp4"
 
+        # Probe output file for embed metadata
+        try:
+            _vinfo = _ffprobe_video_info(output_path)
+            _w, _h = int(_vinfo["width"]), int(_vinfo["height"])
+            _fr_raw = _vinfo.get("r_frame_rate", "")
+            try:
+                _fn, _fd = _fr_raw.split("/")
+                _fps_val = float(_fn) / float(_fd)
+                _fps_str = f"{_fps_val:.3f}".rstrip("0").rstrip(".") + " fps"
+            except Exception:
+                _fps_str = "N/A"
+            if _w > 0 and _h > 0:
+                _gcd = math.gcd(_w, _h)
+                _ar_str = f"{_w // _gcd}:{_h // _gcd}"
+                _res_str = f"{_w}×{_h}"
+            else:
+                _ar_str = _res_str = "N/A"
+            _size_mb = out_size / (1024 * 1024)
+            _size_str = f"{_size_mb:.2f} MB"
+        except Exception:
+            _res_str = _ar_str = _fps_str = "N/A"
+            _size_str = f"{out_size / (1024 * 1024):.2f} MB"
+
         try:
             embed = discord.Embed(
                 title="IHTX Bot - The IHTX command:",
                 description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
                 color=11578404,
             )
-            embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/1507947387031650304/1517856881857531974/Untitled216_20260620164144.png?ex=6a37cde1&is=6a367c61&hm=251129cd4598cb2a954014285055da6fb96b07442ad80154e4d9a5b3d24ea00b&")
+            embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
+            embed.add_field(name="Resolution", value=_res_str, inline=True)
+            embed.add_field(name="Aspect Ratio", value=_ar_str, inline=True)
+            embed.add_field(name="FPS", value=_fps_str, inline=True)
+            embed.add_field(name="File Size", value=_size_str, inline=True)
             await ctx.reply(
                 embed=embed,
                 file=discord.File(output_path, filename=out_filename),
@@ -4044,7 +4071,7 @@ _UPDATELOG: list[dict] = [
         ],
         "fun": [
             "**t!ihtx** (custom) — New processing status: '⏳ Processing your IHTX using pipe effects: `effects`×N', then '⌛ Done!' when finished",
-            "**t!ihtx** — Updated result embed: new title, description, color, and thumbnail",
+            "**t!ihtx** — Result embed now shows Resolution, Aspect Ratio, FPS, and File Size of output; new icon",
             "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
             "**ffmpeg-full** installed — rubberband filter now available for pitch/tempo effects",
         ],
