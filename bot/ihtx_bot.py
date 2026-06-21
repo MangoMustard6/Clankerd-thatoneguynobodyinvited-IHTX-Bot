@@ -2515,7 +2515,22 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
         out_size = os.path.getsize(output_path)
         if out_size > MAX_FILE_SIZE:
-            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
+            await status_msg.edit(content="⬆️ Output too large for Discord — uploading to Catbox…")
+            _cb_url = await _upload_to_catbox(output_path)
+            if _cb_url:
+                _size_str_cb = f"{out_size / (1024 * 1024):.2f} MB"
+                embed_cb = discord.Embed(
+                    title="IHTX Bot - The IHTX command:",
+                    description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
+                    color=11578404,
+                )
+                embed_cb.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
+                embed_cb.add_field(name="File Size", value=_size_str_cb, inline=True)
+                embed_cb.add_field(name="Catbox", value=f"[Download]({_cb_url})\n{_cb_url}", inline=False)
+                await ctx.reply(embed=embed_cb)
+                await status_msg.delete()
+            else:
+                await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed. Try a shorter clip.")
             return
 
         # Store last export for lexg
@@ -2561,9 +2576,6 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             _res_str = _ar_str = _fps_str = "N/A"
             _size_str = f"{out_size / (1024 * 1024):.2f} MB"
 
-        # Upload to Catbox
-        _catbox_url = await _upload_to_catbox(output_path)
-
         try:
             embed = discord.Embed(
                 title="IHTX Bot - The IHTX command:",
@@ -2575,8 +2587,6 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
             embed.add_field(name="Aspect Ratio", value=_ar_str, inline=True)
             embed.add_field(name="FPS", value=_fps_str, inline=True)
             embed.add_field(name="File Size", value=_size_str, inline=True)
-            if _catbox_url:
-                embed.add_field(name="Catbox", value=f"[Download]({_catbox_url})\n{_catbox_url}", inline=False)
             await ctx.reply(
                 embed=embed,
                 file=discord.File(output_path, filename=out_filename),
@@ -4099,7 +4109,7 @@ _UPDATELOG: list[dict] = [
         ],
         "fun": [
             "**t!ihtx** (custom) — New processing status: '⏳ Processing your IHTX using pipe effects: `effects`×N', then '⌛ Done!' when finished",
-            "**t!ihtx** — Catbox upload after processing; result embed includes direct Catbox link",
+            "**t!ihtx** — Auto-uploads to Catbox when output exceeds Discord 25 MB limit; sends embed with download link instead of erroring",
             "**t!ihtx** — Result embed now shows Resolution, Aspect Ratio, FPS, and File Size of output; new icon",
             "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
             "**ffmpeg-full** installed — rubberband filter now available for pitch/tempo effects",
