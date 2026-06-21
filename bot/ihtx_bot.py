@@ -1007,48 +1007,23 @@ def _run_swirl(
     has_audio = vinfo.get("duration", 0) > 0 and Path(input_path).suffix.lower() in VIDEO_EXTENSIONS
 
     power = "^2" if fallout == "quad" else ""
-    angle = f"({strength}/180*PI)"
 
-    # is1to1=True  → circular swirl (scale to square, apply, restore)
-    # is1to1=False → elliptical swirl proportional to the video's W×H,
-    #                so the swirl region is wide on wide videos and tall
-    #                on tall videos, matching the actual frame shape
-
-    # FFmpeg st/ld registers (re-evaluated per pixel, per plane):
-    # reg 0 — actual pixel distance from centre (+eps), used for displacement
-    # reg 1 — attenuation weight [0,1]
-    # reg 2 — pixel angle (atan2), used for swirl direction
-    # reg 3 — (is1to1=False only) normalised ellipse distance
-
-    if is1to1:
-        # Circular: attenuation based on pixel distance vs min(W,H)*radius
-        expr = (
-            f"st(0,hypot(X-W*{xc},Y-H*{yc})+1e-6);"
-            f"st(1,(if(lt(ld(0),min(W,H)*{radius}),1-ld(0)/(min(W,H)*{radius}),0)){power});"
-            f"st(2,atan2(Y-H*{yc},X-W*{xc}));"
-            f"p(W*{xc}+ld(0)*cos(ld(2)+{angle}*ld(1)),"
-            f"H*{yc}+ld(0)*sin(ld(2)+{angle}*ld(1)))"
-        )
-    else:
-        # Elliptical: attenuation based on normalised ellipse distance
-        # (1.0 at the edge of a W*radius × H*radius ellipse).
-        # Displacement still uses the real pixel distance so the swirl
-        # magnitude is natural; only the *falloff region* is wide.
-        expr = (
-            f"st(0,hypot(X-W*{xc},Y-H*{yc})+1e-6);"
-            f"st(2,atan2(Y-H*{yc},X-W*{xc}));"
-            f"st(3,hypot((X-W*{xc})/(W*{radius}),(Y-H*{yc})/(H*{radius})));"
-            f"st(1,(if(lt(ld(3),1),1-ld(3),0)){power});"
-            f"p(W*{xc}+ld(0)*cos(ld(2)+{angle}*ld(1)),"
-            f"H*{yc}+ld(0)*sin(ld(2)+{angle}*ld(1)))"
-        )
-
-    geq_core = f"geq=lum='{expr}':cb='{expr}':cr='{expr}'"
+    # Attenuation: 1→0 within min(W,H)*radius of centre, 0 outside
+    atten = (
+        f"(if(lt(hypot(X-W*{xc},Y-H*{yc})+1e-6,min(W,H)*{radius}),"
+        f"1-(hypot(X-W*{xc},Y-H*{yc})+1e-6)/(min(W,H)*{radius}),0){power})"
+    )
+    calc_cos = f"cos((atan2(Y-H*{yc},X-W*{xc}))+({strength}/180*PI)*{atten})"
+    calc_sin = f"sin((atan2(Y-H*{yc},X-W*{xc}))+({strength}/180*PI)*{atten})"
+    geq_core = (
+        f"geq='p(W*{xc}+(hypot(X-W*{xc},Y-H*{yc})+1e-6)*{calc_cos},"
+        f"H*{yc}+(hypot(X-W*{xc},Y-H*{yc})+1e-6)*{calc_sin})'"
+    )
 
     if is1to1:
-        vf = f"format=yuv444p,scale={h}:{h},{geq_core},scale={w}:{h},format=yuv420p"
+        vf = f"format=yuv444p,scale={h}:{h},{geq_core},scale={w}:{h},setsar=1:1,format=yuv420p"
     else:
-        vf = f"format=yuv444p,{geq_core},format=yuv420p"
+        vf = f"format=yuv444p,{geq_core},scale=iw:ih,format=yuv420p"
 
     if has_audio:
         cmd = [
@@ -4682,6 +4657,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.2",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!swirl** — Updated swirl formula: uses inline geq expressions with `min(W,H)*radius` attenuation for both standard and 1:1 modes (replaces st/ld register approach). `setsar=1:1` added to 1:1 path. `fallout` and `is1to1` params unchanged.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v3.1",
         "date": "2026-06-21",
