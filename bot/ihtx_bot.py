@@ -521,17 +521,17 @@ PRESET_FILTERS: dict[str, dict] = {
             "[0:v]trim=0:{d}[v1];"
             "[0:v]negate,trim=0:{d}[v2];"
             "[v1][v2]concat=2:1:0,setpts=1/2*PTS,fps={fr},trim=0:{d}[outv2];"
-            "[0:a]rubberband=pitch=2:tempo=2:engine=finer,atrim=0:{d}[a1];"
-            "[0:a]rubberband=pitch=2:tempo=2:engine=finer,atrim=0:{d}[a2];"
+            "[0:a]rubberband=pitch=2:tempo=2,atrim=0:{d}[a1];"
+            "[0:a]rubberband=pitch=2:tempo=2,atrim=0:{d}[a2];"
             "[a1][a2]concat=2:0:1,atrim=0:{d}[outa2];"
             "[0:v]null,trim=0:{d}[v3];"
             "[0:v]negate,trim=0:{d}[v4];"
             "[v3][v4]concat=2:1:0,setpts=1/1.333*PTS,fps={fr},trim=0:{d}[outv3];"
-            "[0:a]rubberband=pitch=1.333:tempo=1.333:engine=finer,atrim=0:{d}[a3];"
-            "[0:a]rubberband=pitch=1.333:tempo=1.333:engine=finer,atrim=0:{d}[a4];"
+            "[0:a]rubberband=pitch=1.333:tempo=1.333,atrim=0:{d}[a3];"
+            "[0:a]rubberband=pitch=1.333:tempo=1.333,atrim=0:{d}[a4];"
             "[a3][a4]concat=2:0:1,atrim=0:{d}[outa3];"
             "[0:v]setpts=1/0.5*PTS,fps={fr},trim=0:{d}[outv4];"
-            "[0:a]rubberband=pitch=0.5:tempo=0.5:engine=finer,atrim=0:{d}[outa4];"
+            "[0:a]rubberband=pitch=0.5:tempo=0.5,atrim=0:{d}[outa4];"
             "[outv1][outv2]hstack[tmp1];"
             "[outv3][outv4]hstack[tmp2];"
             "[tmp1][tmp2]vstack,scale=iw/2:ih/2[outv];"
@@ -1828,7 +1828,7 @@ def _run_multipitch_rb3(
                 v_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
                 pitch_flag = f"-p{st:+.4f}" if st != 0 else "-p+0.0"
                 rb_res = subprocess.run(
-                    [rb_bin, "--engine=finer", pitch_flag, "-t1", base_wav, v_wav],
+                    [rb_bin, pitch_flag, "-t1", base_wav, v_wav],
                     capture_output=True, text=True, timeout=300,
                 )
                 if rb_res.returncode != 0:
@@ -2124,7 +2124,7 @@ def _run_preview1280(
         return (
             f"rubberband=pitch={pitch_ratio:.6f}:"
             f"window=short:transients={transients}:"
-            f"detector=soft:channels=together:pitchq=consistency:engine=finer"
+            f"detector=soft:channels=together:pitchq=consistency"
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -5390,6 +5390,319 @@ async def rate(ctx: commands.Context, *, thing: str):
     score = (hash(thing.lower()) % 11 + 11) % 11
     bar = "█" * score + "░" * (10 - score)
     await ctx.reply(f"**{thing}**: {bar} **{score}/10**")
+
+
+# ---------- Fun games ----------
+
+_HANGMAN_WORDS = [
+    "python", "discord", "ffmpeg", "glitch", "chaos", "render", "filter",
+    "codec", "bitrate", "buffer", "kernel", "shader", "pixel", "vector",
+    "matrix", "binary", "server", "latency", "keyframe", "montage",
+    "waveform", "frequency", "amplitude", "distortion", "reverb", "chorus",
+    "flanger", "compressor", "equalizer", "saturation", "contrast",
+]
+
+_HANGMAN_ART = [
+    "```\n  +---+\n  |   |\n      |\n      |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n      |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n  |   |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|   |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\  |\n      |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\  |\n /    |\n      |\n=========```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\  |\n / \\  |\n      |\n=========```",
+]
+
+
+@bot.command(name="hangman", aliases=["hm"])
+async def hangman(ctx: commands.Context):
+    """Play a game of hangman — guess the word one letter at a time."""
+    word = random.choice(_HANGMAN_WORDS)
+    guessed: set[str] = set()
+    wrong = 0
+    max_wrong = 6
+
+    def display() -> str:
+        blanks = " ".join(c if c in guessed else "_" for c in word)
+        wrong_letters = " ".join(sorted(guessed - set(word))) or "none"
+        return (
+            f"{_HANGMAN_ART[wrong]}\n"
+            f"**Word:** `{blanks}`\n"
+            f"**Wrong guesses ({wrong}/{max_wrong}):** {wrong_letters}"
+        )
+
+    msg = await ctx.reply(f"🎮 **Hangman!** Guess one letter at a time.\n{display()}")
+
+    def check(m: discord.Message) -> bool:
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and len(m.content) == 1
+            and m.content.isalpha()
+        )
+
+    while wrong < max_wrong:
+        try:
+            guess_msg = await bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await msg.edit(content=f"⏱️ Time's up! The word was **{word}**.")
+            return
+
+        letter = guess_msg.content.lower()
+        if letter in guessed:
+            await ctx.send(f"You already guessed `{letter}`!", delete_after=4)
+            continue
+
+        guessed.add(letter)
+        if letter not in word:
+            wrong += 1
+
+        won = all(c in guessed for c in word)
+        if won:
+            await msg.edit(content=f"🎉 You got it! The word was **{word}**!\n{display()}")
+            return
+        if wrong >= max_wrong:
+            break
+        await msg.edit(content=display())
+
+    await msg.edit(content=f"💀 Game over! The word was **{word}**.\n{_HANGMAN_ART[6]}")
+
+
+_BJ_VALUES = {"A": 11, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7,
+              "8": 8, "9": 9, "10": 10, "J": 10, "Q": 10, "K": 10}
+_BJ_SUITS = ["♠", "♥", "♦", "♣"]
+
+
+def _bj_deck():
+    return [f"{r}{s}" for s in _BJ_SUITS for r in _BJ_VALUES]
+
+
+def _bj_hand_value(hand: list[str]) -> int:
+    total, aces = 0, 0
+    for card in hand:
+        rank = card[:-1]
+        total += _BJ_VALUES[rank]
+        if rank == "A":
+            aces += 1
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def _bj_fmt(hand: list[str], hide_second: bool = False) -> str:
+    if hide_second:
+        return f"{hand[0]}, ??"
+    return "  ".join(hand)
+
+
+@bot.command(name="blackjack", aliases=["bj", "21"])
+async def blackjack(ctx: commands.Context):
+    """Play blackjack against the bot. Type `hit` or `stand`."""
+    deck = _bj_deck()
+    random.shuffle(deck)
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+
+    def board(hide_dealer: bool = True) -> str:
+        pv = _bj_hand_value(player)
+        dv = _bj_hand_value(dealer) if not hide_dealer else "?"
+        return (
+            f"🃏 **Blackjack**\n"
+            f"**Your hand:** {_bj_fmt(player)} — `{pv}`\n"
+            f"**Dealer:**    {_bj_fmt(dealer, hide_dealer)} — `{dv}`\n\n"
+            f"Type **`hit`** or **`stand`**"
+        )
+
+    msg = await ctx.reply(board())
+
+    def check(m: discord.Message) -> bool:
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and m.content.lower() in ("hit", "stand", "h", "s")
+        )
+
+    while True:
+        pv = _bj_hand_value(player)
+        if pv > 21:
+            await msg.edit(content=f"💥 **Bust!** You went over 21 with `{pv}`.\n**Dealer had:** {_bj_fmt(dealer)} — `{_bj_hand_value(dealer)}`")
+            return
+        if pv == 21:
+            break
+        try:
+            action_msg = await bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await msg.edit(content=f"⏱️ Time's up!\n**Dealer had:** {_bj_fmt(dealer)}")
+            return
+
+        action = action_msg.content.lower()
+        if action in ("hit", "h"):
+            player.append(deck.pop())
+            await msg.edit(content=board())
+        else:
+            break
+
+    # Dealer plays
+    while _bj_hand_value(dealer) < 17:
+        dealer.append(deck.pop())
+
+    pv = _bj_hand_value(player)
+    dv = _bj_hand_value(dealer)
+
+    if dv > 21:
+        result = f"🎉 **Dealer busts!** You win! (`{pv}` vs `{dv}`)"
+    elif pv > dv:
+        result = f"🎉 **You win!** (`{pv}` vs `{dv}`)"
+    elif pv == dv:
+        result = f"🤝 **Push!** It's a tie. (`{pv}` vs `{dv}`)"
+    else:
+        result = f"💀 **Dealer wins!** (`{pv}` vs `{dv}`)"
+
+    await msg.edit(content=(
+        f"🃏 **Blackjack — Final**\n"
+        f"**Your hand:** {_bj_fmt(player)} — `{pv}`\n"
+        f"**Dealer:**    {_bj_fmt(dealer)} — `{dv}`\n\n"
+        f"{result}"
+    ))
+
+
+_TTT_EMPTY = "⬜"
+_TTT_X = "❌"
+_TTT_O = "⭕"
+
+
+def _ttt_board(cells: list[str]) -> str:
+    rows = [" ".join(cells[i*3:(i+1)*3]) for i in range(3)]
+    return "\n".join(rows)
+
+
+def _ttt_check_winner(cells: list[str]) -> str | None:
+    wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+    for a, b, c in wins:
+        if cells[a] == cells[b] == cells[c] and cells[a] != _TTT_EMPTY:
+            return cells[a]
+    return None
+
+
+def _ttt_bot_move(cells: list[str]) -> int:
+    wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+    empty = [i for i, c in enumerate(cells) if c == _TTT_EMPTY]
+    # Win if possible
+    for a, b, c in wins:
+        group = [cells[a], cells[b], cells[c]]
+        if group.count(_TTT_O) == 2 and _TTT_EMPTY in group:
+            return [a, b, c][[cells[a], cells[b], cells[c]].index(_TTT_EMPTY)]
+    # Block player
+    for a, b, c in wins:
+        group = [cells[a], cells[b], cells[c]]
+        if group.count(_TTT_X) == 2 and _TTT_EMPTY in group:
+            return [a, b, c][[cells[a], cells[b], cells[c]].index(_TTT_EMPTY)]
+    # Centre
+    if cells[4] == _TTT_EMPTY:
+        return 4
+    return random.choice(empty)
+
+
+@bot.command(name="tictactoe", aliases=["ttt"])
+async def tictactoe(ctx: commands.Context):
+    """Play tic tac toe against the bot. Reply with a number 1–9."""
+    cells = [_TTT_EMPTY] * 9
+    num_grid = "```\n1 2 3\n4 5 6\n7 8 9\n```"
+
+    def board_msg(extra: str = "") -> str:
+        return f"❌ **Tic Tac Toe** — You are ❌, I am ⭕\n{num_grid}\n{_ttt_board(cells)}{extra}"
+
+    msg = await ctx.reply(board_msg("\n\nPick a square (1–9):"))
+
+    def check(m: discord.Message) -> bool:
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and m.content.strip() in [str(i) for i in range(1, 10)]
+        )
+
+    for _ in range(9):
+        # Player turn
+        try:
+            pick_msg = await bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await msg.edit(content="⏱️ Time's up!")
+            return
+
+        idx = int(pick_msg.content.strip()) - 1
+        if cells[idx] != _TTT_EMPTY:
+            await ctx.send("❌ That square is taken! Pick another.", delete_after=4)
+            continue
+
+        cells[idx] = _TTT_X
+        winner = _ttt_check_winner(cells)
+        if winner:
+            await msg.edit(content=board_msg(f"\n\n🎉 **You win!**"))
+            return
+        if _TTT_EMPTY not in cells:
+            await msg.edit(content=board_msg(f"\n\n🤝 **Draw!**"))
+            return
+
+        # Bot turn
+        bot_idx = _ttt_bot_move(cells)
+        cells[bot_idx] = _TTT_O
+        winner = _ttt_check_winner(cells)
+        if winner:
+            await msg.edit(content=board_msg(f"\n\n💀 **I win!**"))
+            return
+        if _TTT_EMPTY not in cells:
+            await msg.edit(content=board_msg(f"\n\n🤝 **Draw!**"))
+            return
+
+        await msg.edit(content=board_msg("\n\nYour turn — pick a square (1–9):"))
+
+
+_TRIVIA_QUESTIONS = [
+    ("How many bits are in a byte?", ["4", "8", "16", "32"], 1),
+    ("What does 'FPS' stand for in video?", ["Frames Per Second", "Files Per Session", "Fast Processing Speed", "Full Pixel Scan"], 0),
+    ("Which color model does video typically use?", ["RGB", "CMYK", "YUV", "HSL"], 2),
+    ("What is the standard frame rate for NTSC video?", ["24", "25", "29.97", "60"], 2),
+    ("What does 'codec' stand for?", ["Coded Decoder", "Coder Decoder", "Compress Decompress", "Convert Decode"], 1),
+    ("Which FFmpeg flag overwrites output files?", ["-f", "-y", "-o", "-w"], 1),
+    ("What does 'bitrate' measure?", ["Image resolution", "Data per second", "File size", "Frame size"], 1),
+    ("What audio format is lossless?", ["MP3", "AAC", "FLAC", "OGG"], 2),
+    ("What does 'Hz' measure in audio?", ["Volume", "Bitrate", "Frequency", "Latency"], 2),
+    ("What is 2^10?", ["512", "1000", "1024", "2048"], 2),
+    ("Which container supports both video and audio?", ["WAV", "MP3", "MP4", "PNG"], 2),
+    ("What does 'SAR' mean in FFmpeg?", ["Sample Audio Rate", "Sample Aspect Ratio", "Stream Audio Rate", "Source Aspect Ratio"], 1),
+    ("How many semitones are in an octave?", ["7", "10", "12", "16"], 2),
+    ("What does 'VBR' stand for?", ["Variable Bitrate", "Video Buffer Rate", "Variable Buffer Rate", "Video Bit Rate"], 0),
+    ("What is the resolution of 4K video?", ["1920×1080", "2560×1440", "3840×2160", "4096×2160"], 2),
+]
+
+
+@bot.command(name="trivia")
+async def trivia(ctx: commands.Context):
+    """Answer a random trivia question — type A, B, C, or D."""
+    q, options, correct_idx = random.choice(_TRIVIA_QUESTIONS)
+    labels = ["A", "B", "C", "D"]
+    choices_text = "\n".join(f"**{labels[i]}**  {opt}" for i, opt in enumerate(options))
+
+    msg = await ctx.reply(f"❓ **Trivia**\n\n{q}\n\n{choices_text}\n\n*Type A, B, C, or D*")
+
+    def check(m: discord.Message) -> bool:
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and m.content.upper().strip() in labels
+        )
+
+    try:
+        answer_msg = await bot.wait_for("message", check=check, timeout=30)
+    except asyncio.TimeoutError:
+        await msg.edit(content=f"⏱️ Time's up! The answer was **{labels[correct_idx]}** — {options[correct_idx]}")
+        return
+
+    picked = labels.index(answer_msg.content.upper().strip())
+    if picked == correct_idx:
+        await msg.edit(content=f"✅ **Correct!** {labels[correct_idx]} — {options[correct_idx]}\n\n❓ {q}\n\n{choices_text}")
+    else:
+        await msg.edit(content=f"❌ **Wrong!** You said **{labels[picked]}**, the answer was **{labels[correct_idx]}** — {options[correct_idx]}\n\n❓ {q}\n\n{choices_text}")
 
 
 # ---------- Random media pool ----------
