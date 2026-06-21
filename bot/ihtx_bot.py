@@ -521,17 +521,17 @@ PRESET_FILTERS: dict[str, dict] = {
             "[0:v]trim=0:{d}[v1];"
             "[0:v]negate,trim=0:{d}[v2];"
             "[v1][v2]concat=2:1:0,setpts=1/2*PTS,fps={fr},trim=0:{d}[outv2];"
-            "[0:a]rubberband=pitch=2:tempo=2,atrim=0:{d}[a1];"
-            "[0:a]rubberband=pitch=2:tempo=2,atrim=0:{d}[a2];"
+            "[0:a]rubberband=pitch=2:tempo=2:engine=finer,atrim=0:{d}[a1];"
+            "[0:a]rubberband=pitch=2:tempo=2:engine=finer,atrim=0:{d}[a2];"
             "[a1][a2]concat=2:0:1,atrim=0:{d}[outa2];"
             "[0:v]null,trim=0:{d}[v3];"
             "[0:v]negate,trim=0:{d}[v4];"
             "[v3][v4]concat=2:1:0,setpts=1/1.333*PTS,fps={fr},trim=0:{d}[outv3];"
-            "[0:a]rubberband=pitch=1.333:tempo=1.333,atrim=0:{d}[a3];"
-            "[0:a]rubberband=pitch=1.333:tempo=1.333,atrim=0:{d}[a4];"
+            "[0:a]rubberband=pitch=1.333:tempo=1.333:engine=finer,atrim=0:{d}[a3];"
+            "[0:a]rubberband=pitch=1.333:tempo=1.333:engine=finer,atrim=0:{d}[a4];"
             "[a3][a4]concat=2:0:1,atrim=0:{d}[outa3];"
             "[0:v]setpts=1/0.5*PTS,fps={fr},trim=0:{d}[outv4];"
-            "[0:a]rubberband=pitch=0.5:tempo=0.5,atrim=0:{d}[outa4];"
+            "[0:a]rubberband=pitch=0.5:tempo=0.5:engine=finer,atrim=0:{d}[outa4];"
             "[outv1][outv2]hstack[tmp1];"
             "[outv3][outv4]hstack[tmp2];"
             "[tmp1][tmp2]vstack,scale=iw/2:ih/2[outv];"
@@ -1828,7 +1828,7 @@ def _run_multipitch_rb3(
                 v_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
                 pitch_flag = f"-p{st:+.4f}" if st != 0 else "-p+0.0"
                 rb_res = subprocess.run(
-                    [rb_bin, pitch_flag, "-t1", base_wav, v_wav],
+                    [rb_bin, "--engine=finer", pitch_flag, "-t1", base_wav, v_wav],
                     capture_output=True, text=True, timeout=300,
                 )
                 if rb_res.returncode != 0:
@@ -2124,7 +2124,7 @@ def _run_preview1280(
         return (
             f"rubberband=pitch={pitch_ratio:.6f}:"
             f"window=short:transients={transients}:"
-            f"detector=soft:channels=together:pitchq=consistency"
+            f"detector=soft:channels=together:pitchq=consistency:engine=finer"
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
