@@ -540,6 +540,7 @@ PRESET_FILTERS: dict[str, dict] = {
         "maps": ["[outv]", "[outa]"],
         "audio_codec": "flac",
         "extra_codec_args": ["-preset", "ultrafast"],
+        "output_ext": ".mp4",
     },
 }
 
@@ -723,6 +724,7 @@ def run_ffmpeg(input_path: str, output_path: str, preset: str, is_video: bool) -
             "-filter_complex", fc,
             *map_flags,
             "-c:v", "libx264", *extra_codec_args,
+            "-strict", "experimental",
             "-c:a", audio_codec,
             "-t", str(d),
             output_path,
@@ -900,6 +902,7 @@ PIPE_EFFECT_NAMES = {
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio", "speed", "ffmpeg", "frei0r",
     "wave",
+    "sierpinskiransomware",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1473,6 +1476,14 @@ def _apply_pipe_effects(
                 ok, err = _run_ffmpeg_raw(cmd, timeout=180)
                 if not ok:
                     return False, f"Filter '{name}' failed: {err}"
+                current = out
+                continue
+
+            # sierpinskiransomware — 2×2 Sierpinski-style grid via preset
+            if name == "sierpinskiransomware":
+                ok, err = run_ffmpeg(current, out, "sierpinskiransomware", True)
+                if not ok:
+                    return False, f"sierpinskiransomware failed: {err}"
                 current = out
                 continue
 
@@ -2426,17 +2437,22 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
 
     is_video = suffix in VIDEO_EXTENSIONS
     out_ext = get_output_ext(suffix, is_video)
+    if is_preset:
+        _preset_out_ext = PRESET_FILTERS.get(preset, {}).get("output_ext")
+        if _preset_out_ext:
+            out_ext = _preset_out_ext
 
     # Build status label
     if is_preset:
         _status_label = f"`{preset}`"
+        status_msg = await ctx.reply(f"⏳ Processing {_status_label}…")
     else:
         _tmp_effects_label = _pipe_effects_label(custom_args[4])
         _tmp_reps = custom_args[0]
         _reps_str = f"×{_tmp_reps}" if abs(_tmp_reps) > 1 else ""
-        _status_label = f"`{_tmp_effects_label}`{_reps_str}"
-
-    status_msg = await ctx.reply(f"⏳ Processing {_status_label}…")
+        status_msg = await ctx.reply(
+            f"⏳ Processing your IHTX using pipe effects: `{_tmp_effects_label}`{_reps_str}"
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, f"input{suffix}")
@@ -2470,6 +2486,8 @@ async def ihtx_command(ctx: commands.Context, *, args: str = "chaos", attachment
         if not ok:
             await status_msg.edit(content=f"❌ FFmpeg failed:\n```\n{err[-1500:]}\n```")
             return
+
+        await status_msg.edit(content="⌛ Done!")
 
         out_size = os.path.getsize(output_path)
         if out_size > MAX_FILE_SIZE:
@@ -4019,9 +4037,12 @@ _UPDATELOG: list[dict] = [
         "version": "v2.6",
         "date": "2026-06-21",
         "heavy": [
-            "**t!ihtx sierpinskiransomware** — New preset: 2×2 Sierpinski-style video grid (normal / 2× / 1.333× / 0.5× speed+pitch) using FFmpeg rubberband pitch-shifting; outputs FLAC audio",
+            "**t!ihtx sierpinskiransomware** — New preset + pipe effect: 2×2 Sierpinski-style video grid (normal / 2× / 1.333× / 0.5× speed+pitch) using FFmpeg rubberband; outputs FLAC/MP4",
+            "**t!ihtx** — Fixed FLAC-in-MOV container error for sierpinskiransomware preset (now outputs MP4)",
+            "**t!ihtx** — sierpinskiransomware now available as a pipe effect in custom IHTX chains",
         ],
         "fun": [
+            "**t!ihtx** (custom) — New processing status: '⏳ Processing your IHTX using pipe effects: `effects`×N', then '⌛ Done!' when finished",
             "**t!chat / t!ask** — Removed 'slightly rude' from personality description",
             "**ffmpeg-full** installed — rubberband filter now available for pitch/tempo effects",
         ],
