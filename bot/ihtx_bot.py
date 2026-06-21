@@ -976,6 +976,59 @@ def _run_tvsim(
     return _run_ffmpeg_raw(cmd, timeout=300)
 
 
+# ---------- Folk Valley ----------
+
+_FOLKVALLEY_MUSIC_URL = "https://files.catbox.moe/4d3mdi.mp3"
+_FOLKVALLEY_OVERLAY_URL = "https://files.catbox.moe/53c100.png"
+
+
+def _run_folkvalley(input_path: str, output_path: str) -> tuple[bool, str]:
+    """Apply the folkvalley aesthetic effect:
+    - Replace audio with the folkvalley music track (catbox mp3)
+    - Brightness boost via HSV value shift (hueshifthsv H=0 S=0 V+100 ≈ eq brightness +0.39)
+    - Overlay a decorative image (catbox PNG) scaled to fit the frame
+    """
+    import urllib.request
+    import ssl
+
+    _ua = {"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot/1.0)"}
+    ssl_ctx = ssl.create_default_context()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        music_path = os.path.join(tmpdir, "music.mp3")
+        overlay_path = os.path.join(tmpdir, "overlay.png")
+
+        for url, dest in [(_FOLKVALLEY_MUSIC_URL, music_path), (_FOLKVALLEY_OVERLAY_URL, overlay_path)]:
+            try:
+                req = urllib.request.Request(url, headers=_ua)
+                with urllib.request.urlopen(req, context=ssl_ctx, timeout=60) as resp:
+                    with open(dest, "wb") as fh:
+                        fh.write(resp.read())
+            except Exception as exc:
+                return False, f"folkvalley: failed to download {url}: {exc}"
+
+        filter_complex = (
+            "[0:v]eq=brightness=0.39[vbright];"
+            "[2:v][vbright]scale2ref=w=iw:h=ih:force_original_aspect_ratio=decrease[pscale][vref];"
+            "[vref][pscale]overlay=(W-w)/2:(H-h)/2[vout]"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error", "-hide_banner",
+            "-i", input_path,
+            "-stream_loop", "-1", "-i", music_path,
+            "-i", overlay_path,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "1:a",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        return _run_ffmpeg_raw(cmd, timeout=300)
+
+
 # ---------- Swirl ----------
 
 def _run_swirl(
@@ -1782,6 +1835,14 @@ def _apply_pipe_effects(
                 ok, err = run_ffmpeg(current, out, "sierpinskiransomware", True)
                 if not ok:
                     return False, f"sierpinskiransomware failed: {err}"
+                current = out
+                continue
+
+            # folkvalley — music replacement + brightness boost + decorative overlay
+            if name in ("folkvalley", "fv"):
+                ok, err = _run_folkvalley(current, out)
+                if not ok:
+                    return False, f"folkvalley failed: {err}"
                 current = out
                 continue
 
@@ -4239,6 +4300,94 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+@bot.command(name="folkvalley", aliases=["fv", "folk"])
+async def folkvalley_command(ctx: commands.Context):
+    """Apply the folkvalley aesthetic effect to an attached video.
+
+    Replaces the audio with the folkvalley music track, boosts brightness
+    (HSV value shift), and overlays a decorative image scaled to fit the frame.
+
+    Usage:
+      t!folkvalley
+      t!fv
+
+    No parameters — the effect is fixed.
+    """
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "**t!folkvalley** — dreamy aesthetic effect\n"
+            "Attaches folkvalley music, boosts brightness, and adds a decorative overlay.\n\n"
+            "**Usage:** `t!folkvalley` (attach a video)\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 folkvalley`\n"
+            "Aliases: `t!fv` `t!folk`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply("❌ File too large (max 25 MB).")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"❌ `t!folkvalley` requires a video file. Got `{suffix}`.")
+        return
+
+    status_msg = await ctx.reply("⏳ Applying folkvalley effect…")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "folkvalley.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(None, _run_folkvalley, input_path, output_path)
+
+        if not ok:
+            await status_msg.edit(content=f"❌ folkvalley failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="⬆️ Output too large for Discord — uploading to Catbox…")
+            cb_url = await _upload_to_catbox(output_path)
+            if cb_url:
+                await ctx.reply(f"✅ **folkvalley** done! [Download]({cb_url})\n{cb_url}")
+                await status_msg.delete()
+            else:
+                await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed.")
+            return
+
+        out_filename = f"folkvalley_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed = discord.Embed(
+                title="IHTX Bot — t!folkvalley",
+                description="Music replacement · brightness boost (HSV V+100) · decorative overlay",
+                color=0x7c9e6e,
+            )
+            embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
+            embed.add_field(name="File Size", value=f"{out_size / (1024 * 1024):.2f} MB", inline=True)
+            await ctx.reply(embed=embed, file=discord.File(output_path, filename=out_filename))
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
@@ -4291,6 +4440,7 @@ _HELP_ENTRIES: list[dict] = [
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
             "**Swirl:** `swirl=strength[;radius;xc;yc;fallout;is1to1]`\n"
+            "**Aesthetics:** `folkvalley` / `fv` — music replacement + brightness + overlay\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
     },
@@ -4381,6 +4531,19 @@ _HELP_ENTRIES: list[dict] = [
             "`t!swirl -90 0.3 0.25 0.75 linear` — reverse swirl, off-center, linear falloff\n"
             "**As pipe effect:** `t!ihtx 1 5 - mp4 swirl=180`\n"
             "Full pipe syntax: `swirl=strength;radius;xc;yc;fallout;is1to1`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "t!folkvalley  (aliases: fv, folk)",
+        "value": (
+            "Apply the **folkvalley** aesthetic to a video:\n"
+            "• Replaces the audio with the folkvalley music track\n"
+            "• Boosts brightness (HSV value shift: H=0 S=0 V+100)\n"
+            "• Overlays a decorative image scaled to fit the frame\n\n"
+            "**Usage:** `t!folkvalley` (attach a video) — no parameters needed\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 folkvalley`\n"
+            "Pipe alias: `fv`  ·  Command aliases: `t!fv` `t!folk`"
         ),
     },
     {
@@ -4669,6 +4832,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.4",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!folkvalley** — New aesthetic effect command (aliases: `t!fv`, `t!folk`). Replaces video audio with the folkvalley music track, applies a brightness boost (HSV value shift V+100 via FFmpeg `eq`), and overlays a decorative PNG scaled to fit the frame. No parameters needed.",
+            "**t!ihtx pipe** — Added `folkvalley` / `fv` pipe effect. Usage: `folkvalley` (no params).",
+            "**t!ihtxhelp** — Added folkvalley entry; pipe effects list updated with Aesthetics section.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v3.3",
         "date": "2026-06-21",
