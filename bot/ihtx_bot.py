@@ -5437,6 +5437,50 @@ async def rate(ctx: commands.Context, *, thing: str):
     await ctx.reply(f"**{thing}**: {bar} **{score}/10**")
 
 
+_SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "⭐", "💎", "7️⃣"]
+_SLOT_JACKPOT_CHANCE = 0.25  # 25% chance of 777
+
+
+@bot.command(name="slots", aliases=["slot"])
+async def slots(ctx: commands.Context):
+    """Spin the slot machine — land 777 (25% chance) to win 200 XP!"""
+    if random.random() < _SLOT_JACKPOT_CHANCE:
+        reels = ["7️⃣", "7️⃣", "7️⃣"]
+    else:
+        # Guarantee NOT all 7s
+        reels = [random.choice(_SLOT_SYMBOLS) for _ in range(3)]
+        while reels == ["7️⃣", "7️⃣", "7️⃣"]:
+            reels = [random.choice(_SLOT_SYMBOLS) for _ in range(3)]
+
+    display = " | ".join(reels)
+    jackpot = reels == ["7️⃣", "7️⃣", "7️⃣"]
+
+    if jackpot:
+        levelup_msgs = await _award_xp(ctx, 200)
+        _load_xp_data()
+        data = _get_user_xp(ctx.author.id)
+        level = data["level"]
+        if level >= _MAX_LEVEL:
+            progress_line = f"Level MAX 🏆 — {data['xp']} total XP"
+        else:
+            cur, thresh, _ = _level_progress(data)
+            progress_line = f"Level {level} — {cur}/{thresh} XP"
+
+        await ctx.reply(
+            f"🎰 [ {display} ]\n\n"
+            f"🎊 **JACKPOT! 777!** You win **+200 XP!**\n"
+            f"{progress_line}"
+        )
+        for lm in levelup_msgs:
+            await ctx.send(lm)
+    else:
+        all_same = len(set(reels)) == 1
+        if all_same:
+            await ctx.reply(f"🎰 [ {display} ]\n\n✨ Three of a kind! No XP though — only 777 wins.")
+        else:
+            await ctx.reply(f"🎰 [ {display} ]\n\nNo luck this time. Try again!")
+
+
 # ---------- Fun games ----------
 
 _HANGMAN_WORDS = [
