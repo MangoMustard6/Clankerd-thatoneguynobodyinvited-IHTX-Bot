@@ -464,6 +464,9 @@ bot = commands.Bot(command_prefix="t!", intents=intents)
 _response_map: dict[int, list[int]] = {}
 _RESPONSE_MAP_MAX = 2000  # cap to prevent unbounded growth
 
+# Stores the last t!ihtx export per user for t!lexg re-use.
+_last_exports: dict[int, dict] = {}
+
 # Runtime stats
 _bot_start_time: float = time.time()
 _renders_completed: int = 0
@@ -4105,6 +4108,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v2.9",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!ihtx** — Fixed crash after processing: _last_exports was used but never declared, causing a silent NameError immediately after FFmpeg finished, leaving the status stuck at '⌛ Done!' with no video delivered",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v2.8",
         "date": "2026-06-21",
