@@ -3863,6 +3863,136 @@ async def syncaudio_command(ctx: commands.Context, mode: str = ""):
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
+@bot.command(name="tvsim", aliases=["tv", "tvsimulator"])
+async def tvsim_command(ctx: commands.Context, *, args: str = ""):
+    """Apply a TV/CRT simulator effect to an attached video.
+
+    Usage:
+      t!tvsim <line_sync> [detail_zoom] [vertical_sync] [phosphorescence] [interlacing] [scan_phasing]
+
+    Parameters (all separated by spaces or pipes):
+      line_sync       — 0-1, displacement strength (0=max CRT warp, 1=no warp). Required.
+      detail_zoom     — crop zoom on displacement map (default 1)
+      vertical_sync   — vertical scroll speed (default 1 = none)
+      phosphorescence — CRT phosphor color tint (default 0 = off)
+      interlacing     — scanline darkening (default 0 = off)
+      scan_phasing    — scanline ripple/phase shift (default 0 = off)
+
+    Examples:
+      t!tvsim 0.5
+      t!tvsim 0.3 1 1 0.4 0.5 0
+    """
+    # Parse params
+    tokens = re.split(r"[|\s]+", args.strip()) if args.strip() else []
+
+    def _tp(idx, default):
+        try:
+            return float(tokens[idx]) if idx < len(tokens) else default
+        except (ValueError, TypeError):
+            return default
+
+    if not tokens:
+        await ctx.reply(
+            "**t!tvsim** — CRT/TV simulator effect\n"
+            "Attach a video and provide `line_sync` (0–1, required).\n\n"
+            "**Usage:** `t!tvsim <line_sync> [detail_zoom] [vertical_sync] [phosphorescence] [interlacing] [scan_phasing]`\n"
+            "**Example:** `t!tvsim 0.5`\n"
+            "**Full example:** `t!tvsim 0.3 1 1 0.4 0.5 0`\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 tvsim=0.5`\n"
+            "Aliases: `t!tv` `t!tvsimulator`"
+        )
+        return
+
+    line_sync = _tp(0, 0.5)
+    if not (0.0 <= line_sync <= 1.0):
+        await ctx.reply("❌ `line_sync` must be between 0 and 1.")
+        return
+
+    detail_zoom     = _tp(1, 1.0)
+    vertical_sync   = _tp(2, 1.0)
+    phosphorescence = _tp(3, 0.0)
+    interlacing     = _tp(4, 0.0)
+    scan_phasing    = _tp(5, 0.0)
+
+    # Resolve attachment
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "❌ Attach a video to use `t!tvsim`.\n"
+            "**Usage:** `t!tvsim <line_sync> [detail_zoom] [vertical_sync] [phosphorescence] [interlacing] [scan_phasing]`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"❌ File too large (max 25 MB).")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"❌ `t!tvsim` requires a video file. Got `{suffix}`.")
+        return
+
+    param_str = f"line_sync={line_sync}"
+    status_msg = await ctx.reply(f"⏳ Applying TV simulator ({param_str})…")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path  = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "tvsim.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_tvsim,
+            input_path, output_path,
+            line_sync, detail_zoom, vertical_sync,
+            phosphorescence, interlacing, scan_phasing,
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ TV simulator failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="⬆️ Output too large for Discord — uploading to Catbox…")
+            cb_url = await _upload_to_catbox(output_path)
+            if cb_url:
+                await ctx.reply(f"✅ **TV Simulator** done! [Download]({cb_url})\n{cb_url}")
+                await status_msg.delete()
+            else:
+                await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed.")
+            return
+
+        out_filename = f"tvsim_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed = discord.Embed(
+                title="IHTX Bot — t!tvsim",
+                description=f"line_sync={line_sync} · detail_zoom={detail_zoom} · vert_sync={vertical_sync} · phosphor={phosphorescence} · interlace={interlacing} · scan={scan_phasing}",
+                color=11578404,
+            )
+            embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
+            embed.add_field(name="File Size", value=f"{out_size/(1024*1024):.2f} MB", inline=True)
+            await ctx.reply(embed=embed, file=discord.File(output_path, filename=out_filename))
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
@@ -3913,6 +4043,7 @@ _HELP_ENTRIES: list[dict] = [
             "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`\n"
+            "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
     },
@@ -3984,6 +4115,25 @@ _HELP_ENTRIES: list[dict] = [
             "• **`areverse`** — reverses audio only (video unaffected)\n"
             "Chain both to fully reverse: `t!ihtx 1 5 - mp4 vreverse,areverse`\n"
             "Note: `vreverse` loads all frames into memory — keep clips short."
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "t!tvsim <line_sync> [...]  (aliases: tv, tvsimulator)",
+        "value": (
+            "Apply a CRT/TV simulator effect using an FFmpeg displacement map.\n"
+            "**Parameters** (space- or pipe-separated):\n"
+            "• `line_sync` — 0–1, displacement strength. 0 = max CRT warp, 1 = no displacement. **Required.**\n"
+            "• `detail_zoom` — zoom/crop on the displacement map (default 1)\n"
+            "• `vertical_sync` — vertical scroll speed (default 1 = off)\n"
+            "• `phosphorescence` — CRT phosphor color tint 0–1 (default 0 = off)\n"
+            "• `interlacing` — scanline darkening 0–1 (default 0 = off)\n"
+            "• `scan_phasing` — animated scanline ripple 0–1 (default 0 = off)\n\n"
+            "**Examples:**\n"
+            "`t!tvsim 0.5` — moderate CRT warp\n"
+            "`t!tvsim 0.3 1 1 0.4 0.5 0` — warp + phosphor + interlace\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 tvsim=0.5`\n"
+            "Full pipe syntax: `tvsim=line_sync;detail_zoom;vert_sync;phosphor;interlace;scan_phase`"
         ),
     },
     {
@@ -4253,6 +4403,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.0",
+        "date": "2026-06-21",
+        "heavy": [
+            "**t!tvsim** — New CRT/TV simulator command applying FFmpeg displacement-map distortion. Params: `line_sync` (0–1, warp strength), `detail_zoom`, `vertical_sync`, `phosphorescence`, `interlacing`, `scan_phasing`. Aliases: `t!tv` `t!tvsimulator`",
+            "**t!ihtx pipe** — Added `tvsim` / `tv` pipe effect. Usage: `tvsim=line_sync;detail_zoom;vert_sync;phosphor;interlace;scan_phase`",
+            "**t!ihtxhelp** — Added tvsim entry under heavy effects; pipe effects list updated with CRT section",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v2.9",
         "date": "2026-06-21",
