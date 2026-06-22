@@ -3084,6 +3084,14 @@ async def on_ready():
             print("Tag system loaded.")
         except Exception as _tags_exc:
             print(f"Warning: tag system failed to load — {_tags_exc}")
+    # Load economy/RPG/fun cog (once)
+    if "Economy" not in bot.cogs:
+        try:
+            from bot.economy_cog import setup as _economy_setup
+            await _economy_setup(bot)
+            print("EconomyCog loaded.")
+        except Exception as _econ_exc:
+            print(f"Warning: EconomyCog failed to load — {_econ_exc}")
 
 
 @bot.command(name="ihtx", aliases=["effect", "destroy"])
@@ -5348,6 +5356,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.7",
+        "date": "2026-06-22",
+        "heavy": [
+            "**t!ihtxgen / /ihtxgen** — New hybrid command (text prefix + slash). Runs the full IHTX FFmpeg preset pipeline with a live updating embed showing download → processing → result stages. Accepts slash attachment, `url:` param, or message attachment/reply. Autocomplete lists all available presets. Outputs file directly or uploads to Catbox if >25 MB.",
+        ],
+        "fun": [
+            "**t!slot / /slot** — Slot machine command. Spin 🍒🍊🍋🍇⭐🔔7️⃣ symbols. Hit 777 to win +200 XP. Strict 1-hour cooldown per user via `@commands.cooldown`. Custom `slot.error` handler sends an ephemeral embed showing exact remaining cooldown time (Xm Ys) instead of crashing.",
+            "**t!profile / /profile [user]** — Profile card embed showing wallet, bank, XP, level, inventory count, and bio. Interactive buttons: 'Edit Bio' (opens a Discord Modal for in-place bio editing, owner-only) and 'View Inventory' (toggles embed to show owned items list). Data persisted in `bot/economy_data.json`.",
+        ],
+        "owner": [],
+    },
     {
         "version": "v3.6",
         "date": "2026-06-22",
