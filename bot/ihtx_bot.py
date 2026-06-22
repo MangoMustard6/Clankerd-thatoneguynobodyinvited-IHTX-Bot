@@ -5354,6 +5354,8 @@ _UPDATELOG: list[dict] = [
         "heavy": [],
         "fun": [
             "**t!undo** — Delete the bot's most recent message in the current channel. Both the bot message and your `t!undo` invocation are removed silently. Tracked via `_last_bot_msg` dict updated by `on_message`.",
+            "**t!random Easter egg** — 1-in-50 chance per roll awards +500 XP. Announces 🥚 Easter egg found and includes any level-up messages.",
+            "**t!random pool** — Added 3 new entries: `laughingstock`, `they got sprunki!`, `ayo?`",
         ],
         "owner": [
             "**t!slots fix** — `ctx.reply()` now falls back to `ctx.send()` when invoked from a system message (was crashing with HTTP 400 `Cannot reply to a system message`).",
@@ -7421,6 +7423,13 @@ async def random_command(ctx: commands.Context, subcommand: str = "", *, args: s
     if sub == "":
         if not _random_pool:
             await ctx.reply("❌ The random pool is empty. An owner can add items with `t!random add <url>`.")
+            return
+        # Easter egg: 1-in-50 chance per roll → +500 XP
+        if random.randint(1, 50) == 7:
+            levelup_msgs = await _award_xp(ctx, 500)
+            lines = [f"🥚 **Easter egg!** {ctx.author.mention} found a hidden egg and got **+500 XP**!"]
+            lines.extend(levelup_msgs)
+            await ctx.reply("\n".join(lines))
             return
         chosen = random.choice(_random_pool)
         await ctx.reply(chosen)
