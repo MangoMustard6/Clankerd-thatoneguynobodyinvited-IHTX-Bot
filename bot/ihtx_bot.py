@@ -7424,15 +7424,24 @@ async def random_command(ctx: commands.Context, subcommand: str = "", *, args: s
         if not _random_pool:
             await ctx.reply("❌ The random pool is empty. An owner can add items with `t!random add <url>`.")
             return
-        # Easter egg: 1-in-50 chance per roll → +500 XP
-        if random.randint(1, 50) == 7:
+        # Easter egg: 40% chance per roll → +500 XP
+        if random.random() < 0.40:
             levelup_msgs = await _award_xp(ctx, 500)
             lines = [f"🥚 **Easter egg!** {ctx.author.mention} found a hidden egg and got **+500 XP**!"]
             lines.extend(levelup_msgs)
             await ctx.reply("\n".join(lines))
             return
         chosen = random.choice(_random_pool)
-        await ctx.reply(chosen)
+        # Parse t[title](url) → "title\nurl" so the video actually embeds
+        _tm = re.match(r'^t\[([^\]]*)\]\((https?://[^)]+)\)$', chosen.strip())
+        # Parse [text](url) → bare url
+        _lm = re.match(r'^\[([^\]]*)\]\((https?://[^)]+)\)$', chosen.strip())
+        if _tm:
+            await ctx.reply(f"**{_tm.group(1)}**\n{_tm.group(2)}")
+        elif _lm:
+            await ctx.reply(_lm.group(2))
+        else:
+            await ctx.reply(chosen)
         return
 
     # ── Owner-only subcommands ───────────────────────────────────────────────
