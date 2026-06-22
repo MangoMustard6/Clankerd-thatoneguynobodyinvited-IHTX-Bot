@@ -46,3 +46,4 @@ discord-py
 google-genai
 openai
 yt-dlp
+flask
