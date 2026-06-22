@@ -1168,6 +1168,193 @@ def _run_autotune(
         return True, f"autotune: {dominant_hz:.1f} Hz → {correction_st:+.2f} st correction"
 
 
+# ---------- Vocoder ----------
+
+_VOCODER_PROFILES: dict[str, dict] = {
+    "ilvocodex":     {"bandwidth": 256, "window_size": 1024, "mod_phases": 6,  "post_highpass": 200, "bass_g": -10, "alimiter": 0.2, "post_phases": 0},
+    "orangevocoder": {"bandwidth": 256, "window_size": 1024, "mod_phases": 0,  "post_highpass": 200, "bass_g": -10, "alimiter": 0.2, "post_phases": 0},
+    "4ormulator":    {"bandwidth": 128, "window_size": 256,  "mod_phases": 0,  "post_highpass": 100, "bass_g": -10, "alimiter": 0.2, "post_phases": 0},
+    "audacity":      {"bandwidth": 64,  "window_size": 512,  "mod_phases": 0,  "post_highpass": 200, "bass_g": -10, "alimiter": 0.5, "post_phases": 12},
+}
+
+
+def _run_vocoder(
+    input_path: str,
+    output_path: str,
+    carrier_url: str,
+    mode: str = "ilvocodex",
+    bandwidth: int | None = None,
+) -> tuple[bool, str]:
+    """FFT phase vocoder: shape carrier audio with voice (modulator) frequency envelope.
+
+    Pure Python/numpy port of the vocoder.ts pipeline — no Wine or exe required.
+    Modes: ilvocodex | orangevocoder | 4ormulator | audacity
+
+    Args:
+        carrier_url: URL to a carrier audio file (synth pad, drone, instrument…)
+        mode:        vocoder profile (default: ilvocodex)
+        bandwidth:   number of frequency bands; None = use profile default
+    """
+    try:
+        import numpy as np
+        import wave as _wave
+    except ImportError:
+        return False, "numpy not installed — run: pip install numpy"
+
+    m = mode.lower()
+    if m not in _VOCODER_PROFILES:
+        return False, f"Unknown vocoder mode '{mode}'. Valid: {', '.join(_VOCODER_PROFILES)}"
+
+    p = _VOCODER_PROFILES[m]
+    n_bands = bandwidth if (bandwidth and bandwidth > 0) else p["bandwidth"]
+    win_size = p["window_size"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # ── 1. Download carrier ─────────────────────────────────────────────
+        carrier_dl = os.path.join(tmpdir, "carrier_dl")
+        try:
+            import urllib.request, ssl as _ssl
+            _ctx = _ssl.create_default_context()
+            _req = urllib.request.Request(carrier_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(_req, context=_ctx, timeout=60) as _resp:
+                with open(carrier_dl, "wb") as _fh:
+                    _fh.write(_resp.read())
+        except Exception as exc:
+            return False, f"vocoder: failed to download carrier from {carrier_url}: {exc}"
+
+        carrier_wav = os.path.join(tmpdir, "carrier.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", carrier_dl, "-ac", "1", "-ar", "48000", "-f", "wav", carrier_wav,
+        ], timeout=60)
+        if not ok:
+            return False, f"vocoder: carrier conversion failed: {err}"
+
+        # ── 2. Get video duration ──────────────────────────────────────────
+        dur_res = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+            capture_output=True, text=True,
+        )
+        try:
+            duration = float(dur_res.stdout.strip())
+        except Exception:
+            duration = 30.0
+
+        # ── 3. Extract modulator (voice from video) ───────────────────────
+        mod_wav = os.path.join(tmpdir, "mod.wav")
+        mod_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                   "-i", input_path, "-ac", "1", "-ar", "48000", "-vn"]
+        if p["mod_phases"] > 0:
+            mod_af = ",".join(["aphaseshift=order=16:shift=1"] * p["mod_phases"])
+            mod_cmd += ["-af", mod_af]
+        mod_cmd += ["-f", "wav", mod_wav]
+        ok, err = _run_ffmpeg_raw(mod_cmd, timeout=60)
+        if not ok:
+            return False, f"vocoder: modulator extraction failed: {err}"
+
+        # ── 4. Loop carrier to match duration ─────────────────────────────
+        carr_wav = os.path.join(tmpdir, "carr.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-stream_loop", "-1", "-i", carrier_wav,
+            "-ac", "1", "-ar", "48000", "-t", str(duration), "-f", "wav", carr_wav,
+        ], timeout=60)
+        if not ok:
+            return False, f"vocoder: carrier loop failed: {err}"
+
+        # ── 5. Python FFT phase vocoder ────────────────────────────────────
+        def _read_mono(path: str):
+            with _wave.open(path, "rb") as wf:
+                sr = wf.getframerate()
+                sw = wf.getsampwidth()
+                nc = wf.getnchannels()
+                raw = wf.readframes(wf.getnframes())
+            if sw == 2:
+                s = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sw == 1:
+                s = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+            elif sw == 4:
+                s = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                s = np.zeros(wf.getnframes(), dtype=np.float32)
+            if nc > 1:
+                s = s.reshape(-1, nc).mean(axis=1)
+            return s, sr
+
+        mod_samples, sr = _read_mono(mod_wav)
+        car_samples, _  = _read_mono(carr_wav)
+
+        n = min(len(mod_samples), len(car_samples))
+        mod_samples = mod_samples[:n]
+        car_samples = car_samples[:n]
+
+        hop = win_size // 4
+        window = np.hanning(win_size).astype(np.float32)
+        output = np.zeros(n + win_size, dtype=np.float32)
+        n_fft = win_size // 2 + 1
+        bins_per_band = max(1, n_fft // n_bands)
+
+        for start in range(0, n - win_size, hop):
+            mod_frame = mod_samples[start: start + win_size] * window
+            car_frame = car_samples[start: start + win_size] * window
+            mod_fft = np.fft.rfft(mod_frame)
+            car_fft = np.fft.rfft(car_frame)
+            mod_mag = np.abs(mod_fft)
+            car_phase = np.angle(car_fft)
+            out_fft = np.zeros(n_fft, dtype=np.complex64)
+            for band in range(n_bands):
+                bs = band * bins_per_band
+                be = min(bs + bins_per_band, n_fft)
+                env = float(np.mean(mod_mag[bs:be]))
+                out_fft[bs:be] = env * np.exp(1j * car_phase[bs:be])
+            out_frame = np.fft.irfft(out_fft)[:win_size] * window
+            output[start: start + win_size] += out_frame
+
+        result = output[:n]
+        peak = float(np.max(np.abs(result)))
+        if peak > 0:
+            result = result / peak * 0.88
+
+        voc_wav = os.path.join(tmpdir, "vocoded.wav")
+        with _wave.open(voc_wav, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes((result * 32767).astype(np.int16).tobytes())
+
+        # ── 6. Post-filters (per profile) ─────────────────────────────────
+        post_af_parts = [
+            f"highpass=f={p['post_highpass']}",
+            f"bass=g={p['bass_g']}",
+            f"alimiter=limit={p['alimiter']}:latency=1",
+        ]
+        if p["post_phases"] > 0:
+            post_af_parts += ["aphaseshift=order=16:shift=1"] * p["post_phases"]
+        post_af = ",".join(post_af_parts)
+
+        # ── 7. Mux vocoded audio back with original video ─────────────────
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path, "-i", voc_wav,
+            "-af", post_af,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            output_path,
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+        if not ok:
+            # Audio-only fallback (no video stream)
+            cmd2 = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", voc_wav, "-af", post_af,
+                "-c:a", "aac", "-b:a", "192k", output_path,
+            ]
+            ok, err = _run_ffmpeg_raw(cmd2, timeout=180)
+
+        return ok, err if not ok else f"vocoder: {m} mode, {n_bands} bands, {duration:.1f}s"
+
+
 # ---------- Swirl ----------
 
 def _run_swirl(
@@ -1332,7 +1519,7 @@ PIPE_EFFECT_NAMES = {
     "swirl",
     "sierpinskiransomware",
     "folkvalley", "fv",
-    "autotune", "at",
+    "vocoder", "ilvocodex", "orangevocoder", "4ormulator", "audacity",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1987,21 +2174,40 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # autotune — pitch-correct audio to nearest scale note
-            if name in ("autotune", "at"):
-                def _atp(idx, default):
+            # vocoder — FFT phase vocoder (shape carrier with voice envelope)
+            if name in ("vocoder", "ilvocodex", "orangevocoder", "4ormulator", "audacity"):
+                # If the effect name IS a mode, use it as the default mode
+                _default_mode = name if name != "vocoder" else "ilvocodex"
+                def _vp(idx, default):
                     try:
                         return params[idx] if idx < len(params) else default
                     except (IndexError, TypeError):
                         return default
-                _at_key = _atp(0, "chromatic")
-                try:
-                    _at_strength = float(_atp(1, 1.0))
-                except (ValueError, TypeError):
-                    _at_strength = 1.0
-                ok, err = _run_autotune(current, out, key=_at_key, strength=_at_strength)
+                # Syntax variants:
+                #   vocoder=mode;bw;carrier_url
+                #   vocoder=mode;carrier_url
+                #   vocoder=carrier_url
+                #   ilvocodex=carrier_url
+                _p0 = _vp(0, "")
+                _p1 = _vp(1, "")
+                _p2 = _vp(2, "")
+                if _p0.lower() in _VOCODER_PROFILES:
+                    _vc_mode = _p0.lower()
+                    try:
+                        _vc_bw = int(_p1)
+                        _vc_url = _p2
+                    except (ValueError, TypeError):
+                        _vc_bw = None
+                        _vc_url = _p1
+                else:
+                    _vc_mode = _default_mode
+                    _vc_url = _p0
+                    _vc_bw = None
+                if not _vc_url:
+                    return False, "vocoder pipe effect requires a carrier URL: `vocoder=mode;https://…`"
+                ok, err = _run_vocoder(current, out, carrier_url=_vc_url, mode=_vc_mode, bandwidth=_vc_bw)
                 if not ok:
-                    return False, f"autotune failed: {err}"
+                    return False, f"vocoder failed: {err}"
                 current = out
                 continue
 
@@ -4547,35 +4753,58 @@ async def folkvalley_command(ctx: commands.Context):
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
-@bot.command(name="autotune", aliases=["at"])
-async def autotune_command(ctx: commands.Context, *, args: str = ""):
-    """Pitch-correct audio/video to the nearest notes in a musical key.
-
-    Uses HPS FFT pitch detection + FFmpeg rubberband with formant preservation.
+@bot.command(name="vocoder", aliases=["vocode"])
+async def vocoder_command(ctx: commands.Context, *, args: str = ""):
+    """FFT phase vocoder — shape a carrier sound with your video's voice envelope.
 
     Usage:
-      t!autotune                      — chromatic, full strength
-      t!autotune major                — snap to major scale
-      t!autotune minor 0.7            — minor scale, 70% correction
-      t!autotune pentatonic           — pentatonic scale
-      t!at                            — alias
+      t!vocoder <carrier_url>                        — ilvocodex mode (default)
+      t!vocoder <mode> <carrier_url>                 — specify mode
+      t!vocoder <mode> <bandwidth> <carrier_url>     — mode + custom band count
 
-    Keys: chromatic (default), major, minor, pentatonic
-    Strength: 0.0–1.0 (default 1.0)
+    Modes: ilvocodex | orangevocoder | 4ormulator | audacity
+    carrier_url: direct link to any audio file (mp3, wav, ogg…)
+
+    Pipe effects: vocoder=mode;url  |  ilvocodex=url  |  4ormulator=url
     """
     parts = args.strip().split() if args.strip() else []
-    key = parts[0] if len(parts) >= 1 else "chromatic"
-    try:
-        strength = float(parts[1]) if len(parts) >= 2 else 1.0
-        strength = max(0.0, min(1.0, strength))
-    except (ValueError, IndexError):
-        strength = 1.0
 
-    VALID_KEYS = {"chromatic", "major", "minor", "pentatonic"}
-    if key.lower() not in VALID_KEYS:
-        await ctx.reply(
-            f"❌ Unknown key `{key}`. Valid keys: `chromatic`, `major`, `minor`, `pentatonic`"
-        )
+    if not parts:
+        lines = [
+            "**t!vocoder** — FFT phase vocoder",
+            "Shape a carrier sound (synth, pad, instrument) with the frequency envelope of your video's audio.",
+            "",
+            "**Usage:**",
+            "`t!vocoder <carrier_url>` — ilvocodex mode",
+            "`t!vocoder <mode> <carrier_url>` — specify mode",
+            "`t!vocoder <mode> <bandwidth> <carrier_url>` — mode + band count",
+            "",
+            f"**Modes:** `{'` · `'.join(_VOCODER_PROFILES)}`",
+            "**Alias:** `t!vocode`",
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 vocoder=ilvocodex;https://url`",
+            "Mode shortcuts: `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`",
+        ]
+        await ctx.reply("\n".join(lines))
+        return
+
+    # Parse: [mode] [bandwidth] <url>
+    mode = "ilvocodex"
+    bandwidth: int | None = None
+    carrier_url = ""
+
+    if parts[0].lower() in _VOCODER_PROFILES:
+        mode = parts[0].lower()
+        parts = parts[1:]
+    if parts:
+        try:
+            bandwidth = int(parts[0])
+            parts = parts[1:]
+        except ValueError:
+            pass
+    carrier_url = parts[0] if parts else ""
+
+    if not carrier_url:
+        await ctx.reply("❌ Provide a carrier audio URL. Example: `t!vocoder ilvocodex https://example.com/pad.mp3`")
         return
 
     attachment = None
@@ -4590,30 +4819,17 @@ async def autotune_command(ctx: commands.Context, *, args: str = ""):
             pass
 
     if not attachment:
-        await ctx.reply(
-            "**t!autotune** — pitch-correct audio/video to the nearest musical note\n\n"
-            "Attach a video or audio file and optionally specify a scale and strength.\n\n"
-            "**Usage:**\n"
-            "`t!autotune` — chromatic scale, full correction\n"
-            "`t!autotune major` — snap to major scale\n"
-            "`t!autotune minor 0.7` — minor scale, 70% correction\n"
-            "`t!autotune pentatonic` — pentatonic scale\n\n"
-            "**Keys:** `chromatic` `major` `minor` `pentatonic`\n"
-            "**Alias:** `t!at`\n"
-            "**As pipe effect:** `t!ihtx 1 5 - mp4 autotune=chromatic`"
-        )
+        await ctx.reply("❌ Attach a video (or reply to one) for the vocoder to process.")
         return
 
-    ext = Path(attachment.filename).suffix.lower().lstrip(".")
-    if ext not in SUPPORTED_EXTENSIONS and ext not in {"mp3", "wav", "flac", "ogg", "aac", "m4a", "opus"}:
-        await ctx.reply(f"❌ Unsupported file type `.{ext}`. Send a video or audio file.")
-        return
-
-    status_msg = await ctx.reply(f"🎵 Autotuning `{attachment.filename}` (key: {key}, strength: {strength:.1f})…")
+    bw_display = bandwidth if bandwidth else _VOCODER_PROFILES[mode]["bandwidth"]
+    status_msg = await ctx.reply(
+        f"🎙️ Vocoding `{attachment.filename}` — mode: `{mode}`, bands: `{bw_display}`…"
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, attachment.filename)
-        output_path = os.path.join(tmpdir, f"autotune_{Path(attachment.filename).stem}.mp4")
+        output_path = os.path.join(tmpdir, f"vocoder_{Path(attachment.filename).stem}.mp4")
 
         try:
             file_bytes = await attachment.read()
@@ -4625,39 +4841,33 @@ async def autotune_command(ctx: commands.Context, *, args: str = ""):
 
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(
-            None, _run_autotune, input_path, output_path, key, strength
+            None, _run_vocoder, input_path, output_path, carrier_url, mode, bandwidth
         )
 
         if not ok:
-            await status_msg.edit(content=f"❌ Autotune failed:\n```\n{err[-1200:]}\n```")
+            await status_msg.edit(content=f"❌ Vocoder failed:\n```\n{err[-1200:]}\n```")
             return
-
-        if not os.path.exists(output_path):
-            output_path_mp3 = os.path.join(tmpdir, f"autotune_{Path(attachment.filename).stem}.mp3")
-            if os.path.exists(output_path_mp3):
-                output_path = output_path_mp3
 
         out_size = os.path.getsize(output_path)
         if out_size > MAX_FILE_SIZE:
             await status_msg.edit(content="⬆️ Output too large for Discord — uploading to Catbox…")
             cb_url = await _upload_to_catbox(output_path)
             if cb_url:
-                await ctx.reply(f"✅ **autotune** done! [Download]({cb_url})\n{cb_url}")
+                await ctx.reply(f"✅ **vocoder** done! [Download]({cb_url})\n{cb_url}")
                 await status_msg.delete()
             else:
                 await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed.")
             return
 
-        out_filename = f"autotune_{Path(attachment.filename).stem}.mp4"
+        out_filename = f"vocoder_{Path(attachment.filename).stem}.mp4"
         try:
             embed = discord.Embed(
-                title="IHTX Bot — t!autotune",
-                description=f"Key: `{key}` · Strength: `{strength:.1f}` · HPS pitch detection + rubberband",
-                color=0x5865F2,
+                title="IHTX Bot — t!vocoder",
+                description=f"Mode: `{mode}` · Bands: `{bw_display}` · Python FFT phase vocoder",
+                color=0x9B59B6,
             )
             embed.add_field(name="File Size", value=f"{out_size / (1024 * 1024):.2f} MB", inline=True)
-            if err:
-                embed.add_field(name="Pitch Info", value=err[:200], inline=False)
+            embed.add_field(name="Carrier", value=carrier_url[:80], inline=False)
             await ctx.reply(embed=embed, file=discord.File(output_path, filename=out_filename))
             await status_msg.delete()
         except discord.HTTPException as e:
@@ -4713,7 +4923,7 @@ _HELP_ENTRIES: list[dict] = [
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
             "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
-            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `autotune[=key;strength]`\n"
+            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
             "**Swirl:** `swirl=strength[;radius;xc;yc;fallout;is1to1]`\n"
             "**Aesthetics:** `folkvalley` / `fv` — music replacement + brightness + overlay\n"
@@ -4824,18 +5034,18 @@ _HELP_ENTRIES: list[dict] = [
     },
     {
         "cat": "heavy",
-        "name": "t!autotune [key] [strength]  (alias: at)",
+        "name": "t!vocoder [mode] [bw] <carrier_url>  (alias: vocode)",
         "value": (
-            "Pitch-correct audio/video to the nearest notes in a musical scale.\n"
-            "Uses HPS FFT pitch detection + FFmpeg rubberband (formant-preserving).\n\n"
-            "**Keys:** `chromatic` (default) · `major` · `minor` · `pentatonic`\n"
-            "**Strength:** 0.0–1.0 correction amount (default `1.0` = full snap)\n\n"
+            "FFT phase vocoder — shapes a carrier sound using your video's voice envelope.\n"
+            "Pure Python/numpy port of vocoder.ts. No Wine/exe needed.\n\n"
+            "**Modes:** `ilvocodex` (default) · `orangevocoder` · `4ormulator` · `audacity`\n"
+            "**carrier_url:** direct link to any audio (mp3, wav, ogg…)\n\n"
             "**Examples:**\n"
-            "`t!autotune` — chromatic, full correction\n"
-            "`t!autotune major` — snap to major scale\n"
-            "`t!autotune minor 0.7` — minor scale, 70% strength\n"
-            "**As pipe effect:** `t!ihtx 1 5 - mp4 autotune=chromatic`\n"
-            "Pipe alias: `at`  ·  Params: `autotune=key;strength`"
+            "`t!vocoder https://url/pad.mp3` — ilvocodex mode\n"
+            "`t!vocoder orangevocoder https://url/synth.wav` — specify mode\n"
+            "`t!vocoder 4ormulator 64 https://url/drone.mp3` — mode + band count\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 vocoder=ilvocodex;https://url`\n"
+            "Mode shortcuts: `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`"
         ),
     },
     {
@@ -5138,9 +5348,9 @@ _UPDATELOG: list[dict] = [
         "version": "v3.5",
         "date": "2026-06-22",
         "heavy": [
-            "**t!autotune** — New audio pitch-correction command (alias: `t!at`). Uses HPS FFT pitch detection (numpy) + FFmpeg rubberband filter with formant preservation to snap audio to the nearest note in a chosen scale. Keys: `chromatic` (default), `major`, `minor`, `pentatonic`. Strength param 0.0–1.0. Works on video and audio files.",
-            "**t!ihtx pipe** — Added `autotune` / `at` pipe effect. Usage: `autotune` or `autotune=major` or `autotune=minor;0.7`. Also added `folkvalley`/`fv` to PIPE_EFFECT_NAMES for proper parser recognition.",
-            "**t!ihtxhelp** — Fixed 'interaction failed' bug: field values exceeding Discord's 1024-char limit are now truncated; callback wrapped in try/except to prevent silent failures. Added autotune help entry and updated pipe effects reference.",
+            "**t!vocoder** — New FFT phase vocoder command (alias: `t!vocode`). Pure Python/numpy port of vocoder.ts — no Wine/exe required. Four modes: `ilvocodex` (256 bands, 1024-win, 6 mod aphaseshift), `orangevocoder` (256/1024, clean), `4ormulator` (128/256, tight), `audacity` (64/512, 12 post aphaseshift). Takes a carrier audio URL and your attached video as the modulator. Per-mode post-filters: highpass + bass cut + alimiter + optional aphaseshift chain.",
+            "**t!ihtx pipe** — Added `vocoder`, `ilvocodex`, `orangevocoder`, `4ormulator`, `audacity` pipe effects. Syntax: `vocoder=mode;url`, `vocoder=mode;bw;url`, or mode name directly (`ilvocodex=url`). Removed `autotune`/`at` from pipes.",
+            "**t!ihtxhelp** — Replaced autotune help entry with vocoder entry. Updated Audio pipe effects reference line to list all 4 vocoder mode shortcuts.",
         ],
         "fun": [],
         "owner": [],
