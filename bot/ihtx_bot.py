@@ -464,6 +464,10 @@ bot = commands.Bot(command_prefix="t!", intents=intents)
 _response_map: dict[int, list[int]] = {}
 _RESPONSE_MAP_MAX = 2000  # cap to prevent unbounded growth
 
+# t!undo tracking: channel_id → last bot message id
+_last_bot_msg: dict[int, int] = {}
+_LAST_BOT_MSG_MAX = 500
+
 # Stores the last t!ihtx export per user for t!lexg re-use.
 _last_exports: dict[int, dict] = {}
 
@@ -5345,6 +5349,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v3.6",
+        "date": "2026-06-22",
+        "heavy": [],
+        "fun": [
+            "**t!undo** — Delete the bot's most recent message in the current channel. Both the bot message and your `t!undo` invocation are removed silently. Tracked via `_last_bot_msg` dict updated by `on_message`.",
+        ],
+        "owner": [
+            "**t!slots fix** — `ctx.reply()` now falls back to `ctx.send()` when invoked from a system message (was crashing with HTTP 400 `Cannot reply to a system message`).",
+        ],
+    },
+    {
         "version": "v3.5",
         "date": "2026-06-22",
         "heavy": [
@@ -6813,10 +6828,15 @@ async def slots(ctx: commands.Context):
             await ctx.send(lm)
     else:
         all_same = len(set(reels)) == 1
-        if all_same:
-            await ctx.reply(f"🎰 [ {display} ]\n\n✨ Three of a kind! No XP though — only 777 wins.")
-        else:
-            await ctx.reply(f"🎰 [ {display} ]\n\nNo luck this time. Try again!")
+        msg = (
+            f"🎰 [ {display} ]\n\n✨ Three of a kind! No XP though — only 777 wins."
+            if all_same
+            else f"🎰 [ {display} ]\n\nNo luck this time. Try again!"
+        )
+        try:
+            await ctx.reply(msg)
+        except discord.HTTPException:
+            await ctx.send(msg)
 
 
 # ---------- Fun games ----------
@@ -7500,6 +7520,13 @@ async def random_command(ctx: commands.Context, subcommand: str = "", *, args: s
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Track bot messages for t!undo (per channel)
+    if message.author == bot.user:
+        _last_bot_msg[message.channel.id] = message.id
+        if len(_last_bot_msg) > _LAST_BOT_MSG_MAX:
+            oldest = next(iter(_last_bot_msg))
+            del _last_bot_msg[oldest]
+
     # Track bot replies so on_message_edit can clean them up
     if message.author == bot.user and message.reference and message.reference.message_id:
         user_id = message.reference.message_id
@@ -7615,6 +7642,49 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
     # Re-process as a fresh command invocation
     await bot.process_commands(after)
+
+
+# ---------- t!undo ----------
+
+@bot.command(name="undo")
+async def undo_command(ctx: commands.Context):
+    """Delete the bot's most recent message in this channel.
+
+    Usage: t!undo
+    Also deletes your t!undo invocation message to keep the channel clean.
+    """
+    channel_id = ctx.channel.id
+    msg_id = _last_bot_msg.get(channel_id)
+
+    if not msg_id:
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+        return
+
+    # Remove from tracking so a second t!undo doesn't hit the same message
+    del _last_bot_msg[channel_id]
+
+    deleted = False
+    try:
+        target = await ctx.channel.fetch_message(msg_id)
+        await target.delete()
+        deleted = True
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+    # Always clean up the invoking t!undo message
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+    if not deleted:
+        try:
+            await ctx.send("⚠️ Could not find the last bot message to delete.", delete_after=5)
+        except discord.HTTPException:
+            pass
 
 
 # ---------- Catbox upload ----------
