@@ -3092,6 +3092,11 @@ async def on_ready():
             print("EconomyCog loaded.")
         except Exception as _econ_exc:
             print(f"Warning: EconomyCog failed to load — {_econ_exc}")
+    # Slash command sync is triggered manually via t!sync (owner only).
+    # Automatic on_ready sync is intentionally omitted: discord.py's event
+    # loop swallows exceptions from on_ready before our try/except can
+    # print them, making silent failures impossible to debug here.
+    print("Bot ready. Run t!syncslash to register slash (/) commands.")
 
 
 @bot.command(name="ihtx", aliases=["effect", "destroy"])
@@ -5357,13 +5362,22 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v3.8",
+        "date": "2026-06-22",
+        "heavy": [],
+        "fun": [],
+        "owner": [
+            "**t!syncslash** (aliases: synccmds, synctree, slashsync) — Owner command to register slash (/) commands with Discord. Works around Discord error 50240 (Entry Point command preservation) that causes `tree.sync()` to fail: fetches live global commands, strips read-only fields (application_id, version) from Entry Points, then calls bulk_upsert_global_commands with slash commands + preserved Entry Points merged. Reports registered commands in Discord. Global propagation up to 1 hour.",
+        ],
+    },
+    {
         "version": "v3.7",
         "date": "2026-06-22",
         "heavy": [
             "**t!ihtxgen / /ihtxgen** — New hybrid command (text prefix + slash). Runs the full IHTX FFmpeg preset pipeline with a live updating embed showing download → processing → result stages. Accepts slash attachment, `url:` param, or message attachment/reply. Autocomplete lists all available presets. Outputs file directly or uploads to Catbox if >25 MB.",
         ],
         "fun": [
-            "**t!slot / /slot** — Slot machine command. Spin 🍒🍊🍋🍇⭐🔔7️⃣ symbols. Hit 777 to win +200 XP. Strict 1-hour cooldown per user via `@commands.cooldown`. Custom `slot.error` handler sends an ephemeral embed showing exact remaining cooldown time (Xm Ys) instead of crashing.",
+            "**t!jackpot / /jackpot** — Slot machine command (renamed from t!slot to avoid conflict with t!slots). Spin 🍒🍊🍋🍇⭐🔔7️⃣ symbols. Hit 777 to win +200 XP. Strict 1-hour cooldown per user via `@commands.cooldown`. Custom error handler sends an ephemeral embed showing exact remaining cooldown time (Xm Ys).",
             "**t!profile / /profile [user]** — Profile card embed showing wallet, bank, XP, level, inventory count, and bio. Interactive buttons: 'Edit Bio' (opens a Discord Modal for in-place bio editing, owner-only) and 'View Inventory' (toggles embed to show owned items list). Data persisted in `bot/economy_data.json`.",
         ],
         "owner": [],
@@ -6645,6 +6659,59 @@ async def usage(ctx: commands.Context):
 
     embed.set_footer(text=f"Window: rolling 24h · Heavy commands: {', '.join(sorted(HEAVY_COMMANDS))}")
     await ctx.reply(embed=embed)
+
+
+@bot.command(name="syncslash", aliases=["synccmds", "synctree", "slashsync"])
+async def sync_slash_commands(ctx: commands.Context):
+    """[Owner] Register slash (/) commands with Discord.
+
+    discord.py's tree.sync() fails with error 50240 when the app has an
+    Entry Point command (type=4, used by Discord Activities).  This command
+    works around it by fetching live global commands, stripping the read-only
+    fields from any Entry Points, then calling bulk_upsert_global_commands
+    with our slash commands + the preserved Entry Points merged together.
+
+    Run this once after adding new slash commands so they appear in Discord.
+    Global commands may take up to 1 hour to propagate everywhere.
+    """
+    if ctx.author.id not in owner_ids:
+        await ctx.reply("❌ Only bot owners can sync slash commands.")
+        return
+
+    _SYNC_RO = {"application_id", "version"}
+    async with ctx.typing():
+        try:
+            _app_id = bot.application_id
+            _existing: list[dict] = await bot.http.get_global_commands(_app_id)
+
+            # Preserve Entry Point commands (type=4); strip read-only fields
+            _eps: list[dict] = [
+                {k: v for k, v in c.items() if k not in _SYNC_RO}
+                for c in _existing
+                if c.get("type") == 4
+            ]
+
+            # Our slash commands from the app_commands tree
+            _payload: list[dict] = [
+                cmd.to_dict() for cmd in bot.tree._global_commands.values()
+            ]
+            _payload.extend(_eps)
+
+            _result: list[dict] = await bot.http.bulk_upsert_global_commands(
+                _app_id, payload=_payload
+            )
+            _slash = [c for c in _result if c.get("type") != 4]
+            _ep_names = [c["name"] for c in _result if c.get("type") == 4]
+
+            lines = [f"✅ **{len(_slash)} slash command(s) registered globally:**"]
+            for c in _slash:
+                lines.append(f"  • `/{c['name']}` — {c.get('description', '')[:60]}")
+            if _ep_names:
+                lines.append(f"\n🔒 Entry Point preserved: `{', '.join(_ep_names)}`")
+            lines.append("\n⏳ Global commands may take up to 1 hour to appear in Discord.")
+            await ctx.reply("\n".join(lines))
+        except Exception as exc:
+            await ctx.reply(f"❌ Sync failed: `{exc}`")
 
 
 @bot.command(name="setlimit", aliases=["sl"])

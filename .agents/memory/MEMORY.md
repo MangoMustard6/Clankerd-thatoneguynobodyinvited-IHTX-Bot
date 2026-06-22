@@ -1,2 +1,3 @@
 - [Update log policy](updatelog-policy.md) — always add/update _UPDATELOG in bot/ihtx_bot.py when changing the bot; newest entry goes at top of list.
 - [Tag parser execution model](tag-parser-execution-model.md) — ordering of set/foreach/get across parse pipeline; why foreach must be a deep engine and how inner-block resolution works for math.
+- [Discord Entry Point sync workaround](discord-entry-point-sync.md) — tree.sync() breaks with error 50240 when app has Entry Point (type=4); use t!syncslash instead (bulk_upsert + preserved EPs).
