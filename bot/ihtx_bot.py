@@ -1029,6 +1029,145 @@ def _run_folkvalley(input_path: str, output_path: str) -> tuple[bool, str]:
         return _run_ffmpeg_raw(cmd, timeout=300)
 
 
+# ---------- Autotune ----------
+
+def _detect_dominant_pitch_hz(wav_path: str) -> float | None:
+    """Detect the dominant fundamental frequency of a WAV file using HPS + numpy FFT."""
+    try:
+        import numpy as np
+        import wave as _wave
+    except ImportError:
+        return None
+    try:
+        with _wave.open(wav_path, "rb") as wf:
+            sr = wf.getframerate()
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            raw = wf.readframes(wf.getnframes())
+        if sampwidth == 2:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampwidth == 1:
+            samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+        elif sampwidth == 4:
+            samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            return None
+        if nchannels > 1:
+            samples = samples.reshape(-1, nchannels).mean(axis=1)
+        # Analyse the middle half to skip silence at start/end
+        total = len(samples)
+        segment = samples[total // 4: total * 3 // 4] if total > 4096 else samples
+        frame_size = 4096
+        hop = frame_size // 2
+        freqs_detected: list[float] = []
+        for i in range(0, max(1, len(segment) - frame_size), hop):
+            frame = segment[i: i + frame_size]
+            if len(frame) < frame_size:
+                break
+            rms = float(np.sqrt(np.mean(frame ** 2)))
+            if rms < 0.008:
+                continue
+            windowed = frame * np.hanning(frame_size)
+            spectrum = np.abs(np.fft.rfft(windowed))
+            freq_bins = np.fft.rfftfreq(frame_size, 1.0 / sr)
+            # Harmonic Product Spectrum (down-sample × 2,3,4)
+            hps = spectrum.copy()
+            for h in range(2, 5):
+                dec = spectrum[::h]
+                hps[: len(dec)] *= dec
+            lo = int(np.searchsorted(freq_bins, 80))
+            hi = int(np.searchsorted(freq_bins, 1200))
+            if hi <= lo:
+                continue
+            peak_idx = int(np.argmax(hps[lo:hi])) + lo
+            if freq_bins[peak_idx] > 0:
+                freqs_detected.append(float(freq_bins[peak_idx]))
+        if not freqs_detected:
+            return None
+        return float(np.median(freqs_detected))
+    except Exception:
+        return None
+
+
+def _hz_to_semitone_correction(hz: float, scale: list[int]) -> float:
+    """Return semitones to shift so that hz lands on the nearest note in scale."""
+    import math
+    midi = 69.0 + 12.0 * math.log2(hz / 440.0)
+    note_in_octave = midi % 12.0
+    best_diff = 99.0
+    for n in scale:
+        d = (note_in_octave - n) % 12.0
+        if d > 6.0:
+            d -= 12.0
+        if abs(d) < abs(best_diff):
+            best_diff = d
+    return -best_diff  # positive = shift up
+
+
+def _run_autotune(
+    input_path: str,
+    output_path: str,
+    key: str = "chromatic",
+    strength: float = 1.0,
+) -> tuple[bool, str]:
+    """Pitch-correct audio to the nearest notes in a musical key.
+
+    Uses numpy FFT (HPS method) for dominant pitch detection and FFmpeg's
+    rubberband audio filter for pitch shifting with formant preservation.
+
+    Args:
+        key:      chromatic | major | minor | pentatonic  (default: chromatic)
+        strength: 0.0–1.0 correction amount (default: 1.0 = full snap)
+    """
+    SCALES: dict[str, list[int]] = {
+        "chromatic":   list(range(12)),
+        "major":       [0, 2, 4, 5, 7, 9, 11],
+        "minor":       [0, 2, 3, 5, 7, 8, 10],
+        "pentatonic":  [0, 2, 4, 7, 9],
+    }
+    scale = SCALES.get(key.lower(), SCALES["chromatic"])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wav_path = os.path.join(tmpdir, "audio.wav")
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path, "-vn", "-ac", "1", "-ar", "22050", "-f", "wav", wav_path,
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=60)
+        if not ok:
+            return False, f"autotune: audio extraction failed: {err}"
+
+        dominant_hz = _detect_dominant_pitch_hz(wav_path)
+        if dominant_hz is None or dominant_hz <= 0:
+            # No pitched content detected — pass through unchanged
+            return _run_ffmpeg_raw(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", input_path, "-c", "copy", output_path], timeout=60
+            )
+
+        correction_st = _hz_to_semitone_correction(dominant_hz, scale) * strength
+        if abs(correction_st) < 0.05:
+            return _run_ffmpeg_raw(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", input_path, "-c", "copy", output_path], timeout=60
+            )
+
+        import math
+        pitch_ratio = 2.0 ** (correction_st / 12.0)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-af", f"rubberband=pitch={pitch_ratio:.6f}:formant=1",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path,
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+        if not ok:
+            return False, f"autotune: rubberband failed: {err}"
+        return True, f"autotune: {dominant_hz:.1f} Hz → {correction_st:+.2f} st correction"
+
+
 # ---------- Swirl ----------
 
 def _run_swirl(
@@ -1192,6 +1331,8 @@ PIPE_EFFECT_NAMES = {
     "tvsim", "tv",
     "swirl",
     "sierpinskiransomware",
+    "folkvalley", "fv",
+    "autotune", "at",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1843,6 +1984,24 @@ def _apply_pipe_effects(
                 ok, err = _run_folkvalley(current, out)
                 if not ok:
                     return False, f"folkvalley failed: {err}"
+                current = out
+                continue
+
+            # autotune — pitch-correct audio to nearest scale note
+            if name in ("autotune", "at"):
+                def _atp(idx, default):
+                    try:
+                        return params[idx] if idx < len(params) else default
+                    except (IndexError, TypeError):
+                        return default
+                _at_key = _atp(0, "chromatic")
+                try:
+                    _at_strength = float(_atp(1, 1.0))
+                except (ValueError, TypeError):
+                    _at_strength = 1.0
+                ok, err = _run_autotune(current, out, key=_at_key, strength=_at_strength)
+                if not ok:
+                    return False, f"autotune failed: {err}"
                 current = out
                 continue
 
@@ -4388,6 +4547,123 @@ async def folkvalley_command(ctx: commands.Context):
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+@bot.command(name="autotune", aliases=["at"])
+async def autotune_command(ctx: commands.Context, *, args: str = ""):
+    """Pitch-correct audio/video to the nearest notes in a musical key.
+
+    Uses HPS FFT pitch detection + FFmpeg rubberband with formant preservation.
+
+    Usage:
+      t!autotune                      — chromatic, full strength
+      t!autotune major                — snap to major scale
+      t!autotune minor 0.7            — minor scale, 70% correction
+      t!autotune pentatonic           — pentatonic scale
+      t!at                            — alias
+
+    Keys: chromatic (default), major, minor, pentatonic
+    Strength: 0.0–1.0 (default 1.0)
+    """
+    parts = args.strip().split() if args.strip() else []
+    key = parts[0] if len(parts) >= 1 else "chromatic"
+    try:
+        strength = float(parts[1]) if len(parts) >= 2 else 1.0
+        strength = max(0.0, min(1.0, strength))
+    except (ValueError, IndexError):
+        strength = 1.0
+
+    VALID_KEYS = {"chromatic", "major", "minor", "pentatonic"}
+    if key.lower() not in VALID_KEYS:
+        await ctx.reply(
+            f"❌ Unknown key `{key}`. Valid keys: `chromatic`, `major`, `minor`, `pentatonic`"
+        )
+        return
+
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "**t!autotune** — pitch-correct audio/video to the nearest musical note\n\n"
+            "Attach a video or audio file and optionally specify a scale and strength.\n\n"
+            "**Usage:**\n"
+            "`t!autotune` — chromatic scale, full correction\n"
+            "`t!autotune major` — snap to major scale\n"
+            "`t!autotune minor 0.7` — minor scale, 70% correction\n"
+            "`t!autotune pentatonic` — pentatonic scale\n\n"
+            "**Keys:** `chromatic` `major` `minor` `pentatonic`\n"
+            "**Alias:** `t!at`\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 autotune=chromatic`"
+        )
+        return
+
+    ext = Path(attachment.filename).suffix.lower().lstrip(".")
+    if ext not in SUPPORTED_EXTENSIONS and ext not in {"mp3", "wav", "flac", "ogg", "aac", "m4a", "opus"}:
+        await ctx.reply(f"❌ Unsupported file type `.{ext}`. Send a video or audio file.")
+        return
+
+    status_msg = await ctx.reply(f"🎵 Autotuning `{attachment.filename}` (key: {key}, strength: {strength:.1f})…")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, attachment.filename)
+        output_path = os.path.join(tmpdir, f"autotune_{Path(attachment.filename).stem}.mp4")
+
+        try:
+            file_bytes = await attachment.read()
+            with open(input_path, "wb") as fh:
+                fh.write(file_bytes)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download attachment: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_autotune, input_path, output_path, key, strength
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ Autotune failed:\n```\n{err[-1200:]}\n```")
+            return
+
+        if not os.path.exists(output_path):
+            output_path_mp3 = os.path.join(tmpdir, f"autotune_{Path(attachment.filename).stem}.mp3")
+            if os.path.exists(output_path_mp3):
+                output_path = output_path_mp3
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="⬆️ Output too large for Discord — uploading to Catbox…")
+            cb_url = await _upload_to_catbox(output_path)
+            if cb_url:
+                await ctx.reply(f"✅ **autotune** done! [Download]({cb_url})\n{cb_url}")
+                await status_msg.delete()
+            else:
+                await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed.")
+            return
+
+        out_filename = f"autotune_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed = discord.Embed(
+                title="IHTX Bot — t!autotune",
+                description=f"Key: `{key}` · Strength: `{strength:.1f}` · HPS pitch detection + rubberband",
+                color=0x5865F2,
+            )
+            embed.add_field(name="File Size", value=f"{out_size / (1024 * 1024):.2f} MB", inline=True)
+            if err:
+                embed.add_field(name="Pitch Info", value=err[:200], inline=False)
+            await ctx.reply(embed=embed, file=discord.File(output_path, filename=out_filename))
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
 @bot.command(name="presets", aliases=["effects", "list"])
 async def presets_command(ctx: commands.Context):
     """List all available IHTX presets."""
@@ -4437,7 +4713,7 @@ _HELP_ENTRIES: list[dict] = [
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
             "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
-            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`\n"
+            "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `autotune[=key;strength]`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
             "**Swirl:** `swirl=strength[;radius;xc;yc;fallout;is1to1]`\n"
             "**Aesthetics:** `folkvalley` / `fv` — music replacement + brightness + overlay\n"
@@ -4544,6 +4820,22 @@ _HELP_ENTRIES: list[dict] = [
             "**Usage:** `t!folkvalley` (attach a video) — no parameters needed\n"
             "**As pipe effect:** `t!ihtx 1 5 - mp4 folkvalley`\n"
             "Pipe alias: `fv`  ·  Command aliases: `t!fv` `t!folk`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "t!autotune [key] [strength]  (alias: at)",
+        "value": (
+            "Pitch-correct audio/video to the nearest notes in a musical scale.\n"
+            "Uses HPS FFT pitch detection + FFmpeg rubberband (formant-preserving).\n\n"
+            "**Keys:** `chromatic` (default) · `major` · `minor` · `pentatonic`\n"
+            "**Strength:** 0.0–1.0 correction amount (default `1.0` = full snap)\n\n"
+            "**Examples:**\n"
+            "`t!autotune` — chromatic, full correction\n"
+            "`t!autotune major` — snap to major scale\n"
+            "`t!autotune minor 0.7` — minor scale, 70% strength\n"
+            "**As pipe effect:** `t!ihtx 1 5 - mp4 autotune=chromatic`\n"
+            "Pipe alias: `at`  ·  Params: `autotune=key;strength`"
         ),
     },
     {
@@ -4734,6 +5026,8 @@ def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> dis
     embed = discord.Embed(title=title, color=color)
     for entry in entries[:25]:
         copyable_value = f"`{entry['name']}`\n{entry['value']}"
+        if len(copyable_value) > 1024:
+            copyable_value = copyable_value[:1020] + "…"
         embed.add_field(name=entry["name"], value=copyable_value, inline=False)
 
     if cat == "heavy":
@@ -4783,12 +5077,20 @@ class _HelpSelect(discord.ui.Select):
             return await interaction.response.send_message(
                 "Only the person who ran this command can use this menu.", ephemeral=True
             )
-        choice = self.values[0]
-        if choice == "home":
-            embed = _build_home_embed()
-        else:
-            embed = _build_help_embed(choice)
-        await interaction.response.edit_message(embed=embed, view=self.view)
+        try:
+            choice = self.values[0]
+            if choice == "home":
+                embed = _build_home_embed()
+            else:
+                embed = _build_help_embed(choice)
+            await interaction.response.edit_message(embed=embed, view=self.view)
+        except Exception as exc:
+            try:
+                await interaction.response.send_message(
+                    f"❌ Help menu error: {exc}", ephemeral=True
+                )
+            except Exception:
+                pass
 
 
 class _HelpView(discord.ui.View):
@@ -4832,6 +5134,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v3.5",
+        "date": "2026-06-22",
+        "heavy": [
+            "**t!autotune** — New audio pitch-correction command (alias: `t!at`). Uses HPS FFT pitch detection (numpy) + FFmpeg rubberband filter with formant preservation to snap audio to the nearest note in a chosen scale. Keys: `chromatic` (default), `major`, `minor`, `pentatonic`. Strength param 0.0–1.0. Works on video and audio files.",
+            "**t!ihtx pipe** — Added `autotune` / `at` pipe effect. Usage: `autotune` or `autotune=major` or `autotune=minor;0.7`. Also added `folkvalley`/`fv` to PIPE_EFFECT_NAMES for proper parser recognition.",
+            "**t!ihtxhelp** — Fixed 'interaction failed' bug: field values exceeding Discord's 1024-char limit are now truncated; callback wrapped in try/except to prevent silent failures. Added autotune help entry and updated pipe effects reference.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v3.4",
         "date": "2026-06-21",
