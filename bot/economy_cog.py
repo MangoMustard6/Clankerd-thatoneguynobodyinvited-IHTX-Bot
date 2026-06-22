@@ -32,7 +32,7 @@ from discord.ext import commands
 _DB_PATH = Path("bot/economy_data.json")
 
 _DEFAULT_USER: dict[str, Any] = {
-    "wallet": 0,
+    "wallet": 100,
     "bank": 0,
     "xp": 0,
     "bio": "No bio set.",

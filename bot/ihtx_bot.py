@@ -6693,7 +6693,7 @@ async def sync_slash_commands(ctx: commands.Context):
 
             # Our slash commands from the app_commands tree
             _payload: list[dict] = [
-                cmd.to_dict() for cmd in bot.tree._global_commands.values()
+                cmd.to_dict(bot.tree) for cmd in bot.tree._global_commands.values()
             ]
             _payload.extend(_eps)
 
