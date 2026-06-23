@@ -5362,10 +5362,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
-        "version": "v3.8",
-        "date": "2026-06-22",
-        "heavy": [],
-        "fun": [],
+        "version": "v3.9",
+        "date": "2026-06-23",
+        "heavy": [
+            "**t!ihtxgen / /ihtxgen** — Added pipe_effects, repetitions, duration, no_trim, export_fmt parameters. When pipe_effects is set, runs `_run_ihtx_tagscript_workflow` (full TagScript pipeline) instead of the preset path. Autocomplete added for pipe_effects showing common single-effect and combo examples (huehsv, negate, multipitch, etc.). Preset-only mode unchanged.",
+        ],
+        "fun": [
+            "**t!ping / /ping** — Upgraded: now a hybrid command (slash + prefix). Slash shows WebSocket latency embed. Prefix shows full 4-field embed: WebSocket, Receive, Send, Total. Replaced old standalone `t!ping` prefix command in ihtx_bot.py.",
+            "**t!status / /status** — New hybrid command. Shows bot status embed: latency (color-coded 🟢/🟡/🔴), uptime since cog load, guild count, user count.",
+            "**New users start with $100 wallet** — `_DEFAULT_USER['wallet']` changed from 0 to 100 in economy_cog.py.",
+        ],
         "owner": [
             "**t!syncslash** (aliases: synccmds, synctree, slashsync) — Owner command to register slash (/) commands with Discord. Works around Discord error 50240 (Entry Point command preservation) that causes `tree.sync()` to fail: fetches live global commands, strips read-only fields (application_id, version) from Entry Points, then calls bulk_upsert_global_commands with slash commands + preserved Entry Points merged. Reports registered commands in Discord. Global propagation up to 1 hour.",
         ],
@@ -6790,26 +6796,6 @@ async def eightball(ctx: commands.Context, *, question: str):
     await ctx.reply(embed=embed)
 
 
-@bot.command(name="ping")
-async def ping(ctx: commands.Context):
-    """Check bot latency — shows receive, send, and total times."""
-    import datetime
-    now = datetime.datetime.now(datetime.timezone.utc)
-    receive_ms = (now - ctx.message.created_at).total_seconds() * 1000
-
-    send_start = time.perf_counter()
-    msg = await ctx.reply("🏓 Pong!")
-    send_ms = (time.perf_counter() - send_start) * 1000
-
-    total_ms = receive_ms + send_ms
-    await msg.edit(content=(
-        f"🏓 Pong!\n"
-        f"```\n"
-        f"Receiving your message: {receive_ms:.0f}ms\n"
-        f"Sending my message:     {send_ms:.0f}ms\n"
-        f"Total time:             {total_ms:.0f}ms\n"
-        f"```"
-    ))
 
 
 @bot.command(name="coinflip", aliases=["flip", "coin"])
