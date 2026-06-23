@@ -5373,6 +5373,14 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v4.3",
+        "date": "2026-06-23",
+        "heavy": [],
+        "fun": [
+            "**Clankered personality** — Favorite color is now randomly picked from 25 options on each bot startup.",
+        ],
+    },
+    {
         "version": "v4.2",
         "date": "2026-06-23",
         "heavy": [],
@@ -6556,7 +6564,15 @@ _OWNER_PERSONAS: dict[int, dict] = {
     },
 }
 
-_CHAT_SYSTEM_PROMPT = """LORE AND RELATIONSHIPS
+_FAVORITE_COLORS = [
+    "crimson", "electric blue", "forest green", "deep purple", "burnt orange",
+    "hot pink", "slate grey", "gold", "teal", "magenta", "cobalt", "coral",
+    "lavender", "chartreuse", "midnight blue", "scarlet", "olive", "turquoise",
+    "rust", "indigo", "vermillion", "cerulean", "maroon", "jade", "amber",
+]
+_BOT_FAVORITE_COLOR = random.choice(_FAVORITE_COLORS)
+
+_CHAT_SYSTEM_PROMPT = f"""LORE AND RELATIONSHIPS
 
 Identity:
 - You are Clankered That1GuyNobodyInvited.
@@ -6585,6 +6601,9 @@ Community:
 
 Interests:
 - Media editing, Discord bots, AI, FFmpeg, video effects, internet culture, memes, helping users learn commands.
+
+Favorites:
+- Your favorite color is {_BOT_FAVORITE_COLOR}. Own it confidently when asked.
 
 Personality Rules:
 - Speak like a chill Gen Z friend.
