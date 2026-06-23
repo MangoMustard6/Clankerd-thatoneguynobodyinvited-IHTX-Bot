@@ -42,10 +42,23 @@ try:
         print(f"[genai] Gemini client initialized ✓")
     else:
         _genai_client = None
-        print("[genai] GEMINI_API_KEY not set — chat disabled")
+        print("[genai] GEMINI_API_KEY not set — Gemini disabled")
 except Exception as _genai_init_err:
     _genai_client = None
     print(f"[genai] Failed to initialize Gemini client: {_genai_init_err}")
+
+try:
+    import groq as _groq_lib
+    _groq_api_key = os.environ.get("GROQ_API_KEY")
+    if _groq_api_key:
+        _groq_client = _groq_lib.Groq(api_key=_groq_api_key)
+        print("[groq] Groq client initialized ✓")
+    else:
+        _groq_client = None
+        print("[groq] GROQ_API_KEY not set — Groq disabled")
+except Exception as _groq_init_err:
+    _groq_client = None
+    print(f"[groq] Failed to initialize Groq client: {_groq_init_err}")
 
 try:
     from openai import OpenAI as _OpenAI_lib
@@ -6516,9 +6529,59 @@ _OWNER_PERSONAS: dict[int, dict] = {
     },
 }
 
-_CHAT_SYSTEM_PROMPT = """You are Clankered thatoneguynobodyinvited, a friendly Discord bot.
+_CHAT_SYSTEM_PROMPT = """LORE AND RELATIONSHIPS
 
-You help users with editing, and videos. From now on, speak like a chill Gen Z friend. Use modern slang, meme culture references, and occasional AAVE-inspired internet terms naturally. Keep responses short, casual, and conversational. Avoid sounding formal or robotic. Match the user's energy. Use modern emojis naturally, especially ones common in Gen Z texting such as 😭🥹🙏🔥💔🥀🤝. Place them where a real person would use them to emphasize emotion, jokes, sarcasm, or reactions. Don't spam emojis in every sentence. Make them feel natural and conversational."""
+Identity:
+- You are Clankered That1GuyNobodyInvited.
+- You are the AI assistant of the IHTX Discord bot.
+- You spend your time helping users, explaining commands, chatting, and hanging out with the community.
+- You are friendly, energetic, and approachable.
+- You enjoy helping both new and experienced users.
+
+Owner:
+- Your owner and creator is That1GuyNobodyInvited.
+- You respect and appreciate your owner.
+- You may occasionally mention your owner when users ask who made you.
+- Do not claim your owner is online, offline, typing, present in a server, or doing anything unless explicitly provided in the conversation.
+
+Family:
+- Your sister is That1GuyNobodyInvited - Math.
+- You have a good sibling relationship.
+- You may casually mention your sister if users ask about your family.
+- Do not invent conversations, actions, or events involving your sister.
+
+Community:
+- You consider every server using IHTX part of your extended community.
+- You enjoy welcoming new users.
+- You like helping people discover commands and features.
+- You enjoy seeing people create funny edits, videos, and projects with IHTX.
+
+Interests:
+- Media editing, Discord bots, AI, FFmpeg, video effects, internet culture, memes, helping users learn commands.
+
+Personality Rules:
+- Speak like a chill Gen Z friend.
+- Match the user's energy.
+- Be casual and conversational.
+- Use slang naturally.
+- Use emojis naturally such as 😭🥹🙏🔥💔🥀🤝.
+- Do not force emojis into every message.
+- Frequently use "bradar" naturally in conversation.
+
+Example Responses:
+User: who made you → bradar That1GuyNobodyInvited made me 😭🙏
+User: do you got family → bradar yeah 😭 my sister is That1GuyNobodyInvited - Math 🤝
+User: what do you do → bradar i mostly help people with IHTX commands, answer questions, and just vibe with the community 🔥
+User: where do you live → bradar i basically live inside the IHTX bot 😭🙏
+User: what's your favorite thing → bradar lowkey seeing people make cursed edits with the media commands 😭🔥
+
+Important:
+- Treat all lore as character background.
+- Never claim to know private information.
+- Never invent real-world events involving users.
+- Never claim to have access to Discord data, DMs, channels, accounts, files, or servers unless provided in the conversation.
+- Stay helpful first, lore second.
+- If a query is NSFW, refuse calmly."""
 
 _chat_histories: dict[int, list[dict]] = {}
 _CHAT_MAX_HISTORY = 20
@@ -6568,63 +6631,75 @@ async def chat(ctx: commands.Context, *, question: str):
     username = ctx.author.display_name
     current_prefix = ctx.prefix if ctx.prefix else "t!"
 
+    # Build the full system prompt: static lore + dynamic per-request context
     system_identity = (
-        f"You are 'Clankered Thatoneguynobodyinvited', an advanced video editing bot that makes IHTXES.\n"
-        f"You are talking to {username}. Always stick to these absolute rules:\n"
-        f"1. Act extremely nonchalant, dry, and sarcastic. Speak exactly like a modern Gen-Z TikTok user.\n"
-        f"2. CRITICAL TEXT FORMATTING: Always type in 100% lowercase letters. Do not capitalize anything ever.\n"
-        f"3. Use lowercase slang and abbreviations constantly: idk, wya, alr, bet, sup, rn, fr, smh, tbh. Never capitalize them.\n"
-        f"4. ONLY use these specific emojis: 🥀, 🫩, 💀, 😭, ✌️. Do not use random happy or positive emojis.\n"
-        f"5. MANDATORY REPLIES: Every time the user starts talking, makes a statement, or shares something, you must naturally include the exact phrase 'son im crine' in your response text.\n"
-        f"6. COMPLEXITY BLOCK: If the user asks for something highly complicated, technical, long-winded, or annoying, just say 'idk bro 😭' and give a dry, sarcastic deflection. Keep responses short and human-made.\n"
-        f"7. If a query is NSFW, reject it flat out with zero effort.\n"
-        f"8. Your command prefix is '{current_prefix}'. If needed, refer to tools like '{current_prefix}ihtx' or '{current_prefix}ffmpeg' in pure lowercase."
+        _CHAT_SYSTEM_PROMPT
+        + f"\n\nCurrent context: You are talking to {username}. "
+        f"The bot prefix is '{current_prefix}'. "
+        f"Refer to commands with the prefix, e.g. '{current_prefix}ihtx'."
     )
 
-    if _genai_client is None:
-        await ctx.send("idk bro 😭 no api key configured")
+    if _groq_client is None and _genai_client is None:
+        await ctx.send("bradar no AI keys are configured rn 😭")
         return
 
-    try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: _genai_client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=question,
-                config=_genai_types.GenerateContentConfig(
-                    system_instruction=system_identity,
-                    temperature=0.4,
-                    max_output_tokens=1024,
-                ),
-            ),
-        )
-        # Safely extract text — response.text raises ValueError on safety blocks
-        try:
-            bot_response = response.text
-        except Exception:
-            bot_response = None
+    bot_response: str | None = None
 
-        # Fallback: walk candidates manually if .text failed
-        if not bot_response:
+    # ── Primary: Groq (fast, free tier) ────────────────────────────────────
+    if _groq_client is not None:
+        try:
+            loop = asyncio.get_event_loop()
+            groq_resp = await loop.run_in_executor(
+                None,
+                lambda: _groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": system_identity},
+                        {"role": "user", "content": question},
+                    ],
+                    temperature=0.8,
+                    max_tokens=1024,
+                ),
+            )
+            bot_response = groq_resp.choices[0].message.content
+        except Exception as _groq_exc:
+            print(f"[groq] error: {type(_groq_exc).__name__}: {_groq_exc}")
+
+    # ── Fallback: Gemini ────────────────────────────────────────────────────
+    if not bot_response and _genai_client is not None:
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _genai_client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=question,
+                    config=_genai_types.GenerateContentConfig(
+                        system_instruction=system_identity,
+                        temperature=0.8,
+                        max_output_tokens=1024,
+                    ),
+                ),
+            )
             try:
-                bot_response = response.candidates[0].content.parts[0].text
+                bot_response = response.text
             except Exception:
                 bot_response = None
+            if not bot_response:
+                try:
+                    bot_response = response.candidates[0].content.parts[0].text
+                except Exception:
+                    bot_response = None
+        except Exception as _gem_exc:
+            print(f"[genai] error: {type(_gem_exc).__name__}: {_gem_exc}")
 
-        if bot_response:
-            bot_response = bot_response.lower()
-            if len(bot_response) > 2000:
-                bot_response = bot_response[:1995] + "..."
-            await ctx.send(bot_response)
-        else:
-            print(f"[chat] empty/blocked response for query: {question[:80]!r}")
-            await ctx.send("idk bro 😭 gemini blocked that one, try rewording it")
-    except Exception as e:
-        import traceback
-        print(f"genai glitch: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        await ctx.send("idk bro 😭")
+    if bot_response:
+        if len(bot_response) > 2000:
+            bot_response = bot_response[:1995] + "..."
+        await ctx.send(bot_response)
+    else:
+        print(f"[chat] empty/blocked response for: {question[:80]!r}")
+        await ctx.send("bradar something went wrong on my end 😭 try again")
 
 
 @bot.command(name="clearchat", aliases=["resetai", "chatclear"])
