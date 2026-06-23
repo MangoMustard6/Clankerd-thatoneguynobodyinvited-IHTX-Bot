@@ -271,6 +271,7 @@ class EconomyCog(commands.Cog, name="Economy"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._ready_at = time.time()
 
     # -----------------------------------------------------------------------
     # /profile
@@ -335,24 +336,56 @@ class EconomyCog(commands.Cog, name="Economy"):
         ]
         return choices[:25]
 
+    async def _pipe_effect_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        COMBOS = [
+            "huehsv 0.5", "negate", "hflip", "vflip", "grayscale", "sepia",
+            "swirl=90", "speed=2", "volume=2", "multipitch=1|6|7",
+            "huehsv 0.5,negate", "negate,hflip", "grayscale,speed=0.5",
+            "multipitch=1|6|7,negate", "huehsv 0.5,multipitch=1|6|7",
+            "invert,speed=0.5", "sepia,swirl=45", "channelblend,negate",
+        ]
+        try:
+            from bot.ihtx_bot import PIPE_EFFECT_NAMES
+            extra = [n for n in sorted(PIPE_EFFECT_NAMES) if n not in COMBOS]
+        except Exception:
+            extra = []
+        all_opts = COMBOS + extra
+        matches = [o for o in all_opts if current.lower() in o.lower()] if current else all_opts
+        return [app_commands.Choice(name=o[:100], value=o[:100]) for o in matches[:25]]
+
     @commands.hybrid_command(
         name="ihtxgen",
-        description="Run an IHTX FFmpeg effect on a media file or URL with live embed feedback.",
+        description="Run an IHTX FFmpeg effect on media with live embed feedback.",
     )
     @app_commands.describe(
-        effect="The IHTX preset to apply (e.g. chaos, glitch, melt).",
-        url="Direct URL to a media file (alternative to attaching a file).",
-        attachment="Attach a video or image directly (slash command only).",
+        effect="Preset when not using pipe_effects (e.g. chaos, glitch, melt). Autocomplete available.",
+        url="Direct URL to a media file (alternative to attaching).",
+        attachment="Attach a video or image (slash only).",
+        pipe_effects="Comma/semicolon-separated pipe effects (e.g. huehsv 0.5,negate,multipitch=1|6|7).",
+        repetitions="Export repetitions for pipe mode (default 1, max 100).",
+        duration="Seconds or awk expr for pipe mode, e.g. 5 or vidlen/2 (default: full video).",
+        no_trim="Skip trim in pipe mode.",
+        export_fmt="Output container for pipe mode: mp4 (default), mkv, mov, avi.",
     )
-    @app_commands.autocomplete(effect=_preset_autocomplete)
+    @app_commands.autocomplete(effect=_preset_autocomplete, pipe_effects=_pipe_effect_autocomplete)
     async def ihtxgen(
         self,
         ctx: commands.Context,
         effect: str = "chaos",
         url: Optional[str] = None,
         attachment: Optional[discord.Attachment] = None,
+        pipe_effects: Optional[str] = None,
+        repetitions: int = 1,
+        duration: str = "vidlen",
+        no_trim: bool = False,
+        export_fmt: str = "mp4",
     ) -> None:
-        # Import what we need from the main bot module
+        use_pipe = bool(pipe_effects and pipe_effects.strip())
+
         try:
             from bot.ihtx_bot import (
                 PRESET_FILTERS,
@@ -361,29 +394,30 @@ class EconomyCog(commands.Cog, name="Economy"):
                 MAX_FILE_SIZE,
                 get_output_ext,
                 run_ffmpeg,
-                download_attachment,
-                download_url,
                 _upload_to_catbox,
                 _ffprobe_video_info,
+                _run_ihtx_tagscript_workflow,
+                _pipe_effects_label,
             )
         except ImportError as exc:
             await ctx.reply(f"❌ Internal error importing IHTX pipeline: `{exc}`", ephemeral=True)
             return
 
-        effect = effect.lower().strip()
-        if effect not in PRESET_FILTERS:
-            preset_list = ", ".join(f"`{p}`" for p in sorted(PRESET_FILTERS.keys()))
-            await ctx.reply(
-                embed=discord.Embed(
-                    title="❌ Unknown Preset",
-                    description=f"Available presets: {preset_list}",
-                    color=0xED4245,
-                ),
-                ephemeral=True,
-            )
-            return
+        if not use_pipe:
+            effect = effect.lower().strip()
+            if effect not in PRESET_FILTERS:
+                preset_list = ", ".join(f"`{p}`" for p in sorted(PRESET_FILTERS.keys()))
+                await ctx.reply(
+                    embed=discord.Embed(
+                        title="❌ Unknown Preset",
+                        description=f"Available presets: {preset_list}",
+                        color=0xED4245,
+                    ),
+                    ephemeral=True,
+                )
+                return
 
-        # Resolve media source: slash attachment > url param > message attachments > referenced message
+        # Resolve media: slash attachment > url param > message attachment > reply attachment
         media_url: Optional[str] = None
         media_filename: str = "input"
         media_size: int = 0
@@ -418,9 +452,12 @@ class EconomyCog(commands.Cog, name="Economy"):
                     title="📎 No Media Provided",
                     description=(
                         "Attach a file, provide a `url:` parameter, or reply to a message with media.\n\n"
-                        f"**Effect selected:** `{effect}`\n"
-                        "**Usage:** `/ihtxgen effect:chaos` with an attachment\n"
-                        "**Text prefix:** `t!ihtxgen chaos` (attach or reply to a file)"
+                        + (
+                            f"**Pipe effects:** `{pipe_effects}`\n"
+                            if use_pipe else
+                            f"**Effect:** `{effect}`\n"
+                        )
+                        + "**Usage:** `/ihtxgen` with an attachment or `url:`"
                     ),
                     color=0xFEE75C,
                 ),
@@ -450,32 +487,48 @@ class EconomyCog(commands.Cog, name="Economy"):
             return
 
         is_video = suffix in VIDEO_EXTENSIONS
-        out_ext = get_output_ext(suffix, is_video)
-        preset_out_ext = PRESET_FILTERS.get(effect, {}).get("output_ext")
-        if preset_out_ext:
-            out_ext = preset_out_ext
 
-        # Send live "processing" embed
+        if use_pipe and not is_video:
+            await ctx.reply(
+                embed=discord.Embed(
+                    description="❌ Pipe effects mode requires video input (not images or GIFs).",
+                    color=0xED4245,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        out_ext = get_output_ext(suffix, is_video)
+        if not use_pipe:
+            preset_out_ext = PRESET_FILTERS.get(effect, {}).get("output_ext")
+            if preset_out_ext:
+                out_ext = preset_out_ext
+
+        # Build header for the live embed
+        if use_pipe:
+            _pe_label = _pipe_effects_label(pipe_effects)
+            _dur_str = duration if duration != "vidlen" else "full video"
+            _header = (
+                f"**Pipe effects:** `{_pe_label}`"
+                + (f" ×{repetitions}" if repetitions != 1 else "")
+                + f"\n**Duration:** `{_dur_str}` · **Format:** `{export_fmt}`"
+                + (f" · **No trim:** yes" if no_trim else "")
+                + f"\n**File:** `{media_filename}`"
+            )
+        else:
+            _header = f"**Effect:** `{effect}`\n**File:** `{media_filename}`"
+
         loading_embed = discord.Embed(
             title="⚙️ IHTX Generator",
-            description=(
-                f"**Effect:** `{effect}`\n"
-                f"**File:** `{media_filename}`\n\n"
-                "⏳ Downloading and processing your media…"
-            ),
+            description=_header + "\n\n⏳ Downloading and processing your media…",
             color=0x5865F2,
         )
         loading_embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
         loading_embed.set_footer(text=f"Requested by {ctx.author.display_name}")
-
         status_msg = await ctx.reply(embed=loading_embed, mention_author=False)
 
         async def _update(description: str, color: int = 0x5865F2) -> None:
-            e = discord.Embed(
-                title="⚙️ IHTX Generator",
-                description=description,
-                color=color,
-            )
+            e = discord.Embed(title="⚙️ IHTX Generator", description=description, color=color)
             e.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
             e.set_footer(text=f"Requested by {ctx.author.display_name}")
             try:
@@ -485,21 +538,16 @@ class EconomyCog(commands.Cog, name="Economy"):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = os.path.join(tmpdir, f"input{suffix}")
-            output_path = os.path.join(tmpdir, f"output{out_ext}")
+            out_final_ext = ".mp4" if use_pipe else out_ext
+            output_path = os.path.join(tmpdir, f"output{out_final_ext}")
 
             # Download
             try:
-                await _update(
-                    f"**Effect:** `{effect}`\n**File:** `{media_filename}`\n\n"
-                    "⬇️ Downloading media…"
-                )
+                await _update(_header + "\n\n⬇️ Downloading media…")
                 async with __import__("aiohttp").ClientSession() as session:
                     async with session.get(media_url) as resp:
                         if resp.status != 200:
-                            await _update(
-                                f"❌ Failed to download media (HTTP {resp.status}).",
-                                0xED4245,
-                            )
+                            await _update(f"❌ Failed to download media (HTTP {resp.status}).", 0xED4245)
                             return
                         data = await resp.read()
                 with open(input_path, "wb") as fh:
@@ -508,15 +556,23 @@ class EconomyCog(commands.Cog, name="Economy"):
                 await _update(f"❌ Download failed: `{exc}`", 0xED4245)
                 return
 
-            # FFmpeg
-            await _update(
-                f"**Effect:** `{effect}`\n**File:** `{media_filename}`\n\n"
-                f"🔧 Running FFmpeg `{effect}` preset…"
-            )
+            # Process
             loop = asyncio.get_event_loop()
-            ok, err = await loop.run_in_executor(
-                None, run_ffmpeg, input_path, output_path, effect, is_video
-            )
+            if use_pipe:
+                await _update(_header + f"\n\n🔧 Running pipe effects: `{_pe_label}`…")
+                ok, err = await loop.run_in_executor(
+                    None, _run_ihtx_tagscript_workflow,
+                    input_path, output_path,
+                    repetitions, duration,
+                    "true" if no_trim else "-",
+                    export_fmt.lstrip(".") or "mp4",
+                    pipe_effects,
+                )
+            else:
+                await _update(_header + f"\n\n🔧 Running FFmpeg `{effect}` preset…")
+                ok, err = await loop.run_in_executor(
+                    None, run_ffmpeg, input_path, output_path, effect, is_video
+                )
 
             if not ok:
                 await _update(f"❌ FFmpeg failed:\n```\n{err[-1200:]}\n```", 0xED4245)
@@ -524,7 +580,7 @@ class EconomyCog(commands.Cog, name="Economy"):
 
             out_size = os.path.getsize(output_path)
 
-            # Probe for metadata
+            # Probe metadata
             try:
                 vinfo = _ffprobe_video_info(output_path)
                 w, h = int(vinfo["width"]), int(vinfo["height"])
@@ -541,6 +597,7 @@ class EconomyCog(commands.Cog, name="Economy"):
                 res_str = ar_str = fps_str = "N/A"
 
             size_mb = out_size / (1024 * 1024)
+            _applied = f"`{_pe_label}`" if use_pipe else f"`{effect}`"
 
             if out_size > MAX_FILE_SIZE:
                 await _update("⬆️ Output exceeds 25 MB — uploading to Catbox…")
@@ -549,7 +606,7 @@ class EconomyCog(commands.Cog, name="Economy"):
                     result_embed = discord.Embed(
                         title="✅ IHTX Generator — Done!",
                         description=(
-                            f"**Effect:** `{effect}`\n"
+                            f"**Effect:** {_applied}\n"
                             f"**Resolution:** {res_str} ({ar_str}) · {fps_str}\n"
                             f"**Size:** {size_mb:.2f} MB (uploaded to Catbox)\n\n"
                             f"🔗 [Download from Catbox]({catbox_url})\n`{catbox_url}`"
@@ -560,17 +617,15 @@ class EconomyCog(commands.Cog, name="Economy"):
                     result_embed.set_footer(text=f"Requested by {ctx.author.display_name}")
                     await status_msg.edit(embed=result_embed)
                 else:
-                    await _update(
-                        "❌ Output too large for Discord (>25 MB) and Catbox upload failed.",
-                        0xED4245,
-                    )
+                    await _update("❌ Output too large for Discord (>25 MB) and Catbox upload failed.", 0xED4245)
                 return
 
-            out_filename = f"ihtx_{effect}_{Path(media_filename).stem}{out_ext}"
+            stem = Path(media_filename).stem
+            out_filename = f"ihtx_{'pipe' if use_pipe else effect}_{stem}{out_final_ext}"
             result_embed = discord.Embed(
                 title="✅ IHTX Generator — Done!",
                 description=(
-                    f"**Effect applied:** `{effect}`\n"
+                    f"**Effect applied:** {_applied}\n"
                     f"**Resolution:** {res_str} ({ar_str}) · {fps_str}\n"
                     f"**Output size:** {size_mb:.2f} MB"
                 ),
@@ -587,6 +642,81 @@ class EconomyCog(commands.Cog, name="Economy"):
             except discord.HTTPException:
                 await status_msg.edit(embed=result_embed)
                 await ctx.send(file=discord.File(output_path, filename=out_filename))
+
+    # -----------------------------------------------------------------------
+    # /ping and /status — latency and health
+    # -----------------------------------------------------------------------
+
+    @commands.hybrid_command(
+        name="ping",
+        description="Check the bot's WebSocket latency and message round-trip times.",
+    )
+    async def ping(self, ctx: commands.Context) -> None:
+        import datetime
+        ws_ms = round(self.bot.latency * 1000)
+        bar = "🟢" if ws_ms < 150 else ("🟡" if ws_ms < 400 else "🔴")
+        color = 0x57F287 if ws_ms < 150 else (0xFEE75C if ws_ms < 400 else 0xED4245)
+
+        if ctx.interaction:
+            embed = discord.Embed(
+                title="🏓 Pong!",
+                description=f"{bar} **WebSocket:** {ws_ms} ms",
+                color=color,
+            )
+            await ctx.reply(embed=embed, mention_author=False)
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            receive_ms = (now - ctx.message.created_at).total_seconds() * 1000
+            send_start = time.perf_counter()
+            msg = await ctx.reply("🏓 Pong!")
+            send_ms = (time.perf_counter() - send_start) * 1000
+            total_ms = receive_ms + send_ms
+            embed = discord.Embed(
+                title="🏓 Pong!",
+                color=color,
+            )
+            embed.add_field(name=f"{bar} WebSocket", value=f"**{ws_ms} ms**", inline=True)
+            embed.add_field(name="📨 Receive", value=f"**{receive_ms:.0f} ms**", inline=True)
+            embed.add_field(name="📤 Send", value=f"**{send_ms:.0f} ms**", inline=True)
+            embed.add_field(name="⏱️ Total", value=f"**{total_ms:.0f} ms**", inline=True)
+            await msg.edit(content=None, embed=embed)
+
+    @commands.hybrid_command(
+        name="status",
+        description="Show bot status, latency, uptime, and server stats.",
+    )
+    async def status(self, ctx: commands.Context) -> None:
+        latency_ms = round(self.bot.latency * 1000)
+        bar = "🟢" if latency_ms < 150 else ("🟡" if latency_ms < 400 else "🔴")
+
+        uptime_s = int(time.time() - self._ready_at)
+        days, rem = divmod(uptime_s, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        parts.append(f"{seconds}s")
+        uptime_str = " ".join(parts)
+
+        guild_count = len(self.bot.guilds)
+        user_count = sum(g.member_count or 0 for g in self.bot.guilds)
+
+        embed = discord.Embed(title="📊 Bot Status", color=0x5865F2)
+        embed.add_field(name="🏓 Latency", value=f"{bar} **{latency_ms} ms**", inline=True)
+        embed.add_field(name="⏱️ Uptime", value=f"`{uptime_str}`", inline=True)
+        embed.add_field(name="‎", value="‎", inline=True)
+        embed.add_field(name="🌐 Servers", value=f"`{guild_count}`", inline=True)
+        embed.add_field(name="👥 Users", value=f"`{user_count:,}`", inline=True)
+        embed.set_footer(
+            text=f"Requested by {ctx.author.display_name}",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await ctx.reply(embed=embed, mention_author=False)
 
     # -----------------------------------------------------------------------
     # /slot — Slot machine with 1-hour cooldown and 777 jackpot
