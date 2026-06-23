@@ -20,3 +20,15 @@ python-dotenv
 replicate
 uvloop
 yt-dlp
+aiohttp
+anthropic
+discord.py
+fal-client
+flask
+google-genai
+openai
+python-dotenv
+replicate
+uvloop
+yt-dlp
+groq
