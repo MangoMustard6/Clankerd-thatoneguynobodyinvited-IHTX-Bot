@@ -7774,6 +7774,64 @@ async def on_message(message: discord.Message):
         return
 
     if message.author.bot:
+        # Still run autoreply2 for other bots in enabled channels
+        if message.channel.id in autoreply2 and (_groq_client is not None or _genai_client is not None):
+            ok2, _ = _check_heavy_limit(message.author.id)
+            if ok2:
+                uid2 = message.author.id
+                no_ping = uid2 in autoreply2_no_mention
+                has_attachments = bool(message.attachments)
+                system2 = _CHAT_SYSTEM_PROMPT + _AR2_COMMAND_REF
+                reply2_text = None
+                if _groq_client is not None and not has_attachments:
+                    try:
+                        groq_hist2 = _ar2_groq_histories.setdefault(uid2, [])
+                        groq_hist2.append({"role": "user", "content": message.content or "[empty]"})
+                        if len(groq_hist2) > _CHAT_MAX_HISTORY:
+                            groq_hist2[:] = groq_hist2[-_CHAT_MAX_HISTORY:]
+                        loop2 = asyncio.get_event_loop()
+                        groq_resp2 = await loop2.run_in_executor(
+                            None,
+                            lambda: _groq_client.chat.completions.create(
+                                model="llama-3.3-70b-versatile",
+                                messages=[{"role": "system", "content": system2}] + groq_hist2,
+                                temperature=0.8,
+                                max_tokens=1024,
+                            ),
+                        )
+                        reply2_text = groq_resp2.choices[0].message.content
+                        groq_hist2.append({"role": "assistant", "content": reply2_text})
+                    except Exception as _groq_ar2_exc:
+                        print(f"[groq/ar2/bot] error: {type(_groq_ar2_exc).__name__}: {_groq_ar2_exc}")
+                if not reply2_text and _genai_client is not None:
+                    hist2 = _chat_histories.setdefault(uid2, [])
+                    parts2 = await _build_gemini_parts(message.content, message.attachments)
+                    hist2.append({"role": "user", "parts": parts2})
+                    if len(hist2) > _CHAT_MAX_HISTORY:
+                        hist2[:] = hist2[-_CHAT_MAX_HISTORY:]
+                    try:
+                        loop2 = asyncio.get_event_loop()
+                        resp2 = await loop2.run_in_executor(
+                            None,
+                            lambda: _genai_client.models.generate_content(
+                                model="gemini-2.5-flash",
+                                contents=hist2,
+                                config=_genai_types.GenerateContentConfig(
+                                    system_instruction=system2,
+                                    max_output_tokens=1024,
+                                ),
+                            ),
+                        )
+                        reply2_text = resp2.text
+                        text_only2 = [p for p in parts2 if "text" in p] or [{"text": "[media]"}]
+                        hist2[-1] = {"role": "user", "parts": text_only2}
+                        hist2.append({"role": "model", "parts": [{"text": reply2_text}]})
+                    except Exception:
+                        pass
+                if reply2_text:
+                    chunks2 = [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]
+                    for i, chunk in enumerate(chunks2):
+                        await message.reply(chunk, mention_author=(not no_ping and i == 0))
         return
 
     # Autoreplies (check before keyword blocks, skip commands)
