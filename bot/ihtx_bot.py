@@ -376,9 +376,7 @@ def _load_autoreply2():
         if AUTOREPLY2_FILE.exists():
             with AUTOREPLY2_FILE.open() as f:
                 raw = json.load(f)
-            # Migration: old format stored user IDs — wipe and start fresh as channel IDs
-            autoreply2 = set()
-            AUTOREPLY2_FILE.write_text("[]")
+            autoreply2 = set(int(x) for x in raw)
         else:
             autoreply2 = set()
     except Exception:
@@ -5375,6 +5373,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v4.2",
+        "date": "2026-06-23",
+        "heavy": [],
+        "fun": [
+            "**t!autoreply2** — Enabled channels now persist across bot restarts.",
+            "**t!autoreply2** — Replies now arrive after a natural 5–7.5 second delay.",
+        ],
+    },
+    {
         "version": "v4.1",
         "date": "2026-06-23",
         "heavy": [
@@ -7829,6 +7836,7 @@ async def on_message(message: discord.Message):
                     except Exception:
                         pass
                 if reply2_text:
+                    await asyncio.sleep(random.uniform(5, 7.5))
                     chunks2 = [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]
                     for i, chunk in enumerate(chunks2):
                         await message.reply(chunk, mention_author=(not no_ping and i == 0))
@@ -7917,6 +7925,7 @@ async def on_message(message: discord.Message):
                         pass
 
                 if reply2_text:
+                    await asyncio.sleep(random.uniform(5, 7.5))
                     chunks2 = [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]
                     for i, chunk in enumerate(chunks2):
                         await message.reply(chunk, mention_author=(not no_ping and i == 0))
