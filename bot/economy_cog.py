@@ -398,24 +398,44 @@ class EconomyCog(commands.Cog, name="Economy"):
                 _ffprobe_video_info,
                 _run_ihtx_tagscript_workflow,
                 _pipe_effects_label,
+                _parse_ihtx_custom_args,
             )
         except ImportError as exc:
             await ctx.reply(f"❌ Internal error importing IHTX pipeline: `{exc}`", ephemeral=True)
             return
 
         if not use_pipe:
-            effect = effect.lower().strip()
-            if effect not in PRESET_FILTERS:
-                preset_list = ", ".join(f"`{p}`" for p in sorted(PRESET_FILTERS.keys()))
-                await ctx.reply(
-                    embed=discord.Embed(
-                        title="❌ Unknown Preset",
-                        description=f"Available presets: {preset_list}",
-                        color=0xED4245,
-                    ),
-                    ephemeral=True,
-                )
-                return
+            effect_lower = effect.lower().strip()
+            if effect_lower in PRESET_FILTERS:
+                effect = effect_lower
+            else:
+                # Try full t!ihtx custom-syntax string in the effect field
+                # e.g. "10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7"
+                _custom_parsed = _parse_ihtx_custom_args(effect.strip())
+                if _custom_parsed is not None:
+                    _c_reps, _c_dur, _c_notrim, _c_fmt, _c_pe = _custom_parsed
+                    repetitions = _c_reps
+                    duration = _c_dur
+                    no_trim = _c_notrim.lower() in {"true", "yes"}
+                    export_fmt = _c_fmt or "mp4"
+                    pipe_effects = _c_pe
+                    use_pipe = True
+                else:
+                    preset_list = ", ".join(f"`{p}`" for p in sorted(PRESET_FILTERS.keys()))
+                    await ctx.reply(
+                        embed=discord.Embed(
+                            title="❌ Unknown Preset or Invalid Syntax",
+                            description=(
+                                f"**Presets:** {preset_list}\n\n"
+                                "**Or use full t!ihtx syntax:**\n"
+                                "`<exports> <duration> <no_trim> <format> <pipe effects>`\n"
+                                "Example: `10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`"
+                            ),
+                            color=0xED4245,
+                        ),
+                        ephemeral=True,
+                    )
+                    return
 
         # Resolve media: slash attachment > url param > message attachment > reply attachment
         media_url: Optional[str] = None
@@ -538,7 +558,7 @@ class EconomyCog(commands.Cog, name="Economy"):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = os.path.join(tmpdir, f"input{suffix}")
-            out_final_ext = ".mp4" if use_pipe else out_ext
+            out_final_ext = f".{export_fmt.lstrip('.')}" if use_pipe else out_ext
             output_path = os.path.join(tmpdir, f"output{out_final_ext}")
 
             # Download

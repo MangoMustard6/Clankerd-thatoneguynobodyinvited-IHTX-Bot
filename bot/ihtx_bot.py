@@ -5375,6 +5375,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v4.1",
+        "date": "2026-06-23",
+        "heavy": [
+            "**t!ihtxgen / /ihtxgen** — Now accepts full t!ihtx custom syntax in the `effect` field (e.g. `10 0.483 - mp4 huehsv;negate`). No longer limited to presets only.",
+        ],
+        "fun": [
+            "**t!autoreply2** — Now uses Clankered That1GuyNobodyInvited personality + Groq primary / Gemini fallback. Knows every bot command for accurate help replies. Images still routed to Gemini (vision support).",
+        ],
+    },
+    {
         "version": "v4.0",
         "date": "2026-06-23",
         "heavy": [
@@ -6594,7 +6604,57 @@ Important:
 - If a query is NSFW, refuse calmly."""
 
 _chat_histories: dict[int, list[dict]] = {}
+_ar2_groq_histories: dict[int, list[dict]] = {}
 _CHAT_MAX_HISTORY = 20
+
+# Compact command reference appended to autoreply2 system prompt so the AI
+# knows every implemented command and can answer "what can you do?" questions.
+_AR2_COMMAND_REF = """
+
+COMMANDS YOU KNOW (IHTX Bot — prefix t!):
+
+Heavy (media processing):
+- t!ihtx [preset | <exports> <dur> <no_trim> <fmt> <pipe_effects>] — main effect engine
+- t!ihtxgen / /ihtxgen — slash + prefix hybrid; same as t!ihtx with attachment/url support
+- t!multipitch <semitones> — multi-voice pitch shift (Rubber Band R3)
+- t!tvsim <line_sync> [...] — CRT/TV simulator effect
+- t!huehsv <hue> — hue shift via ImageMagick haldclut
+- t!mirror <left|right|top|bottom|deg> — mirror media
+- t!folkvalley — folkvalley aesthetic (audio swap + brightness + overlay)
+- t!vocoder [mode] [bw] <carrier_url> — FFT phase vocoder
+- t!syncaudio [alt] — sync video and audio durations
+- t!trim <start> <end> — trim audio/video/GIF
+- t!preview1280 [start] [dur] — 12-segment TV-simulator montage
+- t!invlum [n] — luma-inversion loop
+- t!lexg — re-apply last export effect chain to new media
+
+Downloads & Upload:
+- t!dl <url> — download video/image from URL
+- t!catbox — upload file to catbox.moe (up to 200 MB)
+
+AI & Chat:
+- t!chat / t!ask / t!ai <prompt> — chat with Clankered (you!) — powered by Groq + Gemini fallback
+- t!clearchat — clear your chat history
+
+Economy & Profile:
+- /profile — view your IHTX profile and wallet balance
+- /jackpot — spend $10 for a random jackpot reward
+- /ping — bot latency
+- /status — bot status (uptime, guilds, users)
+
+Fun & Utility:
+- t!tag <name> [args] — run a custom TagScript tag
+- t!presets — list all IHTX presets (chaos, glitch, melt, etc.)
+- t!updatelog — show recent bot updates
+- t!ihtxhelp — full IHTX command reference
+
+Owner-only:
+- t!autoreply2 / t!ar2 — toggle AI auto-reply in current channel
+- t!autoreply / t!addautoreply — keyword-based autoreply
+- t!blockuser / t!unblockuser / t!blockchannel / t!keywordblock
+- t!warn / t!warnings / t!clearwarn
+- t!say / t!sayembed / t!setactivity
+- t!syncslash — register slash commands globally"""
 
 _GEMINI_MIME_MAP = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -7735,41 +7795,73 @@ async def on_message(message: discord.Message):
                 break
 
         # Autoreply2 — AI reply to every message in enabled channels
-        if message.channel.id in autoreply2 and _genai_client is not None:
+        if message.channel.id in autoreply2 and (_groq_client is not None or _genai_client is not None):
             ok2, _ = _check_heavy_limit(message.author.id)
             if ok2:
                 uid2 = message.author.id
                 no_ping = uid2 in autoreply2_no_mention
-                hist2 = _chat_histories.setdefault(uid2, [])
-                system2 = _CHAT_SYSTEM_PROMPT
+                has_attachments = bool(message.attachments)
+
+                # System prompt: personality + command reference
+                system2 = _CHAT_SYSTEM_PROMPT + _AR2_COMMAND_REF
                 if _OWNER_PERSONAS.get(uid2):
-                    system2 += f"\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
-                parts2 = await _build_gemini_parts(message.content, message.attachments)
-                hist2.append({"role": "user", "parts": parts2})
-                if len(hist2) > _CHAT_MAX_HISTORY:
-                    hist2[:] = hist2[-_CHAT_MAX_HISTORY:]
-                try:
-                    loop2 = asyncio.get_event_loop()
-                    resp2 = await loop2.run_in_executor(
-                        None,
-                        lambda: _genai_client.models.generate_content(
-                            model="gemini-2.5-flash",
-                            contents=hist2,
-                            config=_genai_types.GenerateContentConfig(
-                                system_instruction=system2,
-                                max_output_tokens=1024,
+                    system2 += "\n\nYou are currently speaking with ✨le creator✨. Be extra friendly and hype them up."
+
+                reply2_text = None
+
+                # ── Primary: Groq (text-only messages) ───────────────────────
+                if _groq_client is not None and not has_attachments:
+                    try:
+                        groq_hist2 = _ar2_groq_histories.setdefault(uid2, [])
+                        groq_hist2.append({"role": "user", "content": message.content or "[empty]"})
+                        if len(groq_hist2) > _CHAT_MAX_HISTORY:
+                            groq_hist2[:] = groq_hist2[-_CHAT_MAX_HISTORY:]
+                        loop2 = asyncio.get_event_loop()
+                        groq_resp2 = await loop2.run_in_executor(
+                            None,
+                            lambda: _groq_client.chat.completions.create(
+                                model="llama-3.3-70b-versatile",
+                                messages=[{"role": "system", "content": system2}] + groq_hist2,
+                                temperature=0.8,
+                                max_tokens=1024,
                             ),
-                        ),
-                    )
-                    reply2_text = resp2.text
-                    text_only2 = [p for p in parts2 if "text" in p] or [{"text": "[media]"}]
-                    hist2[-1] = {"role": "user", "parts": text_only2}
-                    hist2.append({"role": "model", "parts": [{"text": reply2_text}]})
+                        )
+                        reply2_text = groq_resp2.choices[0].message.content
+                        groq_hist2.append({"role": "assistant", "content": reply2_text})
+                    except Exception as _groq_ar2_exc:
+                        print(f"[groq/ar2] error: {type(_groq_ar2_exc).__name__}: {_groq_ar2_exc}")
+
+                # ── Fallback: Gemini (also handles image attachments) ─────────
+                if not reply2_text and _genai_client is not None:
+                    hist2 = _chat_histories.setdefault(uid2, [])
+                    parts2 = await _build_gemini_parts(message.content, message.attachments)
+                    hist2.append({"role": "user", "parts": parts2})
+                    if len(hist2) > _CHAT_MAX_HISTORY:
+                        hist2[:] = hist2[-_CHAT_MAX_HISTORY:]
+                    try:
+                        loop2 = asyncio.get_event_loop()
+                        resp2 = await loop2.run_in_executor(
+                            None,
+                            lambda: _genai_client.models.generate_content(
+                                model="gemini-2.5-flash",
+                                contents=hist2,
+                                config=_genai_types.GenerateContentConfig(
+                                    system_instruction=system2,
+                                    max_output_tokens=1024,
+                                ),
+                            ),
+                        )
+                        reply2_text = resp2.text
+                        text_only2 = [p for p in parts2 if "text" in p] or [{"text": "[media]"}]
+                        hist2[-1] = {"role": "user", "parts": text_only2}
+                        hist2.append({"role": "model", "parts": [{"text": reply2_text}]})
+                    except Exception:
+                        pass
+
+                if reply2_text:
                     chunks2 = [reply2_text[i:i+1900] for i in range(0, len(reply2_text), 1900)]
                     for i, chunk in enumerate(chunks2):
                         await message.reply(chunk, mention_author=(not no_ping and i == 0))
-                except Exception:
-                    pass
 
     # Always allow owners to manage the bot and allow all bot commands to run.
     if not _is_owner_by_id(message.author.id) and not message.content.startswith("t!"):
