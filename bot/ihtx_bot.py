@@ -5375,6 +5375,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v4.0",
+        "date": "2026-06-23",
+        "heavy": [
+            "**t!chat** — Groq (llama-3.3-70b-versatile) is now the primary AI engine. Gemini is kept as automatic fallback. Configure via GROQ_API_KEY secret.",
+        ],
+        "fun": [
+            "**t!chat** — New system prompt: Clankered That1GuyNobodyInvited lore (owner, sister That1GuyNobodyInvited - Math, community, 'bradar' slang, Gen Z chill personality). Removed forced-lowercase rule.",
+        ],
+    },
+    {
         "version": "v3.9",
         "date": "2026-06-23",
         "heavy": [
