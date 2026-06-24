@@ -32,3 +32,4 @@ replicate
 uvloop
 yt-dlp
 groq
+Pillow
