@@ -83,20 +83,19 @@ function generatePCM(formula: string): Buffer | string {
 
 /**
  * Pipes the raw u8 PCM buffer into ffmpeg via a PassThrough stream and
- * writes an AAC/MP4 file to outputPath.
+ * writes a standard PCM WAV file to outputPath.
  *
  * Equivalent shell command:
- *   ffmpeg -f u8 -ar 8000 -ac 1 -i pipe:0 -acodec aac -movflags +faststart out.mp4
+ *   ffmpeg -f u8 -ar 8000 -ac 1 -i pipe:0 -acodec pcm_s16le out.wav
  */
-function transcodeToMP4(pcm: Buffer, outputPath: string): Promise<void> {
+function transcodeToWAV(pcm: Buffer, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const src = new PassThrough();
 
     ffmpeg(src)
       .inputFormat('u8')
       .inputOptions(['-ar 8000', '-ac 1'])
-      .audioCodec('aac')
-      .outputOptions(['-movflags +faststart'])
+      .audioCodec('pcm_s16le')
       .output(outputPath)
       .on('end', () => resolve())
       .on('error', (err: Error) => reject(err))
@@ -126,10 +125,10 @@ export async function executeByteBeat(formula: string): Promise<BytebeatResult> 
   }
 
   const tmpDir = makeTempDir('bytebeat');
-  const outputPath = path.join(tmpDir, 'bytebeat.mp4');
+  const outputPath = path.join(tmpDir, 'bytebeat.wav');
 
   try {
-    await transcodeToMP4(pcm, outputPath);
+    await transcodeToWAV(pcm, outputPath);
   } catch (e) {
     cleanupDir(tmpDir);
     return {
@@ -173,7 +172,7 @@ export async function handleBytebeat(message: Message, rest: string): Promise<vo
   try {
     await message.reply({
       content: `🎵 **Bytebeat:** \`${formula}\``,
-      files: [new AttachmentBuilder(result.filePath, { name: 'bytebeat.mp4' })],
+      files: [new AttachmentBuilder(result.filePath, { name: 'bytebeat.wav' })],
     });
   } catch (e) {
     await message.reply(
@@ -204,7 +203,7 @@ export async function handleBytebeatInteraction(
   try {
     await interaction.editReply({
       content: `🎵 **Bytebeat:** \`${formula}\``,
-      files: [new AttachmentBuilder(result.filePath, { name: 'bytebeat.mp4' })],
+      files: [new AttachmentBuilder(result.filePath, { name: 'bytebeat.wav' })],
     });
   } catch (e) {
     await interaction.editReply(
