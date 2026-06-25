@@ -5939,6 +5939,14 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v4.6",
+        "date": "2026-06-25",
+        "heavy": [
+            "**Tag script engines fixed** — TypeScript bot was logging in with the same DISCORD_TOKEN as the Python bot, causing Discord to invalidate the Python bot's session on every restart. Fixed by moving the TS bot to DISCORD_TOKEN_TS so both can coexist without kicking each other out.",
+        ],
+        "fun": [],
+    },
+    {
         "version": "v4.5",
         "date": "2026-06-25",
         "heavy": [
