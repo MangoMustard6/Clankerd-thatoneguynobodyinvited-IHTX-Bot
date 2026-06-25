@@ -3911,7 +3911,7 @@ async def preview1280_640x360resize_command(ctx: commands.Context, start: float 
         out_filename = f"p1280_640x360_{Path(attachment.filename).stem}.mp4"
         try:
             embed_p1280r = discord.Embed(
-                title="Preview 1280 (640×360 output) — FFmpeg command originally by `MWTVE7691`:",
+                title="Preview 1280 (640×360 output) — FFmpeg command originally by `yodelaiihiiho`:",
                 description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
                 color=11578404,
             )
