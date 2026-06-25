@@ -136,7 +136,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -3051,6 +3051,7 @@ def _run_preview1280(
     output_path: str,
     start_offset: float = 1.85,
     segment_dur: float = 0.85,
+    force_output_size: tuple[int, int] | None = None,
 ) -> tuple[bool, str]:
     """Run the preview1280 TV-simulator montage pipeline.
 
@@ -3239,11 +3240,11 @@ def _run_preview1280(
             return False, "No segments were produced."
 
         concat_str = "|".join(avi_files)
-        concat_out = os.path.join(tmpdir, "concat.avi")
+        out_w, out_h = force_output_size if force_output_size else (w, h)
         cmd = [
             "ffmpeg", "-y",
             "-i", f"concat:{concat_str}",
-            "-vf", f"scale={w}:{h},setsar=1",
+            "-vf", f"scale={out_w}:{out_h},setsar=1",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
@@ -3830,6 +3831,98 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
+@bot.command(name="preview1280with640x360resize", aliases=["p1280ff!3", "p1280w16:9r"])
+async def preview1280_640x360resize_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
+    """Same 12-segment TV-simulator montage as preview1280 but output is locked to 640x360.
+
+    Usage: t!preview1280with640x360resize [start_offset] [segment_duration]
+    Aliases: t!p1280ff!3, t!p1280w16:9r
+    Default: start=1.85, duration=0.85
+    """
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "**IHTX Preview1280 (640×360 output)**\n"
+            "Attach a video and use `t!preview1280with640x360resize [start] [duration]`.\n\n"
+            "Same 12-segment TV-simulator montage pipeline as `t!preview1280`, "
+            "but the final output is always rescaled to **640×360** regardless of input resolution.\n\n"
+            "Defaults: start=1.85s, duration=0.85s per segment.\n"
+            "Aliases: `t!p1280ff!3`, `t!p1280w16:9r`\n"
+            "Example: `t!p1280w16:9r 2.0 1.0`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"Preview1280w16:9r requires a video file. Got `{suffix}`.")
+        return
+
+    start = max(0.0, start)
+    duration = max(0.1, min(duration, 10.0))
+
+    status_msg = await ctx.reply(
+        f"⚙️ Creating **preview1280 (640×360)** montage (start={start}s, dur={duration}s)... this will take a while."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_p1280_resized.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        try:
+            await _ensure_displacement_map(tmpdir)
+        except FileNotFoundError as e:
+            await status_msg.edit(content=f"❌ {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_preview1280, input_path, output_path, start, duration, (640, 360)
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ Preview1280 (640×360) failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try shorter segments.")
+            return
+
+        out_filename = f"p1280_640x360_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed_p1280r = discord.Embed(
+                title="Preview 1280 (640×360 output) — FFmpeg command originally by `MWTVE7691`:",
+                description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
+                color=11578404,
+            )
+            embed_p1280r.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
+            await ctx.reply(
+                embed=embed_p1280r,
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
 _MULTIPITCH_AUDIO_EXTS = {
@@ -5677,6 +5770,11 @@ _HELP_ENTRIES: list[dict] = [
     },
     {
         "cat": "heavy",
+        "name": "t!preview1280with640x360resize [start] [dur]  (aliases: p1280ff!3, p1280w16:9r)",
+        "value": "Same 12-segment TV-simulator montage as preview1280 but the final output is locked to **640×360** regardless of input resolution. Defaults: start=1.85, dur=0.85",
+    },
+    {
+        "cat": "heavy",
         "name": "t!invlum [n]",
         "value": "Apply luma-inversion progressively N times and concat all iterations.",
     },
@@ -5938,6 +6036,14 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v4.7",
+        "date": "2026-06-25",
+        "heavy": [
+            "**t!preview1280with640x360resize** (aliases: `p1280ff!3`, `p1280w16:9r`) — Same 12-segment TV-simulator montage pipeline as `t!preview1280` but the final output is always locked to **640×360** regardless of input resolution. Implemented by passing `force_output_size=(640,360)` to `_run_preview1280`.",
+        ],
+        "fun": [],
+    },
     {
         "version": "v4.6",
         "date": "2026-06-25",
