@@ -1540,6 +1540,7 @@ PIPE_EFFECT_NAMES = {
     "sierpinskiransomware",
     "preview1280", "scale1280",
     "earthquake", "nbfx",
+    "ssmp", "soundstretchmultipitch",
     "folkvalley", "fv",
     "vocoder", "ilvocodex", "orangevocoder", "4ormulator", "audacity",
 }
@@ -1870,6 +1871,14 @@ def _apply_pipe_effects(
             # Rubber Band R3 multipitch
             if name in ("multipitch", "mp", "multi"):
                 ok, err = _run_multipitch_rb3(current, out, params)
+                if not ok:
+                    return False, err
+                current = out
+                continue
+
+            # SoundTouch soundstretch multipitch
+            if name in ("ssmp", "soundstretchmultipitch"):
+                ok, err = _run_soundstretch_multipitch(current, out, params)
                 if not ok:
                     return False, err
                 current = out
@@ -2686,6 +2695,131 @@ def _run_multipitch_rb3(
 
 # Keep the old name as an alias so legacy pipe-effect calls still resolve
 _run_multipitch = _run_multipitch_rb3
+
+
+def _run_soundstretch_multipitch(
+    input_path: str,
+    output_path: str,
+    pitch_values: list[str],
+) -> tuple[bool, str]:
+    """Multi-voice pitch shift using SoundTouch soundstretch + FFmpeg amix.
+
+    Pipeline:
+      1. Validate & deduplicate semitone values.
+      2. Extract 16-bit PCM WAV audio from the input.
+      3. Run `soundstretch in.wav voice_N.wav -pitch=N` for each voice.
+      4. Mix all voices via FFmpeg amix (normalize=0).
+      5. Remux over the original video stream (or emit audio-only).
+    """
+    # ── 1. Flatten & parse pitch values ──────────────────────────────────────
+    flattened: list[str] = []
+    for pv in pitch_values:
+        flattened.extend(v.strip() for v in re.split(r"[;|,\s]+", pv) if v.strip())
+
+    if not flattened:
+        return False, "❌ No pitch values specified."
+    if len(flattened) > MAX_PITCHES:
+        return False, f"❌ Too many pitch values (maximum: {MAX_PITCHES})."
+
+    semitones: list[float] = []
+    seen: set[float] = set()
+    for raw in flattened:
+        try:
+            val = float(raw)
+            if not math.isfinite(val):
+                raise ValueError
+        except ValueError:
+            return False, f"❌ Invalid pitch value: {raw!r} — must be a finite number in semitones."
+        if val not in seen:
+            seen.add(val)
+            semitones.append(val)
+
+    # ── 2. Locate soundstretch binary ─────────────────────────────────────────
+    ss_bin = shutil.which("soundstretch")
+    if not ss_bin:
+        return False, "❌ soundstretch binary not found (soundtouch package required)."
+
+    # ── 3. Probe input ────────────────────────────────────────────────────────
+    has_video = bool(_ffprobe(
+        input_path,
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=nw=1:nk=1",
+    ).strip())
+
+    actual_dur = _ffprobe_duration(input_path)
+    cap = str(int(min(actual_dur, MAX_DURATION)) + 1) if actual_dur > 0 else str(MAX_DURATION)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # ── 4. Extract 16-bit PCM WAV ─────────────────────────────────────────
+        base_wav = os.path.join(tmpdir, "base.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y",
+            "-t", cap, "-i", input_path,
+            "-vn", "-ar", "44100", "-ac", "2",
+            "-c:a", "pcm_s16le",
+            "-t", cap,
+            base_wav,
+        ], timeout=120)
+        if not ok:
+            return False, f"Audio extraction failed: {err}"
+
+        # ── 5. soundstretch per voice ─────────────────────────────────────────
+        voice_wavs: list[str] = []
+        for idx, st in enumerate(semitones):
+            v_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
+            result = subprocess.run(
+                [ss_bin, base_wav, v_wav, f"-pitch={st:.4f}"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                return False, (
+                    f"❌ soundstretch failed (voice {idx}, pitch {st:+.1f} st): "
+                    f"{(result.stderr or result.stdout)[-600:]}"
+                )
+            voice_wavs.append(v_wav)
+
+        # ── 6. Mix voices ─────────────────────────────────────────────────────
+        if len(voice_wavs) == 1:
+            out_wav = voice_wavs[0]
+        else:
+            out_wav = os.path.join(tmpdir, "mixed.wav")
+            mix_cmd = ["ffmpeg", "-y"]
+            for vw in voice_wavs:
+                mix_cmd += ["-i", vw]
+            mix_cmd += [
+                "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+                "-c:a", "pcm_s16le",
+                out_wav,
+            ]
+            ok_mix, err_mix = _run_ffmpeg_raw(mix_cmd, timeout=180)
+            if not ok_mix:
+                return False, f"❌ amix failed: {err_mix}"
+
+        # ── 7. Remux with video (or audio-only) ───────────────────────────────
+        dur_flag = str(round(actual_dur, 6)) if actual_dur > 0 else cap
+        if has_video:
+            ok, err = _run_ffmpeg_raw([
+                "ffmpeg", "-y",
+                "-t", cap, "-i", input_path,
+                "-i", out_wav,
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "pcm_s24le",
+                "-t", dur_flag,
+                output_path,
+            ], timeout=300)
+        else:
+            ok, err = _run_ffmpeg_raw([
+                "ffmpeg", "-y",
+                "-i", out_wav,
+                "-c:a", "aac", "-b:a", "192k",
+                output_path,
+            ], timeout=180)
+
+        if not ok:
+            return False, f"Remux failed: {err}"
+
+    return True, ""
 
 
 
@@ -3829,6 +3963,130 @@ async def multipitch_command(ctx: commands.Context, *, args: str = ""):
         try:
             await ctx.reply(
                 content=f"✅ **IHTX multipitch** ({pitch_str}) applied!",
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
+@bot.command(name="soundstretchmultipitch", aliases=["ssmp"])
+async def soundstretchmultipitch_command(ctx: commands.Context, *, args: str = ""):
+    """Apply multi-voice pitch shifting using SoundTouch soundstretch.
+
+    Usage:
+      t!ssmp -7;12;19          — semicolon-separated semitone values
+      t!ssmp -7|12|19          — pipe-separated also accepted
+      t!soundstretchmultipitch -3;5   — full name
+
+    Each value creates a separately pitched voice via soundstretch;
+    all voices are mixed together with FFmpeg amix (normalize=0).
+    Works on video and audio files. Video stream is preserved unchanged.
+    Uses the SoundTouch algorithm (different character from Rubber Band).
+
+    Example: t!ssmp -7;12;19
+    """
+    if not args:
+        await ctx.reply(
+            "**IHTX SoundStretch Multipitch** — SoundTouch algorithm\n"
+            "Attach a video or audio file and provide semicolon-separated semitone values.\n\n"
+            "Each value creates a pitched voice via soundstretch; all voices are mixed together.\n\n"
+            "Example: `t!ssmp -7;12;19`\n"
+            "Pipe syntax also works: `t!ssmp -7|12|19`\n"
+            f"Max pitches: {_MULTIPITCH_MAX}"
+        )
+        return
+
+    raw = args.strip()
+    if ";" in raw:
+        pitch_values = [v.strip() for v in raw.split(";") if v.strip()]
+    elif "|" in raw:
+        pitch_values = [v.strip() for v in raw.split("|") if v.strip()]
+    else:
+        pitch_values = [raw] if raw else []
+
+    if not pitch_values:
+        await ctx.reply("No pitch values provided. Example: `t!ssmp -7;12;19`")
+        return
+
+    if len(pitch_values) > _MULTIPITCH_MAX:
+        await ctx.reply(f"Too many pitches (max {_MULTIPITCH_MAX}). Got {len(pitch_values)}.")
+        return
+
+    for pv in pitch_values:
+        try:
+            val = float(pv)
+            if not math.isfinite(val):
+                raise ValueError
+        except ValueError:
+            await ctx.reply(f"❌ Invalid pitch value: `{pv}` — must be a finite number in semitones.")
+            return
+
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "Attach a video or audio file and provide pitch values.\n"
+            "Example: `t!ssmp -7;12;19`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in _MULTIPITCH_AUDIO_EXTS:
+        await ctx.reply(
+            f"Unsupported file type `{suffix}`.\n"
+            f"Supported: video (mp4, mov, avi, mkv, webm, gif) or audio (wav, mp3, flac, ogg, aac, m4a, opus)."
+        )
+        return
+
+    pitch_str = ";".join(pitch_values)
+    status_msg = await ctx.reply(
+        f"⚙️ Applying **soundstretch multipitch** ({pitch_str}) via SoundTouch… this may take a moment."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_ssmp.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_soundstretch_multipitch,
+            input_path, output_path, pitch_values
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ SoundStretch multipitch failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
+            return
+
+        safe_pitch_str = pitch_str.replace(";", "_")
+        out_filename = f"ssmp_{safe_pitch_str}_{Path(attachment.filename).stem}.mp4"
+        try:
+            await ctx.reply(
+                content=f"✅ **SoundStretch multipitch** ({pitch_str}) applied!",
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -5684,6 +5942,7 @@ _UPDATELOG: list[dict] = [
         "version": "v4.5",
         "date": "2026-06-25",
         "heavy": [
+            "**t!ssmp / t!soundstretchmultipitch** — New standalone command + pipe effect (ssmp): multi-voice pitch shifting using SoundTouch soundstretch. Semicolon/pipe-separated semitones; each voice runs soundstretch -pitch=N, all voices mixed via FFmpeg amix normalize=0. Different algorithm/character from Rubber Band multipitch.",
             "**t!ihtx earthquake / t!ihtx nbfx** — New pipe effect: 2-pass vidstab destabilize shake. Downloads NBFX shake sample, generates .trf via vidstabdetect (matched to input FPS/dimensions/duration), then applies inverted vidstabtransform for a chaotic earthquake look.",
             "**t!ihtx preview1280=start|dur** — Full TV-simulator montage pipeline usable as a pipe step. Calls _run_preview1280 directly; params: start offset (default 1.85) and segment duration (default 0.85). Example: t!ihtx 10 6.8 - mp4 preview1280=0|0.85",
             "**t!ihtx scale1280[=width]** — Simple pipe effect: scale to 1280 px wide (aspect-preserving, scale=W:-2). Optional custom width. Usable in chains: t!ihtx negate,scale1280.",
