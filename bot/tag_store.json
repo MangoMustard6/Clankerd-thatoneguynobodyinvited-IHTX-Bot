@@ -34,14 +34,14 @@
       },
       "test": {
         "name": "test",
-        "content": "{iscript:load {iv} f\nhueshifthsv f 180}",
+        "content": "{iscript:load {iv} f\ndeepfry f}",
         "owner_id": 1355759019330895973,
         "created_at": "2026-06-20T01:58:18.303600+00:00",
-        "uses": 3,
+        "uses": 4,
         "aliases": [],
         "allowed_roles": [],
         "denied_users": [],
-        "edited_at": "2026-06-25T09:24:50.614989+00:00"
+        "edited_at": "2026-06-25T09:53:19.391093+00:00"
       },
       "braxtons_gm105oldp": {
         "name": "braxtons_gm105oldp",
