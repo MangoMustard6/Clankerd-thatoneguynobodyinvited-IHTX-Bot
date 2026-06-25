@@ -5944,6 +5944,7 @@ _UPDATELOG: list[dict] = [
         "heavy": [
             "**Tag script engines fixed** — TypeScript bot was logging in with the same DISCORD_TOKEN as the Python bot, causing Discord to invalidate the Python bot's session on every restart. Fixed by moving the TS bot to DISCORD_TOKEN_TS so both can coexist without kicking each other out.",
             "**{iv} and {ia} built-in tag variables** — Tags can now use `{iv}` (input video URL) and `{ia}` (input attachment URL) to reference a video/image attached to the invoking message or the message being replied to. Previously `{iv}` was undefined and resolved to empty string, causing `iscript load` to fail with 'iscript only accepts http/https URLs'.",
+            "**iscript rewritten — named variable system + NotSoBot-style ops** — iscript now supports NotSoBot-compatible syntax: `load URL varname`, `hueshifthsv f 180`, `caption f text`, `impact f top|bottom`, `deepfry f`, `spin f frames fps`, `mirror f left`, `edges/emboss/charcoal/oil/solarize/posterize/vignette`, `jpeg f quality`, `saturate f 2.0`, `colorize f R,G,B`. Old positional syntax (no var name) still works.",
         ],
         "fun": [],
     },
