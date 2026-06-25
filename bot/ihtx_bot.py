@@ -136,7 +136,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 10
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -3336,209 +3336,6 @@ async def on_ready():
     print("Bot ready. Run t!syncslash to register slash (/) commands.")
 
 
-@bot.command(name="ihtx", aliases=["effect", "destroy"])
-async def ihtx_command(ctx: commands.Context, *, args: str = "chaos"):
-    """HEAVY COMMAND: replicates ihtx from FFmpeg.
-
-    Apply an IHTX FFmpeg effect to an attached video or image.
-
-    Usage:
-      t!ihtx [preset]                  — use a built-in preset (chaos, glitch, etc.)
-      t!ihtx <exports> <duration> <no_trim> <export_fmt> <pipe effects>   — custom TagScript workflow
-    """
-    attachment = None
-    # Parse arguments: preset name or TagScript-style custom icf+ workflow.
-    parts = args.split()
-    first = parts[0].lower() if parts else "chaos"
-
-    is_preset = first in VISUAL_PRESETS and len(parts) == 1
-    custom_args = None if is_preset else _parse_ihtx_custom_args(args)
-
-    if is_preset:
-        preset = first
-    elif custom_args is None:
-        preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
-        await ctx.reply(
-            f"Unknown preset or invalid custom IHTX syntax. Available presets: {preset_list}\n"
-            f"Custom syntax: `t!ihtx <exports> <duration> <no_trim> <export_fmt> <pipe effects>`\n"
-            f"Example: `t!ihtx 10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`\n"
-            f"Use `t!ihtxhelp` for full usage."
-        )
-        return
-
-    # Resolve attachment: slash commands pass it as a parameter;
-    # prefix commands need us to look at the message or referenced message.
-    if attachment is None:
-        if ctx.message and ctx.message.attachments:
-            attachment = ctx.message.attachments[0]
-        elif ctx.message and ctx.message.reference:
-            try:
-                ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-                if ref.attachments:
-                    attachment = ref.attachments[0]
-            except Exception:
-                pass
-
-    if not attachment:
-        preset_list = ", ".join(f"`{p}`" for p in sorted(VISUAL_PRESETS))
-        await ctx.reply(
-            f"**I HATE THE X — IHTX Bot**\n"
-            f"Attach a video or image and use `t!ihtx [preset]` or the custom IHTX syntax.\n\n"
-            f"**Presets:** {preset_list}\n\n"
-            f"**Custom IHTX:** `t!ihtx 10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`\n"
-            f"Use `t!ihtxhelp` for full usage.\n\n"
-            f"Examples:\n"
-            f"`t!ihtx chaos`\n"
-            f"`t!ihtx glitch`\n"
-            f"`t!ihtx 10 0.5 - mp4 huehsv 0.5;negate;multipitch=25|5|8.5`\n"
-            f"`t!ihtx 5 0.25 - mp4 multipitch=1|2|3|4`"
-        )
-        return
-
-    if attachment.size > MAX_FILE_SIZE:
-        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
-        return
-
-    suffix = Path(attachment.filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        await ctx.reply(f"Unsupported file type `{suffix}`. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-        return
-
-    is_video = suffix in VIDEO_EXTENSIONS
-    out_ext = get_output_ext(suffix, is_video)
-    if is_preset:
-        _preset_out_ext = PRESET_FILTERS.get(preset, {}).get("output_ext")
-        if _preset_out_ext:
-            out_ext = _preset_out_ext
-
-    # Build status label
-    if is_preset:
-        _status_label = f"`{preset}`"
-        status_msg = await ctx.reply(f"⏳ Processing {_status_label}…")
-    else:
-        _tmp_effects_label = _pipe_effects_label(custom_args[4])
-        _tmp_reps = custom_args[0]
-        _reps_str = f"×{_tmp_reps}" if abs(_tmp_reps) > 1 else ""
-        status_msg = await ctx.reply(
-            f"⏳ Processing your IHTX using pipe effects: `{_tmp_effects_label}`{_reps_str}"
-        )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, f"output{out_ext}")
-
-        try:
-            await download_attachment(attachment, input_path)
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
-            return
-
-        loop = asyncio.get_event_loop()
-
-        if is_preset:
-            ok, err = await loop.run_in_executor(
-                None, run_ffmpeg, input_path, output_path, preset, is_video
-            )
-        else:
-            # Custom IHTX follows the TagScript icf+ shell workflow and only supports video.
-            if not is_video:
-                await status_msg.edit(content="❌ Custom IHTX workflow requires video input (not images/GIFs).")
-                return
-            exports, duration_expr, no_trim, export_format, pipe_effects = custom_args
-            output_path = os.path.join(tmpdir, "output.mp4")
-            ok, err = await loop.run_in_executor(
-                None, _run_ihtx_tagscript_workflow,
-                input_path, output_path, exports, duration_expr, no_trim,
-                export_format, pipe_effects
-            )
-
-        if not ok:
-            await status_msg.edit(content=f"❌ FFmpeg failed:\n```\n{err[-1500:]}\n```")
-            return
-
-        await status_msg.edit(content="⌛ Done!")
-
-        out_size = os.path.getsize(output_path)
-        if out_size > MAX_FILE_SIZE:
-            await status_msg.edit(content="⬆️ Output too large for Discord — uploading to Catbox…")
-            _cb_url = await _upload_to_catbox(output_path)
-            if _cb_url:
-                _size_str_cb = f"{out_size / (1024 * 1024):.2f} MB"
-                embed_cb = discord.Embed(
-                    title="IHTX Bot - The IHTX command:",
-                    description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
-                    color=11578404,
-                )
-                embed_cb.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
-                embed_cb.add_field(name="File Size", value=_size_str_cb, inline=True)
-                embed_cb.add_field(name="Catbox", value=f"[Download]({_cb_url})\n{_cb_url}", inline=False)
-                await ctx.reply(embed=embed_cb)
-                await status_msg.delete()
-            else:
-                await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed. Try a shorter clip.")
-            return
-
-        # Store last export for lexg
-        if is_preset:
-            _last_exports[ctx.author.id] = {
-                "type": "preset",
-                "preset": preset,
-                "label": preset,
-            }
-            out_filename = f"ihtx_{preset}_{Path(attachment.filename).stem}{out_ext}"
-        else:
-            _last_exports[ctx.author.id] = {
-                "type": "custom",
-                "exports": str(exports),
-                "duration": duration_expr,
-                "no_trim": no_trim,
-                "export_format": export_format,
-                "pipe_effects": pipe_effects,
-                "label": "custom",
-            }
-            out_filename = f"ihtx_custom_{Path(attachment.filename).stem}.mp4"
-
-        # Probe output file for embed metadata
-        try:
-            _vinfo = _ffprobe_video_info(output_path)
-            _w, _h = int(_vinfo["width"]), int(_vinfo["height"])
-            _fr_raw = _vinfo.get("r_frame_rate", "")
-            try:
-                _fn, _fd = _fr_raw.split("/")
-                _fps_val = float(_fn) / float(_fd)
-                _fps_str = f"{_fps_val:.3f}".rstrip("0").rstrip(".") + " fps"
-            except Exception:
-                _fps_str = "N/A"
-            if _w > 0 and _h > 0:
-                _gcd = math.gcd(_w, _h)
-                _ar_str = f"{_w // _gcd}:{_h // _gcd}"
-                _res_str = f"{_w}×{_h}"
-            else:
-                _ar_str = _res_str = "N/A"
-            _size_mb = out_size / (1024 * 1024)
-            _size_str = f"{_size_mb:.2f} MB"
-        except Exception:
-            _res_str = _ar_str = _fps_str = "N/A"
-            _size_str = f"{out_size / (1024 * 1024):.2f} MB"
-
-        try:
-            embed = discord.Embed(
-                title="IHTX Bot - The IHTX command:",
-                description="use whatever sync to audio tag you want, I highly recommend notsobot's tag system (.t sync+)",
-                color=11578404,
-            )
-            embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
-            embed.add_field(name="Resolution", value=_res_str, inline=True)
-            embed.add_field(name="Aspect Ratio", value=_ar_str, inline=True)
-            embed.add_field(name="FPS", value=_fps_str, inline=True)
-            embed.add_field(name="File Size", value=_size_str, inline=True)
-            await ctx.reply(
-                embed=embed,
-                file=discord.File(output_path, filename=out_filename),
-            )
-            await status_msg.delete()
-        except discord.HTTPException as e:
-            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 
 def _run_ihtxcustom_workflow(
@@ -6036,6 +5833,14 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v4.8",
+        "date": "2026-06-25",
+        "heavy": [
+            "**t!ihtx → hybrid command `/ihtxgen`** — Converted `t!ihtx` from a plain prefix command to a hybrid command (slash name: `/ihtxgen`, prefix aliases: `t!ihtx`, `t!effect`, `t!destroy`). Slash params: `effect` (preset/full-syntax), `duration`, `repetitions`, `no_trim`, `export_fmt`, `attachment`, `url`. Live embed feedback with ⚙️/✅/❌ states. The old monolithic `ihtx_command` function was removed; the full implementation now lives in `EconomyCog.ihtxgen`. Run `t!syncslash` to register `/ihtxgen` globally.",
+        ],
+        "fun": [],
+    },
     {
         "version": "v4.7",
         "date": "2026-06-25",
