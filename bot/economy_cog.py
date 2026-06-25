@@ -359,6 +359,7 @@ class EconomyCog(commands.Cog, name="Economy"):
 
     @commands.hybrid_command(
         name="ihtxgen",
+        aliases=["ihtx", "effect", "destroy"],
         description="Run an IHTX FFmpeg effect on media with live embed feedback.",
     )
     @app_commands.describe(
