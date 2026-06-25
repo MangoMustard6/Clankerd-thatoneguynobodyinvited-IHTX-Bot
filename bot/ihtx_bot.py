@@ -1741,7 +1741,7 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
                 f"crop=iw/2:ih/2,"
                 f"format=yuv420p"
             )
-    if name in ("preview1280", "scale1280"):
+    if name == "scale1280":
         width = params[0] if params else "1280"
         try:
             int(width)
@@ -2119,6 +2119,23 @@ def _apply_pipe_effects(
                     )
                     if not ok:
                         return False, f"wave failed: {err}"
+                current = out
+                continue
+
+            # preview1280 — full TV-simulator montage pipeline as a pipe step
+            if name == "preview1280":
+                def _pp1280(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                ok, err = _run_preview1280(
+                    current, out,
+                    start_offset=_pp1280(0, 1.85),
+                    segment_dur=_pp1280(1, 0.85),
+                )
+                if not ok:
+                    return False, f"preview1280 pipe failed: {err}"
                 current = out
                 continue
 
@@ -5668,7 +5685,8 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-25",
         "heavy": [
             "**t!ihtx earthquake / t!ihtx nbfx** — New pipe effect: 2-pass vidstab destabilize shake. Downloads NBFX shake sample, generates .trf via vidstabdetect (matched to input FPS/dimensions/duration), then applies inverted vidstabtransform for a chaotic earthquake look.",
-            "**t!ihtx preview1280 / scale1280** — New pipe effect: scales to 1280 px wide (aspect-preserving, scale=W:-2). Optional width param: preview1280=1920. Usable in chains: t!ihtx negate,preview1280.",
+            "**t!ihtx preview1280=start|dur** — Full TV-simulator montage pipeline usable as a pipe step. Calls _run_preview1280 directly; params: start offset (default 1.85) and segment duration (default 0.85). Example: t!ihtx 10 6.8 - mp4 preview1280=0|0.85",
+            "**t!ihtx scale1280[=width]** — Simple pipe effect: scale to 1280 px wide (aspect-preserving, scale=W:-2). Optional custom width. Usable in chains: t!ihtx negate,scale1280.",
             "**t!ihtx sierpinskiransomware** — Fixed broken filter: amix=4 → amix=inputs=4, alimiter=2:latency=1 → alimiter=level_in=2:latency=1, highpass=40 → highpass=f=40 (modern FFmpeg syntax).",
         ],
         "fun": [],
