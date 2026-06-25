@@ -1543,6 +1543,8 @@ PIPE_EFFECT_NAMES = {
     "ssmp", "soundstretchmultipitch",
     "folkvalley", "fv",
     "vocoder", "ilvocodex", "orangevocoder", "4ormulator", "audacity",
+    "alimiter",
+    "freakzinga", "fzgm156",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1802,6 +1804,17 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         return f"vibrato=f={freq}:d={depth}"
     if name == "areverse":
         return "areverse"
+    if name == "alimiter":
+        level_in = params[0] if len(params) > 0 else "1"
+        limit    = params[1] if len(params) > 1 else "1"
+        attack   = params[2] if len(params) > 2 else "5"
+        release  = params[3] if len(params) > 3 else "50"
+        try:
+            latency = int(float(params[4])) if len(params) > 4 else 1
+        except (ValueError, TypeError):
+            latency = 1
+        latency = max(0, min(latency, 1))
+        return f"alimiter=level_in={level_in}:limit={limit}:attack={attack}:release={release}:latency={latency}"
     if name == "channelblend":
         r = params[0] if len(params) > 0 else "r"
         g = params[1] if len(params) > 1 else "g"
@@ -2013,7 +2026,7 @@ def _apply_pipe_effects(
                 continue
 
             # Named audio filters — rendered immediately
-            if name in ("volume", "vibrato", "areverse"):
+            if name in ("volume", "vibrato", "areverse", "alimiter"):
                 af = _build_ffmpeg_pipe_vf(name, params)
                 if af:
                     # pcm_s16le is lossless but requires a container that supports it.
@@ -2323,6 +2336,124 @@ def _apply_pipe_effects(
                 ok, err = _run_vocoder(current, out, carrier_url=_vc_url, mode=_vc_mode, bandwidth=_vc_bw)
                 if not ok:
                     return False, f"vocoder failed: {err}"
+                current = out
+                continue
+
+            # freakzinga g major 156 — palindrome video + dual-voice pitch shift + bass mix
+            if name in ("freakzinga", "fzgm156"):
+                if not _ensure_multipitch_bin():
+                    return False, "fzgm156: multipitch binary unavailable — download failed."
+
+                def _fzp(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+
+                sr_val = int(_fzp(0, 44100))
+
+                # Probe input duration
+                try:
+                    _fz_dur, _ = _probe_video_info(current)
+                except Exception:
+                    _fz_dur = 0.0
+                if _fz_dur <= 0.0:
+                    return False, "fzgm156: could not probe input duration."
+
+                trim_s = _fz_dur * 0.5
+
+                # Step 1: generate Hald CLUT with ImageMagick
+                hald_ppm = os.path.join(tmpdir, f"fzgm156_hsv_{i}.ppm")
+                try:
+                    subprocess.run(
+                        [
+                            "magick", "hald:6",
+                            "-define", "modulate:colorspace=hsl",
+                            "-modulate", "100,100,200",
+                            hald_ppm,
+                        ],
+                        check=True, capture_output=True, timeout=30,
+                    )
+                except Exception as _hald_err:
+                    return False, f"fzgm156: Hald CLUT generation failed: {_hald_err}"
+
+                # Step 2: palindrome video — forward half + reversed half concatenated,
+                # with haldclut and slight hue/blue-channel boost
+                vid_step = os.path.join(tmpdir, f"fzgm156_vid_{i}.mkv")
+                fz_vf = (
+                    f"movie={hald_ppm},[in]haldclut,hue=b=.045,format=yuv444p[bruh];"
+                    f"[bruh]split=2[invcol][invcol2];"
+                    f"[invcol]trim=0:{trim_s:.6f},format=rgb24,shuffleplanes=0:2:1,format=yuv420p[first_s];"
+                    f"[invcol2]reverse,trim=0:{trim_s:.6f},format=yuv420p[second_s];"
+                    f"[first_s][second_s]concat=2:1:0,format=yuv420p"
+                )
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-filter_complex", fz_vf,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "1",
+                    "-c:a", "pcm_s16le",
+                    vid_step,
+                ], timeout=300)
+                if not ok:
+                    return False, f"fzgm156: palindrome video step failed: {err}"
+
+                # Step 3: extract downsampled audio (halved sample rate)
+                audio_down = os.path.join(tmpdir, f"fzgm156_h_{i}.wav")
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", vid_step,
+                    "-af", f"asetrate={sr_val // 2}",
+                    audio_down,
+                ], timeout=120)
+                if not ok:
+                    return False, f"fzgm156: audio downsample step failed: {err}"
+
+                # Step 4: dual pitch-shift passes with multipitch binary
+                out_pos = os.path.join(tmpdir, f"fzgm156_pos_{i}.wav")
+                out_neg = os.path.join(tmpdir, f"fzgm156_neg_{i}.wav")
+                try:
+                    subprocess.run(
+                        [_MULTIPITCH_BIN, audio_down, out_pos, "0.5,4.5",
+                         "--backend", "signalsmith", "--no-normalize"],
+                        check=True, capture_output=True, timeout=120,
+                    )
+                    subprocess.run(
+                        [_MULTIPITCH_BIN, audio_down, out_neg, "-0.5,-4.5",
+                         "--backend", "signalsmith", "--no-normalize"],
+                        check=True, capture_output=True, timeout=120,
+                    )
+                except Exception as _ps_err:
+                    return False, f"fzgm156: pitch shift failed: {_ps_err}"
+
+                # Step 5: mix — pos forward + neg reversed, both with bass boost, trimmed to half
+                audio_mixed = os.path.join(tmpdir, f"fzgm156_mix_{i}.wav")
+                fz_af = (
+                    f"[0]asetrate={sr_val},bass=g=2.5,atrim=end={trim_s:.6f}[a];"
+                    f"[1]asetrate={sr_val},bass=g=2.5,areverse,atrim=end={trim_s:.6f}[b];"
+                    f"[a][b]concat=n=2:v=0:a=1"
+                )
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", out_pos, "-i", out_neg,
+                    "-filter_complex", fz_af,
+                    audio_mixed,
+                ], timeout=120)
+                if not ok:
+                    return False, f"fzgm156: audio mix step failed: {err}"
+
+                # Step 6: remux palindrome video + mixed audio
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", vid_step, "-i", audio_mixed,
+                    "-map", "0:v", "-map", "1:a",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "pcm_s16le",
+                    out,
+                ], timeout=300)
+                if not ok:
+                    return False, f"fzgm156: remux step failed: {err}"
                 current = out
                 continue
 
@@ -5705,6 +5836,16 @@ _HELP_ENTRIES: list[dict] = [
     },
     # ── Moderation ──
     {
+        "cat": "heavy",
+        "name": "alimiter [level_in] [limit] [attack] [release] [latency]",
+        "value": "Pipe effect — FFmpeg audio limiter. Clamps peaks without clipping. Defaults: level_in=1, limit=1, attack=5ms, release=50ms, latency=1 (1=compensated delay, 0=off). Example: `alimiter 1.5 0.9 3 30 1`",
+    },
+    {
+        "cat": "heavy",
+        "name": "fzgm156 [sr]  (aliases: freakzinga)",
+        "value": "Pipe effect — Freakzinga G Major 156. Creates a video palindrome (forward half + reversed half) with Hald CLUT hue shift and blue boost, then applies dual-voice pitch shifts (+0.5/+4.5 and -0.5/-4.5 semitones) mixed with the second track reversed and bass boosted. Optional sr param sets sample rate (default 44100).",
+    },
+    {
         "cat": "owner",
         "name": "t!ban @user [reason]",
         "value": "Ban a user from the server. Works with mentions, usernames, or user IDs.",
@@ -5869,6 +6010,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.2",
+        "date": "2026-06-25",
+        "heavy": [
+            "**alimiter pipe effect** — FFmpeg `alimiter` audio limiter as a pipe step. Params: `level_in limit attack release latency` (all optional). `latency=1` enables delay compensation (default). Example: `alimiter 1.5 0.9 3 30 1`.",
+            "**fzgm156 / freakzinga pipe effect** — Freakzinga G Major 156 as a pipe step. 6-stage pipeline: (1) Hald:6 CLUT via ImageMagick, (2) haldclut + hue=b=.045 + shuffleplanes RBG swap on forward half → palindrome concat, (3) audio extracted at sr/2, (4) dual multipitch pass (+0.5,+4.5 and -0.5,-4.5 semitones via Signalsmith backend), (5) mix: pos-track forward + neg-track reversed with bass=g=2.5, (6) remux. Optional `sr` param (default 44100).",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.1",
         "date": "2026-06-25",
