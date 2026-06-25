@@ -542,6 +542,46 @@ def parse(content: str, ctx: dict) -> tuple[str, list[dict]]:
     return text, all_blocks
 
 
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".gif"})
+_VIDEO_MIME_PREFIXES = ("video/", "image/gif")
+
+
+def _first_attachment_url(msg) -> str:
+    """Return the URL of the first attachment on a message, or ''."""
+    if msg and msg.attachments:
+        return msg.attachments[0].url
+    return ""
+
+
+def _first_video_url(msg) -> str:
+    """Return the URL of the first video/gif attachment on a message, or ''."""
+    if not msg or not msg.attachments:
+        return ""
+    for att in msg.attachments:
+        # Check MIME type first (most reliable)
+        ct = att.content_type or ""
+        if ct.startswith(_VIDEO_MIME_PREFIXES):
+            return att.url
+        # Fall back to extension check
+        import os
+        ext = os.path.splitext(att.filename)[1].lower()
+        if ext in _VIDEO_EXTS:
+            return att.url
+    # Nothing video-like — return first attachment anyway so the tag can try
+    return msg.attachments[0].url
+
+
+def _resolved_ref(discord_ctx) -> object | None:
+    """Return the resolved referenced (replied-to) message, if any."""
+    ref = getattr(discord_ctx.message, "reference", None)
+    if ref is None:
+        return None
+    resolved = getattr(ref, "resolved", None)
+    if isinstance(resolved, Exception) or resolved is None:
+        return None
+    return resolved
+
+
 def build_context(discord_ctx, args: str) -> dict:
     """Build the variable context dict from a discord.py Context object."""
     user = discord_ctx.author
@@ -552,6 +592,18 @@ def build_context(discord_ctx, args: str) -> dict:
     if hasattr(user, "nick"):
         nick = user.nick
     nickname = nick or user.display_name
+
+    # Resolve media attachment variables: prefer current message, fall back to reply
+    cur_msg = discord_ctx.message
+    ref_msg = _resolved_ref(discord_ctx)
+
+    # {ia} — first attachment URL (any type)
+    ia = _first_attachment_url(cur_msg) or _first_attachment_url(ref_msg)
+    # {iv} — first video/gif attachment URL, then any attachment
+    iv = _first_video_url(cur_msg) or _first_video_url(ref_msg)
+    if not iv:
+        iv = ia  # last resort: use whatever attachment is there
+
     return {
         "user":      user.display_name,
         "username":  user.name,
@@ -567,4 +619,6 @@ def build_context(discord_ctx, args: str) -> dict:
         "channelid": str(channel.id),
         "args":      args,
         "argslen":   str(len(args.split()) if args else 0),
+        "iv":        iv,
+        "ia":        ia,
     }
