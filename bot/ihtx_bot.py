@@ -5943,6 +5943,7 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-25",
         "heavy": [
             "**Tag script engines fixed** — TypeScript bot was logging in with the same DISCORD_TOKEN as the Python bot, causing Discord to invalidate the Python bot's session on every restart. Fixed by moving the TS bot to DISCORD_TOKEN_TS so both can coexist without kicking each other out.",
+            "**{iv} and {ia} built-in tag variables** — Tags can now use `{iv}` (input video URL) and `{ia}` (input attachment URL) to reference a video/image attached to the invoking message or the message being replied to. Previously `{iv}` was undefined and resolved to empty string, causing `iscript load` to fail with 'iscript only accepts http/https URLs'.",
         ],
         "fun": [],
     },
