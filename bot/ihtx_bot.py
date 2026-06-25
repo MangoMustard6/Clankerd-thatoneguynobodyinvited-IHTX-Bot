@@ -575,7 +575,7 @@ PRESET_FILTERS: dict[str, dict] = {
             "[outv1][outv2]hstack[tmp1];"
             "[outv3][outv4]hstack[tmp2];"
             "[tmp1][tmp2]vstack,scale=iw/2:ih/2[outv];"
-            "[outa1][outa2][outa3][outa4]amix=4,alimiter=2:latency=1,highpass=40[outa]"
+            "[outa1][outa2][outa3][outa4]amix=inputs=4,alimiter=level_in=2:latency=1,highpass=f=40[outa]"
         ),
         "maps": ["[outv]", "[outa]"],
         "audio_codec": "flac",
@@ -1538,6 +1538,8 @@ PIPE_EFFECT_NAMES = {
     "tvsim", "tv",
     "swirl",
     "sierpinskiransomware",
+    "preview1280", "scale1280",
+    "earthquake", "nbfx",
     "folkvalley", "fv",
     "vocoder", "ilvocodex", "orangevocoder", "4ormulator", "audacity",
 }
@@ -1739,6 +1741,13 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
                 f"crop=iw/2:ih/2,"
                 f"format=yuv420p"
             )
+    if name in ("preview1280", "scale1280"):
+        width = params[0] if params else "1280"
+        try:
+            int(width)
+        except (ValueError, TypeError):
+            width = "1280"
+        return f"scale={width}:-2"
     if name == "zoom":
         amount = params[0] if params else "1.1"
         zoom_geq = f"p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})"
@@ -2183,6 +2192,66 @@ def _apply_pipe_effects(
                 ok, err = run_ffmpeg(current, out, "sierpinskiransomware", True)
                 if not ok:
                     return False, f"sierpinskiransomware failed: {err}"
+                current = out
+                continue
+
+            # earthquake (nbfx) — 2-pass vidstab destabilize shake effect
+            if name in ("earthquake", "nbfx"):
+                _EARTHQUAKE_SAMPLE = "https://file.garden/aTXso15ukD3mnuPI/nbfx_earthquake.mp4"
+
+                # Probe dimensions (duration/fps via existing helper)
+                _eq_dur, _eq_fps = _probe_video_info(current)
+                _eq_dur = min(_eq_dur, 30.0)
+                _eq_fr = str(round(_eq_fps)) if _eq_fps else "30"
+                try:
+                    _dim_r = subprocess.run(
+                        [
+                            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height",
+                            "-of", "csv=s=x:p=0", current,
+                        ],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    _dims = _dim_r.stdout.strip().split("x")
+                    _eq_w, _eq_h = int(_dims[0]), int(_dims[1])
+                except Exception:
+                    _eq_w, _eq_h = 1920, 1080
+
+                _trf_path = os.path.join(tmpdir, f"eq_{i}.trf")
+
+                # Pass 1: vidstabdetect on the shake sample, matched to input specs
+                _eq_pass1 = [
+                    "ffmpeg", "-y",
+                    "-stream_loop", "-1",
+                    "-i", _EARTHQUAKE_SAMPLE,
+                    "-vf", (
+                        f"fps={_eq_fr},scale={_eq_w}:{_eq_h},setsar=1:1,"
+                        f"vidstabdetect=shakiness=10:accuracy=1:mincontrast=0:show=0:result={_trf_path}"
+                    ),
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-t", str(_eq_dur),
+                    "-f", "null", "-",
+                ]
+                ok, err = _run_ffmpeg_raw(_eq_pass1, timeout=180)
+                if not ok:
+                    return False, f"earthquake (pass 1 — vidstabdetect) failed: {err}"
+
+                # Pass 2: apply inverted stabilization (destabilize = shake)
+                _eq_pass2 = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-vf", (
+                        f"format=yuv444p,"
+                        f"vidstabtransform=input={_trf_path}:optalgo=avg:optzoom=0:zoom=15:invert=1,"
+                        f"scale=iw:ih,format=yuv420p"
+                    ),
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "copy",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(_eq_pass2, timeout=180)
+                if not ok:
+                    return False, f"earthquake (pass 2 — vidstabtransform) failed: {err}"
                 current = out
                 continue
 
@@ -5594,6 +5663,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v4.5",
+        "date": "2026-06-25",
+        "heavy": [
+            "**t!ihtx earthquake / t!ihtx nbfx** — New pipe effect: 2-pass vidstab destabilize shake. Downloads NBFX shake sample, generates .trf via vidstabdetect (matched to input FPS/dimensions/duration), then applies inverted vidstabtransform for a chaotic earthquake look.",
+            "**t!ihtx preview1280 / scale1280** — New pipe effect: scales to 1280 px wide (aspect-preserving, scale=W:-2). Optional width param: preview1280=1920. Usable in chains: t!ihtx negate,preview1280.",
+            "**t!ihtx sierpinskiransomware** — Fixed broken filter: amix=4 → amix=inputs=4, alimiter=2:latency=1 → alimiter=level_in=2:latency=1, highpass=40 → highpass=f=40 (modern FFmpeg syntax).",
+        ],
+        "fun": [],
+    },
     {
         "version": "v4.4",
         "date": "2026-06-23",
