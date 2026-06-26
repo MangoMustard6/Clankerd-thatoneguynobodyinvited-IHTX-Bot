@@ -359,7 +359,6 @@ class EconomyCog(commands.Cog, name="Economy"):
 
     @commands.hybrid_command(
         name="ihtxgen",
-        aliases=["ihtx", "effect", "destroy"],
         description="Run an IHTX FFmpeg effect on media with live embed feedback.",
     )
     @app_commands.describe(
@@ -386,21 +385,6 @@ class EconomyCog(commands.Cog, name="Economy"):
         export_fmt: str = "mp4",
     ) -> None:
         use_pipe = bool(pipe_effects and pipe_effects.strip())
-
-        # Prefix-command fix: discord.py only puts the first token into `effect`.
-        # If the first token is a number (old custom syntax like "1 5 - mp4 negate"),
-        # reconstruct the full argument string from the raw message content so
-        # _parse_ihtx_custom_args can process it properly.
-        if not ctx.interaction and ctx.message:
-            _prefix_len = len(ctx.prefix or "t!")
-            _cmd_len = len(ctx.invoked_with or "ihtxgen")
-            _full_args = ctx.message.content[_prefix_len + _cmd_len:].strip()
-            _first_word = _full_args.split()[0] if _full_args else ""
-            try:
-                int(_first_word)  # raises if not a number
-                effect = _full_args  # reconstruct for custom-syntax parsing
-            except (ValueError, IndexError):
-                pass  # preset name, URL, or empty — normal discord.py parsing stands
 
         try:
             from bot.ihtx_bot import (
@@ -678,6 +662,40 @@ class EconomyCog(commands.Cog, name="Economy"):
             except discord.HTTPException:
                 await status_msg.edit(embed=result_embed)
                 await ctx.send(file=discord.File(output_path, filename=out_filename))
+
+    # -----------------------------------------------------------------------
+    # t!ihtx / t!effect / t!destroy — prefix-only alias that consumes the
+    # full rest of the message as one string, avoiding discord.py's per-token
+    # argument parsing (which breaks the "1 5 - mp4 negate" custom syntax).
+    # -----------------------------------------------------------------------
+
+    @commands.command(name="ihtx", aliases=["effect", "destroy"])
+    async def ihtx_prefix(self, ctx: commands.Context, *, args: str = "") -> None:
+        """Prefix alias for /ihtxgen — handles both preset names and the full
+        custom syntax: <exports> <duration> <no_trim> <fmt> <pipe_effects>"""
+        try:
+            from bot.ihtx_bot import _parse_ihtx_custom_args, PRESET_FILTERS
+        except ImportError as exc:
+            await ctx.reply(f"❌ Internal import error: `{exc}`")
+            return
+
+        args = args.strip()
+        parsed = _parse_ihtx_custom_args(args) if args else None
+
+        if parsed is not None:
+            reps, dur, notrim, fmt, pe = parsed
+            await ctx.invoke(
+                self.ihtxgen,
+                effect="chaos",
+                pipe_effects=pe,
+                repetitions=reps,
+                duration=dur,
+                no_trim=notrim.lower() in {"true", "yes"},
+                export_fmt=fmt or "mp4",
+            )
+        else:
+            first = args.split()[0] if args else "chaos"
+            await ctx.invoke(self.ihtxgen, effect=first)
 
     # -----------------------------------------------------------------------
     # /ping and /status — latency and health
