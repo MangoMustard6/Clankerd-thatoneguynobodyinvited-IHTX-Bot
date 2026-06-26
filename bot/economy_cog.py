@@ -597,25 +597,27 @@ class EconomyCog(commands.Cog, name="Economy"):
 
         _fun_fact = random.choice(WEATHER_FUN_FACTS)
         _start_time = time.monotonic()
+        _user_tag = str(ctx.author)
+        _avatar_url = ctx.author.display_avatar.url
+        _IHTX_COLOR = 0x001080
+        _IHTX_FOOTER_ICON = "https://files.catbox.moe/pdw8bi.webp"
 
-        loading_embed = discord.Embed(
-            title="⚙️ IHTX Generator",
-            description=_header + f"\n\n⏳ Downloading and processing your media…\n\n> 🌤️ {_fun_fact}",
-            color=0x5865F2,
-        )
-        loading_embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
-        loading_embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+        def _make_base_embed(color: int = _IHTX_COLOR) -> discord.Embed:
+            e = discord.Embed(color=color, timestamp=discord.utils.utcnow())
+            e.set_author(name=_user_tag, icon_url=_avatar_url)
+            e.set_footer(text="IHTX Custom FFmpeg+", icon_url=_IHTX_FOOTER_ICON)
+            return e
+
+        loading_embed = _make_base_embed()
+        loading_embed.add_field(name="Status:", value="⏳ Downloading and processing your media…", inline=False)
+        loading_embed.add_field(name="🌤️ Weather Fact:", value=_fun_fact, inline=False)
         status_msg = await ctx.reply(embed=loading_embed, mention_author=False)
 
-        async def _update(description: str, color: int = 0x5865F2) -> None:
-            fact_suffix = f"\n\n> 🌤️ {_fun_fact}" if color == 0x5865F2 else ""
-            e = discord.Embed(
-                title="⚙️ IHTX Generator",
-                description=description + fact_suffix,
-                color=color,
-            )
-            e.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
-            e.set_footer(text=f"Requested by {ctx.author.display_name}")
+        async def _update(status: str, color: int = _IHTX_COLOR) -> None:
+            e = _make_base_embed(color)
+            e.add_field(name="Status:", value=status, inline=False)
+            if color == _IHTX_COLOR:
+                e.add_field(name="🌤️ Weather Fact:", value=_fun_fact, inline=False)
             try:
                 await status_msg.edit(embed=e)
             except Exception:
@@ -628,7 +630,7 @@ class EconomyCog(commands.Cog, name="Economy"):
 
             # Download
             try:
-                await _update(_header + "\n\n⬇️ Downloading media…")
+                await _update("⬇️ Downloading media…")
                 async with __import__("aiohttp").ClientSession() as session:
                     async with session.get(media_url) as resp:
                         if resp.status != 200:
@@ -652,7 +654,7 @@ class EconomyCog(commands.Cog, name="Economy"):
                         _phase = f"🔧 Running pipe effects: `{_pe_label}`…\n⏱️ **{elapsed}s elapsed**"
                     else:
                         _phase = f"🔧 Running FFmpeg `{effect}` preset…\n⏱️ **{elapsed}s elapsed**"
-                    await _update(_header + f"\n\n{_phase}")
+                    await _update(_phase)
                     try:
                         await asyncio.wait_for(_done_evt.wait(), timeout=4.0)
                     except asyncio.TimeoutError:
@@ -710,18 +712,21 @@ class EconomyCog(commands.Cog, name="Economy"):
                 await _update("⬆️ Output exceeds 25 MB — uploading to Catbox…")
                 catbox_url = await _upload_to_catbox(output_path)
                 if catbox_url:
-                    result_embed = discord.Embed(
-                        title="✅ IHTX Generator — Done!",
-                        description=(
-                            f"**Effect:** {_applied}\n"
-                            f"**Resolution:** {res_str} ({ar_str}) · {fps_str}\n"
-                            f"**Size:** {size_mb:.2f} MB (uploaded to Catbox)\n\n"
-                            f"🔗 [Download from Catbox]({catbox_url})\n`{catbox_url}`"
-                        ),
-                        color=0x57F287,
+                    _elapsed = time.monotonic() - _start_time
+                    _size_str = f"{size_mb:.2f} MB" if size_mb >= 1 else f"{out_size / 1024:.2f} KB"
+                    result_embed = _make_base_embed()
+                    result_embed.add_field(name="Effect:", value=_applied, inline=True)
+                    result_embed.add_field(name="Resolution:", value=f"{res_str} ({ar_str}) · {fps_str}", inline=True)
+                    result_embed.add_field(
+                        name="Reminder:",
+                        value="Make sure you use `.t sync+` or `.t sync+ alt` afterwards to make sure the video is synced to the audio",
+                        inline=False,
                     )
-                    result_embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
-                    result_embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+                    result_embed.add_field(
+                        name="File Info:",
+                        value=f"{_size_str} (Catbox), took {_elapsed:.2f} seconds\n🔗 [Download]({catbox_url})\n`{catbox_url}`",
+                        inline=False,
+                    )
                     await status_msg.edit(embed=result_embed)
                 else:
                     await _update("❌ Output too large for Discord (>25 MB) and Catbox upload failed.", 0xED4245)
@@ -729,17 +734,21 @@ class EconomyCog(commands.Cog, name="Economy"):
 
             stem = Path(media_filename).stem
             out_filename = f"ihtx_{'pipe' if use_pipe else effect}_{stem}{out_final_ext}"
-            result_embed = discord.Embed(
-                title="✅ IHTX Generator — Done!",
-                description=(
-                    f"**Effect applied:** {_applied}\n"
-                    f"**Resolution:** {res_str} ({ar_str}) · {fps_str}\n"
-                    f"**Output size:** {size_mb:.2f} MB"
-                ),
-                color=0x57F287,
+            _elapsed = time.monotonic() - _start_time
+            _size_str = f"{size_mb:.2f} MB" if size_mb >= 1 else f"{out_size / 1024:.2f} KB"
+            result_embed = _make_base_embed()
+            result_embed.add_field(name="Effect:", value=_applied, inline=True)
+            result_embed.add_field(name="Resolution:", value=f"{res_str} ({ar_str}) · {fps_str}", inline=True)
+            result_embed.add_field(
+                name="Reminder:",
+                value="Make sure you use `.t sync+` or `.t sync+ alt` afterwards to make sure the video is synced to the audio",
+                inline=False,
             )
-            result_embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
-            result_embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+            result_embed.add_field(
+                name="File Info:",
+                value=f"{_size_str}, took {_elapsed:.2f} seconds",
+                inline=False,
+            )
 
             try:
                 await status_msg.edit(
