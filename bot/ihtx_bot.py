@@ -137,7 +137,7 @@ _load_owner_ids()
 
 # Heavy command rate limiting
 HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
-HEAVY_LIMIT_DEFAULT = 10
+HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
 USAGE_FILE = Path("bot/usage.json")
