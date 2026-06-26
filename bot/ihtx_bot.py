@@ -1546,6 +1546,7 @@ PIPE_EFFECT_NAMES = {
     "alimiter",
     "freakzinga", "fzgm156", "freakzingagm156", "fgm156",
     "multipitch2", "mp2",
+    "jitter",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1573,7 +1574,7 @@ def _split_pipe_segments(pipe_str: str) -> list[str]:
         elif ch == ")":
             depth -= 1
             current.append(ch)
-        elif ch == "," and depth == 0:
+        elif ch in (",", ">") and depth == 0:
             seg = "".join(current).strip()
             if seg:
                 segments.append(seg)
@@ -1638,7 +1639,13 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
                 effects.append((current_name, current_params))
             name, value = part.split("=", 1)
             current_name = name.strip().lower()
-            current_params = _split_effect_params(value)
+            if "::" in value:
+                # :: is an explicit param separator — each segment is kept verbatim
+                # as one param (no further splitting on | or spaces).
+                # Allows: mp2=-4.5|5::G-Major_17  →  params=["-4.5|5", "G-Major_17"]
+                current_params = [p.strip() for p in value.split("::") if p.strip()]
+            else:
+                current_params = _split_effect_params(value)
             continue
 
         tokens = part.split(None, 1)
@@ -2540,6 +2547,38 @@ def _apply_pipe_effects(
                     ], timeout=300)
                 if not ok:
                     return False, f"multipitch2: remux failed: {err}"
+                current = out
+                continue
+
+            # jitter — sinusoidal per-frame pixel displacement (camera shake)
+            # Param: <strength> (default 15). Translates the TypeScript geq shake
+            # into a pad→crop approach: expands the canvas by `margin` px, then
+            # crops back with a sin(n*seed)-driven x/y offset each frame.
+            if name == "jitter":
+                try:
+                    strength = float(params[0]) if params else 15.0
+                except (ValueError, TypeError):
+                    strength = 15.0
+
+                margin = max(4, (int(strength * 2) + 4) // 2 * 2)  # even, ≥4
+                half = margin // 2
+                sin_x = i + 68   # TypeScript: sinSeedX = i + 67 (with i defaulting to 1)
+                sin_y = i + 671  # TypeScript: sinSeedY = i + 670
+                x_expr = f"max(0,{half}+{strength:.4f}*sin(n*{sin_x}))"
+                y_expr = f"max(0,{half}+{strength:.4f}*sin(n*{sin_y}))"
+                vf = (
+                    f"pad=iw+{margin}:ih+{margin}:{half}:{half},"
+                    f"crop=iw-{margin}:ih-{margin}:'{x_expr}':'{y_expr}'"
+                )
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-vf", vf,
+                    "-c:a", "copy",
+                    out,
+                ], timeout=300)
+                if not ok:
+                    return False, f"jitter: ffmpeg failed: {err}"
                 current = out
                 continue
 
@@ -6096,6 +6135,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.4",
+        "date": "2026-06-26",
+        "heavy": [
+            "**`>` pipe segment delimiter** — `>` now works alongside `,` as a top-level pipe separator (e.g. `mp2=-4.5|5>negate`), allowing `|` in pitch lists without ambiguity.",
+            "**`::` explicit param separator** — `name=val1::val2` keeps each `::` chunk as one verbatim param, fixing mp2 multi-pitch inputs: `mp2=-5|5::G-Major_17` → pitches=`-5|5`, surround=`G-Major_17`.",
+            "**jitter pipe effect** — Sinusoidal per-frame pixel displacement camera shake. Param: `<strength>` (default 15). Uses pad→crop with sin(n·seed) offsets. Example: `jitter=20`.",
+            "**Processing embed: elapsed timer + weather fun facts** — Status embed now ticks every 4s showing seconds elapsed, and includes a random weather fact while processing runs.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.3",
         "date": "2026-06-26",

@@ -26,6 +26,63 @@ from discord import app_commands
 from discord.ext import commands
 
 # ---------------------------------------------------------------------------
+# Weather fun facts — shown in the processing embed while FFmpeg runs
+# ---------------------------------------------------------------------------
+
+WEATHER_FUN_FACTS: list[str] = [
+    "A bolt of lightning is about 5× hotter than the surface of the Sun.",
+    "The world's heaviest hailstone weighed 1.02 kg and fell in Bangladesh in 1986.",
+    "Fog is simply a cloud that forms at ground level.",
+    "The fastest wind ever recorded was 408 km/h during Typhoon Olivia in 1996.",
+    "Snow isn't actually white — ice crystals are translucent but scatter light to look white.",
+    "Raindrops aren't teardrop-shaped — they look more like tiny hamburger buns.",
+    "The US gets about 1,200 tornadoes per year, more than anywhere else on Earth.",
+    "A single thunderstorm can pack as much energy as 10 atomic bombs.",
+    "Lightning strikes Earth about 100 times every second.",
+    "The wettest spot on Earth is Mawsynram, India, with ~11,871 mm of rain per year.",
+    "A blizzard needs winds ≥ 56 km/h and visibility under 400 m to officially qualify.",
+    "The coldest temp ever recorded was −89.2 °C at Vostok Station, Antarctica, in 1983.",
+    "The hottest air temp ever recorded in shade was 56.7 °C in Death Valley in 1913.",
+    "A rainbow is actually a full circle — the ground hides the bottom half.",
+    "Very cold air holds almost no moisture, so heavy snowfall rarely happens below −29 °C.",
+    "A cubic mile of fog contains less than a gallon of liquid water.",
+    "Thundersnow is real — a snowstorm with lightning and thunder embedded inside it.",
+    "Neptune has the fastest winds in the solar system: over 2,000 km/h.",
+    "Hurricane winds can extend 400–500 km outward from the storm centre.",
+    "The eye of a hurricane is completely calm and can be sunny and clear.",
+    "Heat lightning doesn't exist — it's just regular lightning too far away to hear.",
+    "Ball lightning is a poorly understood phenomenon where glowing plasma orbs float through air.",
+    "The smell of rain is called petrichor, from soil oils and actinomycetes bacteria.",
+    "Cloud-to-ground lightning always has an upward return stroke from the ground.",
+    "Antarctica is the driest, windiest, and coldest continent on Earth.",
+    "A hurricane can dump 2.4 trillion gallons of rain in a single day.",
+    "Wind makes no sound on its own — it's only audible when moving past objects.",
+    "Cirrus cloud ice crystals can be needles, plates, or hollow hexagonal columns.",
+    "El Niño can shift global weather patterns for months or even years.",
+    "The Coriolis effect is why Northern Hemisphere hurricanes spin counter-clockwise.",
+    "Virga is precipitation that falls from clouds but evaporates before hitting the ground.",
+    "Mammatus clouds are rare, pouch-shaped formations hanging beneath thunderstorm anvils.",
+    "The Aurora Borealis happens when solar wind interacts with Earth's magnetic field.",
+    "Snow can fall above 0 °C if the air is dry enough for the flakes to survive descent.",
+    "The deadliest weather disaster in history was China's 1931 flood — up to 4 million deaths.",
+    "A waterspout is simply a tornado that forms over water.",
+    "Dust devils are rotating columns of dust-filled air caused by hot ground heating air unevenly.",
+    "The Great Blizzard of 1888 buried New York City under 50 cm of snow in 36 hours.",
+    "Category 5 hurricanes sustain winds over 252 km/h.",
+    "Frost forms only when the surface drops below the dew point AND below 0 °C.",
+    "Clouds can weigh millions of tonnes yet stay airborne because their droplets are microscopic.",
+    "Supercell thunderstorms are rotating and can last for hours, sometimes spawning multiple tornadoes.",
+    "The Beaufort Scale has 13 levels, from 0 (dead calm) to 12 (hurricane force).",
+    "Monsoon rains dump about 80% of India's annual rainfall in just 4 months.",
+    "Global lightning networks track over 40 million cloud-to-ground strikes per year.",
+    "Haboobs are massive wall-like dust storms common in the Sahara, Middle East, and US Southwest.",
+    "The highest recorded tornado reached approximately 12 km into the atmosphere.",
+    "Rainbows can be seen as full circles from an airplane.",
+    "Lake-effect snow forms when cold air passes over warm lake water, picking up moisture rapidly.",
+    "Some Antarctic regions have gone over 2 million years without rain — the driest places on Earth.",
+]
+
+# ---------------------------------------------------------------------------
 # Economy database — lightweight JSON store
 # ---------------------------------------------------------------------------
 
@@ -538,9 +595,12 @@ class EconomyCog(commands.Cog, name="Economy"):
         else:
             _header = f"**Effect:** `{effect}`\n**File:** `{media_filename}`"
 
+        _fun_fact = random.choice(WEATHER_FUN_FACTS)
+        _start_time = time.monotonic()
+
         loading_embed = discord.Embed(
             title="⚙️ IHTX Generator",
-            description=_header + "\n\n⏳ Downloading and processing your media…",
+            description=_header + f"\n\n⏳ Downloading and processing your media…\n\n> 🌤️ {_fun_fact}",
             color=0x5865F2,
         )
         loading_embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
@@ -548,7 +608,12 @@ class EconomyCog(commands.Cog, name="Economy"):
         status_msg = await ctx.reply(embed=loading_embed, mention_author=False)
 
         async def _update(description: str, color: int = 0x5865F2) -> None:
-            e = discord.Embed(title="⚙️ IHTX Generator", description=description, color=color)
+            fact_suffix = f"\n\n> 🌤️ {_fun_fact}" if color == 0x5865F2 else ""
+            e = discord.Embed(
+                title="⚙️ IHTX Generator",
+                description=description + fact_suffix,
+                color=color,
+            )
             e.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
             e.set_footer(text=f"Requested by {ctx.author.display_name}")
             try:
@@ -576,23 +641,45 @@ class EconomyCog(commands.Cog, name="Economy"):
                 await _update(f"❌ Download failed: `{exc}`", 0xED4245)
                 return
 
-            # Process
+            # Process — with a background ticker showing elapsed seconds
             loop = asyncio.get_event_loop()
-            if use_pipe:
-                await _update(_header + f"\n\n🔧 Running pipe effects: `{_pe_label}`…")
-                ok, err = await loop.run_in_executor(
-                    None, _run_ihtx_tagscript_workflow,
-                    input_path, output_path,
-                    repetitions, duration,
-                    "true" if no_trim else "-",
-                    export_fmt.lstrip(".") or "mp4",
-                    pipe_effects,
-                )
-            else:
-                await _update(_header + f"\n\n🔧 Running FFmpeg `{effect}` preset…")
-                ok, err = await loop.run_in_executor(
-                    None, run_ffmpeg, input_path, output_path, effect, is_video
-                )
+            _done_evt = asyncio.Event()
+
+            async def _tick() -> None:
+                while not _done_evt.is_set():
+                    elapsed = int(time.monotonic() - _start_time)
+                    if use_pipe:
+                        _phase = f"🔧 Running pipe effects: `{_pe_label}`…\n⏱️ **{elapsed}s elapsed**"
+                    else:
+                        _phase = f"🔧 Running FFmpeg `{effect}` preset…\n⏱️ **{elapsed}s elapsed**"
+                    await _update(_header + f"\n\n{_phase}")
+                    try:
+                        await asyncio.wait_for(_done_evt.wait(), timeout=4.0)
+                    except asyncio.TimeoutError:
+                        pass
+
+            _tick_task = asyncio.create_task(_tick())
+            try:
+                if use_pipe:
+                    ok, err = await loop.run_in_executor(
+                        None, _run_ihtx_tagscript_workflow,
+                        input_path, output_path,
+                        repetitions, duration,
+                        "true" if no_trim else "-",
+                        export_fmt.lstrip(".") or "mp4",
+                        pipe_effects,
+                    )
+                else:
+                    ok, err = await loop.run_in_executor(
+                        None, run_ffmpeg, input_path, output_path, effect, is_video
+                    )
+            finally:
+                _done_evt.set()
+                _tick_task.cancel()
+                try:
+                    await _tick_task
+                except asyncio.CancelledError:
+                    pass
 
             if not ok:
                 await _update(f"❌ FFmpeg failed:\n```\n{err[-1200:]}\n```", 0xED4245)
