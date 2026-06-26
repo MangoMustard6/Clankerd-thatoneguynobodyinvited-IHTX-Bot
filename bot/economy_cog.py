@@ -387,6 +387,21 @@ class EconomyCog(commands.Cog, name="Economy"):
     ) -> None:
         use_pipe = bool(pipe_effects and pipe_effects.strip())
 
+        # Prefix-command fix: discord.py only puts the first token into `effect`.
+        # If the first token is a number (old custom syntax like "1 5 - mp4 negate"),
+        # reconstruct the full argument string from the raw message content so
+        # _parse_ihtx_custom_args can process it properly.
+        if not ctx.interaction and ctx.message:
+            _prefix_len = len(ctx.prefix or "t!")
+            _cmd_len = len(ctx.invoked_with or "ihtxgen")
+            _full_args = ctx.message.content[_prefix_len + _cmd_len:].strip()
+            _first_word = _full_args.split()[0] if _full_args else ""
+            try:
+                int(_first_word)  # raises if not a number
+                effect = _full_args  # reconstruct for custom-syntax parsing
+            except (ValueError, IndexError):
+                pass  # preset name, URL, or empty — normal discord.py parsing stands
+
         try:
             from bot.ihtx_bot import (
                 PRESET_FILTERS,

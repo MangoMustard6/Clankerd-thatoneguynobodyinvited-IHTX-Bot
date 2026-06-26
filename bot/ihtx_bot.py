@@ -9210,12 +9210,22 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply(f"Missing argument: `{error.param.name}`. Use `t!ihtxhelp` for usage.")
+        await ctx.reply(f"❌ Missing argument: `{error.param.name}`. Use `t!ihtxhelp` for usage.")
         return
-    # Permission errors from owner-only commands
     if isinstance(error, commands.CheckFailure):
-        # If check failed for owner-only commands, be quiet (or you could notify)
         return
+    if isinstance(error, commands.BadArgument):
+        await ctx.reply(f"❌ Bad argument: {error}\nUse `t!ihtxhelp` for correct usage.")
+        return
+    if isinstance(error, commands.CommandInvokeError):
+        original = error.original
+        print(f"[error] CommandInvokeError in {ctx.command}: {type(original).__name__}: {original}")
+        try:
+            await ctx.reply(f"❌ An error occurred: `{type(original).__name__}: {original}`")
+        except Exception:
+            pass
+        return
+    print(f"[error] Unhandled command error in {ctx.command}: {type(error).__name__}: {error}")
     raise error
 
 
