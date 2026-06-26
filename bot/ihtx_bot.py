@@ -1544,7 +1544,8 @@ PIPE_EFFECT_NAMES = {
     "folkvalley", "fv",
     "vocoder", "ilvocodex", "orangevocoder", "4ormulator", "audacity",
     "alimiter",
-    "freakzinga", "fzgm156",
+    "freakzinga", "fzgm156", "freakzingagm156", "fgm156",
+    "multipitch2", "mp2",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -2340,7 +2341,7 @@ def _apply_pipe_effects(
                 continue
 
             # freakzinga g major 156 — palindrome video + dual-voice pitch shift + bass mix
-            if name in ("freakzinga", "fzgm156"):
+            if name in ("freakzinga", "fzgm156", "freakzingagm156", "fgm156"):
                 if not _ensure_multipitch_bin():
                     return False, "fzgm156: multipitch binary unavailable — download failed."
 
@@ -2454,6 +2455,91 @@ def _apply_pipe_effects(
                 ], timeout=300)
                 if not ok:
                     return False, f"fzgm156: remux step failed: {err}"
+                current = out
+                continue
+
+            # multipitch2 / mp2 — wave-hammer multi-voice pitch shift with optional surround
+            if name in ("multipitch2", "mp2"):
+                if not _ensure_multipitch_bin():
+                    return False, "multipitch2: multipitch binary unavailable — download failed."
+
+                # params[0] = pitches (pipe/comma/space-separated semitones)
+                # params[1] = surround type: G-Major_17 | Evil_Rampaging_Sorcerer (optional)
+                # params[2] = sample rate (optional, default 44100)
+                pitches_raw = params[0] if len(params) > 0 else ""
+                if not pitches_raw:
+                    return False, "multipitch2: requires at least one pitch value (e.g. `mp2=1|7|8`)."
+                surround_type = params[1] if len(params) > 1 else ""
+                try:
+                    sr_val = int(params[2]) if len(params) > 2 else 44100
+                except (ValueError, TypeError):
+                    sr_val = 44100
+
+                # Convert pipe/space-separated pitches to comma-separated for binary
+                pitches_csv = re.sub(r"[|\s]+", ",", pitches_raw.strip()).strip(",")
+                if not pitches_csv:
+                    return False, "multipitch2: no valid pitch values found."
+
+                # Step 1: extract downsampled audio (halved sample rate)
+                audio_down = os.path.join(tmpdir, f"mp2_h_{i}.wav")
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-af", f"asetrate={sr_val // 2}",
+                    "-c:a", "pcm_s16le",
+                    audio_down,
+                ], timeout=120)
+                if not ok:
+                    return False, f"multipitch2: audio downsample failed: {err}"
+
+                # Step 2: run multipitch binary with all pitches in one call
+                out_wav = os.path.join(tmpdir, f"mp2_out_{i}.wav")
+                try:
+                    subprocess.run(
+                        [_MULTIPITCH_BIN, audio_down, out_wav, pitches_csv,
+                         "--backend", "signalsmith", "--no-normalize"],
+                        check=True, capture_output=True, timeout=300,
+                    )
+                except Exception as _mp2_err:
+                    return False, f"multipitch2: pitch shift failed: {_mp2_err}"
+
+                # Step 3: build audio filter — asetrate + optional alimiter surround
+                if surround_type == "Evil_Rampaging_Sorcerer":
+                    af_str = f"asetrate={sr_val},alimiter=30:latency=1"
+                elif surround_type == "G-Major_17":
+                    af_str = f"asetrate={sr_val},alimiter=15:latency=1"
+                else:
+                    af_str = f"asetrate={sr_val}"
+
+                # Step 4: remux — original video stream + processed audio
+                _mp2_has_vid = bool(_ffprobe(
+                    current,
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_type",
+                    "-of", "default=nw=1:nk=1",
+                ).strip())
+
+                if _mp2_has_vid:
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current, "-i", out_wav,
+                        "-map", "0:v", "-map", "1:a",
+                        "-af", af_str,
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-c:a", "pcm_s16le",
+                        out,
+                    ], timeout=300)
+                else:
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", out_wav,
+                        "-af", af_str,
+                        "-c:a", "pcm_s16le",
+                        out,
+                    ], timeout=300)
+                if not ok:
+                    return False, f"multipitch2: remux failed: {err}"
                 current = out
                 continue
 
@@ -6010,6 +6096,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.3",
+        "date": "2026-06-26",
+        "heavy": [
+            "**fzgm156 / freakzingagm156 / fgm156 aliases** — All four aliases (`freakzinga`, `fzgm156`, `freakzingagm156`, `fgm156`) now work for the G Major 156 pipe effect.",
+            "**multipitch2 / mp2 pipe effect** — Wave-hammer multi-voice pitch shift. Params: `<pitches> [surround_type] [sr]`. Pitches are pipe/comma-separated semitones (e.g. `mp2=1|7|8`). Optional surround types: `G-Major_17` (alimiter=15) or `Evil_Rampaging_Sorcerer` (alimiter=30). Pipeline: (1) downsample audio to sr/2, (2) run Signalsmith multipitch binary, (3) asetrate back to sr + optional alimiter, (4) remux over original video.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.2",
         "date": "2026-06-25",
