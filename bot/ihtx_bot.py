@@ -846,17 +846,25 @@ def _run_huehsv(
     input_path: str,
     output_path: str,
     hue: float,
+    sat: float = 1.0,
+    brightness: float = 1.0,
 ) -> tuple[bool, str]:
     """Apply huehsv using ImageMagick haldclut + FFmpeg haldclut filter.
 
-    Uses: magick hald:6 -modulate 100,100,<hue*200+100> hsv.ppm
-    Then: ffmpeg -i input -vf "movie=hsv.ppm,[in]haldclut,format=rgba" -pix_fmt yuv420p output
+    ImageMagick -modulate takes brightness%,saturation%,hue% (100 = unchanged).
+      hue:        user float → hue*200+100  (0.0=unchanged, 0.5=full rotation)
+      sat:        multiplier  → sat*100      (1.0=unchanged, 0.8=less, 1.5=more)
+      brightness: multiplier  → brightness*100 (1.0=unchanged, 1.2=brighter)
+
+    Pipe usage: huehsv=<hue>|<sat>|<brightness>   e.g. huehsv=0.65|0.8|1.2
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         hald_path = os.path.join(tmpdir, "hsv.ppm")
-        modulate_val = hue * 200 + 100
-        # Generate hald clut using ImageMagick
-        cmd = ["magick", "hald:6", "-modulate", f"100,100,{modulate_val}", hald_path]
+        hue_pct = hue * 200 + 100
+        sat_pct = sat * 100
+        brightness_pct = brightness * 100
+        # Generate hald clut using ImageMagick (-modulate brightness,saturation,hue)
+        cmd = ["magick", "hald:6", "-modulate", f"{brightness_pct},{sat_pct},{hue_pct}", hald_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             return False, f"Haldclut generation failed: {result.stderr}"
@@ -1682,6 +1690,10 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         return "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"
     if name == "rotate":
         angle = params[0] if params else "0"
+        # params[1]: expand — 0=keep original canvas (default), 1=expand to fit full rotated frame
+        expand = (params[1] if len(params) > 1 else "0").strip()
+        if expand == "1":
+            return f"rotate={angle}/180*PI:ow='rotw(a)':oh='roth(a)':fillcolor=black"
         return f"rotate={angle}/180*PI"
     if name == "ccshue":
         # Handled as a special case in _apply_pipe_effects (needs ImageMagick preprocessing)
@@ -1694,14 +1706,24 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         rest = ":".join(params[1:]) if len(params) > 1 else ""
         return f"frei0r={plugin}:{rest}" if rest else f"frei0r={plugin}"
     if name == "brightness":
-        val = params[0] if params else "0"
-        return f"eq=brightness={val}"
+        # params: brightness|contrast|saturation|gamma  (all via eq filter, 100=unchanged)
+        b = params[0] if params else "0"
+        c = params[1] if len(params) > 1 else "1"
+        s = params[2] if len(params) > 2 else "1"
+        g = params[3] if len(params) > 3 else "1"
+        return f"eq=brightness={b}:contrast={c}:saturation={s}:gamma={g}"
     if name == "contrast":
-        val = params[0] if params else "1"
-        return f"eq=contrast={val}"
+        # params: contrast|brightness|saturation|gamma
+        c = params[0] if params else "1"
+        b = params[1] if len(params) > 1 else "0"
+        s = params[2] if len(params) > 2 else "1"
+        g = params[3] if len(params) > 3 else "1"
+        return f"eq=contrast={c}:brightness={b}:saturation={s}:gamma={g}"
     if name == "saturation":
-        val = params[0] if params else "1"
-        return f"hue=s={val}"
+        # params: saturation|hue_angle_degrees
+        s = params[0] if params else "1"
+        h = params[1] if len(params) > 1 else "0"
+        return f"hue=s={s}:h={h}"
     if name == "swapuv":
         return "swapuv"
     if name == "mirror":
@@ -1753,15 +1775,30 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
                 f"format=yuv420p"
             )
     if name == "scale1280":
+        # params: width|height  (height defaults to -2 = preserve aspect ratio)
         width = params[0] if params else "1280"
         try:
             int(width)
         except (ValueError, TypeError):
             width = "1280"
-        return f"scale={width}:-2"
+        height = params[1] if len(params) > 1 else "-2"
+        try:
+            int(height)
+        except (ValueError, TypeError):
+            height = "-2"
+        return f"scale={width}:{height}"
     if name == "zoom":
+        # params: amount|cx|cy  (cx/cy = zoom centre as 0.0–1.0 fraction, default 0.5)
         amount = params[0] if params else "1.1"
-        zoom_geq = f"p((W/2)+(X-(W/2))/{amount},(H/2)+(Y-(H/2))/{amount})"
+        try:
+            cx = float(params[1]) if len(params) > 1 else 0.5
+        except (ValueError, TypeError):
+            cx = 0.5
+        try:
+            cy = float(params[2]) if len(params) > 2 else 0.5
+        except (ValueError, TypeError):
+            cy = 0.5
+        zoom_geq = f"p(W*{cx}+(X-W*{cx})/{amount},H*{cy}+(Y-H*{cy})/{amount})"
         return (
             f"format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
             f"geq='{zoom_geq}',"
@@ -1880,10 +1917,19 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # ImageMagick huehsv
+            # ImageMagick huehsv — params: hue|sat|brightness (all optional after hue)
             if name == "huehsv":
-                val = float(params[0]) if params else 0.5
-                ok, err = _run_huehsv(current, out, val)
+                def _hf(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                ok, err = _run_huehsv(
+                    current, out,
+                    hue=_hf(0, 0.5),
+                    sat=_hf(1, 1.0),
+                    brightness=_hf(2, 1.0),
+                )
                 if not ok:
                     return False, err
                 current = out
