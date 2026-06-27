@@ -33,3 +33,16 @@ uvloop
 yt-dlp
 groq
 Pillow
+aiohttp
+anthropic
+discord.py
+fal-client
+flask
+google-genai
+groq
+openai
+Pillow
+python-dotenv
+replicate
+uvloop
+yt-dlp
