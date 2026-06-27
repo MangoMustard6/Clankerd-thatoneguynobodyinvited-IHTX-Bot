@@ -2734,22 +2734,17 @@ def _apply_pipe_effects(
                 if not ok:
                     return False, f"fzgm156: audio downsample step failed: {err}"
 
-                # Step 4: dual pitch-shift passes with multipitch binary
+                # Step 4: dual pitch-shift passes with multipitch binary (+ rubberband fallback)
                 out_pos = os.path.join(tmpdir, f"fzgm156_pos_{i}.wav")
                 out_neg = os.path.join(tmpdir, f"fzgm156_neg_{i}.wav")
-                try:
-                    subprocess.run(
-                        [_MULTIPITCH_BIN, audio_down, out_pos, "0.5,4.5",
-                         "--backend", "signalsmith", "--no-normalize"],
-                        check=True, capture_output=True, timeout=120,
-                    )
-                    subprocess.run(
-                        [_MULTIPITCH_BIN, audio_down, out_neg, "-0.5,-4.5",
-                         "--backend", "signalsmith", "--no-normalize"],
-                        check=True, capture_output=True, timeout=120,
-                    )
-                except Exception as _ps_err:
-                    return False, f"fzgm156: pitch shift failed: {_ps_err}"
+                ok_pos, err_pos = _run_fileaa_with_fallback(
+                    audio_down, out_pos, "0.5,4.5", tmpdir, f"fzpos{i}", timeout=120)
+                if not ok_pos:
+                    return False, f"fzgm156: pitch shift (pos) failed: {err_pos}"
+                ok_neg, err_neg = _run_fileaa_with_fallback(
+                    audio_down, out_neg, "-0.5,-4.5", tmpdir, f"fzneg{i}", timeout=120)
+                if not ok_neg:
+                    return False, f"fzgm156: pitch shift (neg) failed: {err_neg}"
 
                 # Step 5: mix — pos forward + neg reversed, both with bass boost, trimmed to half
                 audio_mixed = os.path.join(tmpdir, f"fzgm156_mix_{i}.wav")
@@ -2816,16 +2811,12 @@ def _apply_pipe_effects(
                 if not ok:
                     return False, f"multipitch2: audio downsample failed: {err}"
 
-                # Step 2: run multipitch binary with all pitches in one call
+                # Step 2: run multipitch binary with all pitches in one call (+ rubberband fallback)
                 out_wav = os.path.join(tmpdir, f"mp2_out_{i}.wav")
-                try:
-                    subprocess.run(
-                        [_MULTIPITCH_BIN, audio_down, out_wav, pitches_csv,
-                         "--backend", "signalsmith", "--no-normalize"],
-                        check=True, capture_output=True, timeout=300,
-                    )
-                except Exception as _mp2_err:
-                    return False, f"multipitch2: pitch shift failed: {_mp2_err}"
+                ok_mp2, err_mp2 = _run_fileaa_with_fallback(
+                    audio_down, out_wav, pitches_csv, tmpdir, f"mp2_{i}", timeout=300)
+                if not ok_mp2:
+                    return False, f"multipitch2: pitch shift failed: {err_mp2}"
 
                 # Step 3: build audio filter — asetrate + optional alimiter surround
                 if surround_type == "Evil_Rampaging_Sorcerer":
@@ -3121,6 +3112,64 @@ def _ensure_multipitch_bin() -> bool:
     except Exception as exc:
         print(f"[multipitch] binary download failed: {exc}")
         return False
+
+
+def _run_fileaa_with_fallback(
+    in_wav: str,
+    out_wav: str,
+    pitches_csv: str,
+    tmpdir: str,
+    prefix: str = "fb",
+    timeout: int = 300,
+) -> tuple[bool, str]:
+    """Run the fileaa multipitch binary; fall back to rubberband+amix on failure.
+
+    Drops the --backend and --no-normalize flags that Termux builds don't support.
+    """
+    result = subprocess.run(
+        [_MULTIPITCH_BIN, in_wav, out_wav, pitches_csv],
+        capture_output=True, timeout=timeout,
+    )
+    if result.returncode == 0:
+        return True, ""
+
+    # ── Fallback: rubberband CLI, one pass per semitone, then amix ────────────
+    rb_bin = shutil.which("rubberband")
+    if not rb_bin:
+        stderr = result.stderr.decode(errors="replace")[-600:] if result.stderr else ""
+        return False, f"fileaa failed (exit {result.returncode}) and rubberband not found. stderr: {stderr}"
+
+    voice_wavs: list[str] = []
+    for idx, st_str in enumerate(pitches_csv.split(",")):
+        st_str = st_str.strip()
+        if not st_str:
+            continue
+        try:
+            st = float(st_str)
+        except ValueError:
+            return False, f"invalid semitone value: {st_str!r}"
+        v_wav = os.path.join(tmpdir, f"{prefix}_rb_{idx}.wav")
+        rb_res = subprocess.run(
+            [rb_bin, f"-p{st:+.4f}", "-t1", in_wav, v_wav],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if rb_res.returncode != 0:
+            return False, f"rubberband failed (voice {idx}, {st:+.2f}st): {rb_res.stderr[-400:]}"
+        voice_wavs.append(v_wav)
+
+    if not voice_wavs:
+        return False, "no valid pitch voices produced"
+
+    mix_cmd = ["ffmpeg", "-y"]
+    for vw in voice_wavs:
+        mix_cmd += ["-i", vw]
+    mix_cmd += [
+        "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+        "-c:a", "pcm_s16le",
+        out_wav,
+    ]
+    ok, err = _run_ffmpeg_raw(mix_cmd, timeout=timeout)
+    return ok, ("" if ok else f"amix failed: {err}")
 
 
 def _run_multipitch_rb3(
