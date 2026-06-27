@@ -26,6 +26,7 @@ import { handleCatbox } from './commands/catbox.js';
 import { handleChat } from './commands/chat.js';
 import { handleClearchat } from './commands/clearchat.js';
 import { handleBytebeat, handleBytebeatInteraction } from './commands/bytebeat.js';
+import { handleFfmpegProcess } from './commands/ffmpegprocess.js';
 
 if (!BOT_TOKEN) {
   console.error('ERROR: DISCORD_TOKEN environment variable is not set.');
@@ -65,7 +66,7 @@ client.once('clientReady', async (c) => {
   console.log(`[IHTX-TS] Logged in as ${c.user.tag}`);
   console.log(`[IHTX-TS] Prefix: ${PREFIX}`);
   console.log(`[IHTX-TS] Owner ID: ${BOT_OWNER_ID || '(not set)'}`);
-  console.log(`[IHTX-TS] Commands: download, multipitchihtx, chat, ask, clearchat, coinflip, dice, rps, 8ball, slots, choose, roulette, trivia, help, info, catbox, bytebeat`);
+  console.log(`[IHTX-TS] Commands: download, multipitchihtx, chat, ask, clearchat, coinflip, dice, rps, 8ball, slots, choose, roulette, trivia, help, info, catbox, bytebeat, ffmpegprocess`);
 
   // Register slash commands.
   // Set BOT_GUILD_ID env var for instant guild-level registration (dev),
@@ -191,6 +192,11 @@ client.on('messageCreate', async (message: Message) => {
       case 'bytebeat':
       case 'bb':
         await handleBytebeat(message, rest);
+        break;
+
+      case 'ffmpegprocess':
+      case 'fmp':
+        await handleFfmpegProcess(message, rest);
         break;
 
       default:
