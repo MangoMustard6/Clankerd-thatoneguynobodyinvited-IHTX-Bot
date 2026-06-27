@@ -484,7 +484,11 @@ class EconomyCog(commands.Cog, name="Economy"):
                             title="❌ Unknown Preset or Invalid Syntax",
                             description=(
                                 f"**Presets:** {preset_list}\n\n"
-                                "**Or use full t!ihtx syntax:**\n"
+                                "**Pipe-effects shorthand** *(1 rep, full duration, mp4)*:\n"
+                                "`t!ihtx <pipe effects>`\n"
+                                "Example: `t!ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)`\n"
+                                "Example: `t!ihtx negate,huehsv=0.5`\n\n"
+                                "**Full custom syntax:**\n"
                                 "`<exports> <duration> <no_trim> <format> <pipe effects>`\n"
                                 "Example: `10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`"
                             ),
@@ -790,8 +794,27 @@ class EconomyCog(commands.Cog, name="Economy"):
                 export_fmt=fmt or "mp4",
             )
         else:
-            first = args.split()[0] if args else "chaos"
-            await ctx.invoke(self.ihtxgen, effect=first)
+            first = (args.split()[0] if args else "").lower()
+            # Shorthand pipe-effects mode: if the arg doesn't start with a digit
+            # (which would indicate the full "<reps> <dur> <noTrim> <fmt> <effects>"
+            # syntax) and isn't a known preset name, treat the entire string as
+            # pipe effects with defaults (1 rep, full video duration, mp4).
+            # This lets users write:
+            #   t!ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)
+            #   t!ihtx negate,huehsv=0.5
+            #   t!ihtx ffmpeg(-vf negate),speed=0.5
+            if args and not first[:1].isdigit() and first not in PRESET_FILTERS:
+                await ctx.invoke(
+                    self.ihtxgen,
+                    effect="chaos",
+                    pipe_effects=args,
+                    repetitions=1,
+                    duration="vidlen",
+                    no_trim=False,
+                    export_fmt="mp4",
+                )
+            else:
+                await ctx.invoke(self.ihtxgen, effect=first or "chaos")
 
     # -----------------------------------------------------------------------
     # /ping and /status — latency and health

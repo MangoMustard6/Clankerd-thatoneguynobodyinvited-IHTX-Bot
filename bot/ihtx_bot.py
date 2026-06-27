@@ -6889,6 +6889,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v5.9",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!ihtx ffmpeg(-vf ...)`** — Pipe-effects shorthand mode. `t!ihtx` now accepts a bare pipe-effects string without needing the full `<reps> <dur> <noTrim> <fmt> <effects>` prefix. If the arg doesn't start with a digit and isn't a preset name, the entire string is treated as pipe effects with defaults: 1 rep, full video duration, mp4. Enables e.g. `t!ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)` or `t!ihtx negate,huehsv=0.5` or `t!ihtx ffmpeg(-vf negate),speed=0.5` directly. The `ffmpeg(...)` block itself was already supported inside full-syntax pipe chains — this change makes it reachable without specifying the positional headers.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
         "version": "v5.8",
         "date": "2026-06-27",
         "heavy": [
