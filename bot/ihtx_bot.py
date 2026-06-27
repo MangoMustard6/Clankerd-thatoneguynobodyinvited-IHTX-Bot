@@ -3089,12 +3089,33 @@ _MULTIPITCH_BIN = os.path.join(os.path.dirname(__file__), "fileaa")
 _MULTIPITCH_URL = "https://file.garden/aTXso15ukD3mnuPI/multipitch"
 
 
+def _is_native_arch(match: str) -> bool:
+    """Return True if the current machine architecture matches *match* (e.g. 'x86_64', 'aarch64')."""
+    import platform
+    return platform.machine().lower() == match.lower()
+
+
 def _ensure_multipitch_bin() -> bool:
     """Download the multipitch binary if it isn't already present and executable.
+
     Returns True if the binary is ready, False on failure.
+    On non-x86_64 hosts (e.g. Termux/aarch64) the x86-64 binary cannot run,
+    so we skip the download and return False immediately — callers must then
+    fall through to the rubberband/FFmpeg fallback path.
     """
     if os.path.isfile(_MULTIPITCH_BIN) and os.access(_MULTIPITCH_BIN, os.X_OK):
+        # Even if the file exists, it might be the wrong architecture
+        # (e.g. checked into the repo or downloaded on a different machine).
+        if not _is_native_arch("x86_64"):
+            print(f"[multipitch] skipping fileaa — host is {platform.machine()}, binary is x86-64 only")
+            return False
         return True
+
+    # Only x86_64 hosts can run the binary
+    if not _is_native_arch("x86_64"):
+        print(f"[multipitch] skipping fileaa download — host is {platform.machine()}, binary is x86-64 only")
+        return False
+
     try:
         import urllib.request
         tmp = _MULTIPITCH_BIN + ".tmp"
@@ -3124,22 +3145,70 @@ def _run_fileaa_with_fallback(
 ) -> tuple[bool, str]:
     """Run the fileaa multipitch binary; fall back to rubberband+amix on failure.
 
-    Drops the --backend and --no-normalize flags that Termux builds don't support.
+    Fallback chain (each tier tried only when the previous one fails):
+      1. fileaa binary   — fastest, single-process multi-voice (x86-64 only)
+      2. rubberband CLI  — one pass per voice, then amix (requires rubberband pkg)
+      3. FFmpeg rubberband audio filter — built into ffmpeg-full, works everywhere
     """
-    result = subprocess.run(
-        [_MULTIPITCH_BIN, in_wav, out_wav, pitches_csv],
-        capture_output=True, timeout=timeout,
-    )
-    if result.returncode == 0:
-        return True, ""
+    # ── Tier 1: fileaa binary ───────────────────────────────────────────────
+    if _ensure_multipitch_bin():
+        result = subprocess.run(
+            [_MULTIPITCH_BIN, in_wav, out_wav, pitches_csv],
+            capture_output=True, timeout=timeout,
+        )
+        if result.returncode == 0:
+            return True, ""
+        stderr_note = result.stderr.decode(errors="replace")[-300:] if result.stderr else ""
+        print(f"[multipitch] fileaa failed (exit {result.returncode}): {stderr_note}")
+    else:
+        print("[multipitch] fileaa unavailable — skipping to rubberband fallback")
 
-    # ── Fallback: rubberband CLI, one pass per semitone, then amix ────────────
+    # ── Tier 2: rubberband CLI, one pass per semitone, then amix ───────────
     rb_bin = shutil.which("rubberband")
-    if not rb_bin:
-        stderr = result.stderr.decode(errors="replace")[-600:] if result.stderr else ""
-        return False, f"fileaa failed (exit {result.returncode}) and rubberband not found. stderr: {stderr}"
+    if rb_bin:
+        voice_wavs: list[str] = []
+        all_ok = True
+        for idx, st_str in enumerate(pitches_csv.split(",")):
+            st_str = st_str.strip()
+            if not st_str:
+                continue
+            try:
+                st = float(st_str)
+            except ValueError:
+                return False, f"invalid semitone value: {st_str!r}"
+            v_wav = os.path.join(tmpdir, f"{prefix}_rb_{idx}.wav")
+            rb_res = subprocess.run(
+                [rb_bin, f"-p{st:+.4f}", "-t1", in_wav, v_wav],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if rb_res.returncode != 0:
+                print(f"[multipitch] rubberband CLI failed (voice {idx}, {st:+.2f}st): {rb_res.stderr[-300:]}")
+                all_ok = False
+                break
+            voice_wavs.append(v_wav)
 
-    voice_wavs: list[str] = []
+        if all_ok and voice_wavs:
+            mix_cmd = ["ffmpeg", "-y"]
+            for vw in voice_wavs:
+                mix_cmd += ["-i", vw]
+            mix_cmd += [
+                "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+                "-c:a", "pcm_s16le",
+                out_wav,
+            ]
+            ok, err = _run_ffmpeg_raw(mix_cmd, timeout=timeout)
+            if ok:
+                return True, ""
+            print(f"[multipitch] rubberband CLI amix failed: {err[-300:]}")
+        elif not all_ok:
+            print("[multipitch] rubberband CLI had failures — trying FFmpeg filter fallback")
+        else:
+            print("[multipitch] rubberband CLI produced no voices — trying FFmpeg filter fallback")
+
+    # ── Tier 3: FFmpeg rubberband audio filter (works on any arch) ──────────
+    #   Use one pass per voice with rubberband=pitch filter, then amix.
+    #   This requires ffmpeg compiled with --enable-librubberband (e.g. Termux ffmpeg-full).
+    voice_wavs_ff: list[str] = []
     for idx, st_str in enumerate(pitches_csv.split(",")):
         st_str = st_str.strip()
         if not st_str:
@@ -3148,23 +3217,27 @@ def _run_fileaa_with_fallback(
             st = float(st_str)
         except ValueError:
             return False, f"invalid semitone value: {st_str!r}"
-        v_wav = os.path.join(tmpdir, f"{prefix}_rb_{idx}.wav")
-        rb_res = subprocess.run(
-            [rb_bin, f"-p{st:+.4f}", "-t1", in_wav, v_wav],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if rb_res.returncode != 0:
-            return False, f"rubberband failed (voice {idx}, {st:+.2f}st): {rb_res.stderr[-400:]}"
-        voice_wavs.append(v_wav)
+        # Convert semitones to pitch ratio: 2^(N/12)
+        pitch_ratio = 2.0 ** (st / 12.0)
+        v_wav = os.path.join(tmpdir, f"{prefix}_ffrb_{idx}.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y", "-i", in_wav,
+            "-af", f"rubberband=pitch={pitch_ratio:.6f}",
+            "-c:a", "pcm_s16le",
+            v_wav,
+        ], timeout=timeout)
+        if not ok:
+            return False, f"FFmpeg rubberband filter failed (voice {idx}, {st:+.2f}st): {err[-400:]}"
+        voice_wavs_ff.append(v_wav)
 
-    if not voice_wavs:
+    if not voice_wavs_ff:
         return False, "no valid pitch voices produced"
 
     mix_cmd = ["ffmpeg", "-y"]
-    for vw in voice_wavs:
+    for vw in voice_wavs_ff:
         mix_cmd += ["-i", vw]
     mix_cmd += [
-        "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+        "-filter_complex", f"amix=inputs={len(voice_wavs_ff)}:normalize=0",
         "-c:a", "pcm_s16le",
         out_wav,
     ]
@@ -3246,44 +3319,19 @@ def _run_multipitch_rb3(
         if not ok:
             return False, f"Audio extraction failed: {err}"
 
-        # ── 5. Run fileaa (all pitches in one call, comma-separated) ─────────
+        # ── 5. Run pitch shifting (all pitches via unified fallback) ───────
         pitch_arg = ",".join(
             str(int(s)) if s == int(s) else str(s)
             for s in semitones
         )
         out_wav = os.path.join(tmpdir, "pitched.wav")
-        result = subprocess.run(
-            [_MULTIPITCH_BIN, base_wav, out_wav, pitch_arg],
-            capture_output=True, text=True, timeout=300,
+
+        # Use the unified fallback chain: fileaa → rubberband CLI → FFmpeg rubberband filter
+        ok_pitch, err_pitch = _run_fileaa_with_fallback(
+            base_wav, out_wav, pitch_arg, tmpdir, prefix="mp3_rb", timeout=300,
         )
-        if result.returncode != 0:
-            # ── Fallback: rubberband CLI — one pass per voice, then amix ─────
-            rb_bin = shutil.which("rubberband")
-            if not rb_bin:
-                return False, f"❌ Multipitch processing failed: {result.stderr[-800:]}"
-            voice_wavs: list[str] = []
-            for idx, st in enumerate(semitones):
-                v_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
-                pitch_flag = f"-p{st:+.4f}" if st != 0 else "-p+0.0"
-                rb_res = subprocess.run(
-                    [rb_bin, pitch_flag, "-t1", base_wav, v_wav],
-                    capture_output=True, text=True, timeout=300,
-                )
-                if rb_res.returncode != 0:
-                    return False, f"❌ rubberband fallback failed (voice {idx}): {rb_res.stderr[-600:]}"
-                voice_wavs.append(v_wav)
-            # Mix all voices with FFmpeg amix
-            mix_cmd = ["ffmpeg", "-y"]
-            for vw in voice_wavs:
-                mix_cmd += ["-i", vw]
-            mix_cmd += [
-                "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
-                "-c:a", "pcm_s16le",
-                out_wav,
-            ]
-            ok_mix, err_mix = _run_ffmpeg_raw(mix_cmd, timeout=180)
-            if not ok_mix:
-                return False, f"❌ amix failed: {err_mix}"
+        if not ok_pitch:
+            return False, f"❌ Multipitch processing failed: {err_pitch}"
 
         # ── 6. Remux pitched audio with original video (or audio-only) ───────
         # Use -c:v copy to preserve original timestamps exactly — re-encoding
@@ -7046,7 +7094,7 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-26",
         "heavy": [
             "**fzgm156 / freakzingagm156 / fgm156 aliases** — All four aliases (`freakzinga`, `fzgm156`, `freakzingagm156`, `fgm156`) now work for the G Major 156 pipe effect.",
-            "**multipitch2 / mp2 pipe effect** — Wave-hammer multi-voice pitch shift. Params: `<pitches> [surround_type] [sr]`. Pitches are pipe/comma-separated semitones (e.g. `mp2=1|7|8`). Optional surround types: `G-Major_17` (alimiter=15) or `Evil_Rampaging_Sorcerer` (alimiter=30). Pipeline: (1) downsample audio to sr/2, (2) run Signalsmith multipitch binary, (3) asetrate back to sr + optional alimiter, (4) remux over original video.",
+            "**multipitch2 / mp2 pipe effect** — Wave-hammer multi-voice pitch shift. Params: `<pitches> [surround_type] [sr]`. Pitches are pipe/comma-separated semitones (e.g. `mp2=1|7|8`). Optional surround types: `G-Major_17` (alimiter=15) or `Evil_Rampaging_Sorcerer` (alimiter=30). Pipeline: (1) downsample audio to sr/2, (2) pitch-shift with auto fallback (Signalsmith binary on x86_64, rubberband CLI, or FFmpeg rubberband filter on ARM/Termux), (3) asetrate back to sr + optional alimiter, (4) remux over original video. Works on all architectures including Termux (aarch64).",
         ],
         "fun": [],
         "owner": [],
