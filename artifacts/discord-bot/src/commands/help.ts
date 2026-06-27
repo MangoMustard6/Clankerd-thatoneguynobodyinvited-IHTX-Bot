@@ -71,6 +71,7 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
           value: [
             '`t!dl <url>` *dv download dlv* — Download video/image from URL → Discord',
             '`t!download <url>` — Same via yt-dlp (TypeScript bot)',
+            '`t!ffmpegprocess <args>` *fmp* — FFmpeg on attachment with ffprobe metadata inspection (TypeScript bot)',
             '`t!catbox` *cb upload* — Upload attachment to catbox.moe (200 MB, permanent link)',
           ].join('\n'),
         },

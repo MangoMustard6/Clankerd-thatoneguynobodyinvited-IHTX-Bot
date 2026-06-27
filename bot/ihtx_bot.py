@@ -4649,6 +4649,181 @@ async def ffmpeg_raw_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Upload failed: {e}")
 
 
+# ---------- t!ffmpegprocess — FFmpeg with ffprobe metadata inspection ----------
+
+async def _run_ffprobe_field(args: list) -> str:
+    """Run a single ffprobe query and return stripped stdout, or 'N/A' on failure."""
+    try:
+        loop = asyncio.get_event_loop()
+        proc = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["ffprobe"] + args,
+                capture_output=True, text=True, timeout=10
+            )
+        )
+        return proc.stdout.strip() or "N/A"
+    except Exception:
+        return "N/A"
+
+
+async def _gather_media_metadata(file_path: str) -> dict:
+    """Gather video/audio metadata using ffprobe (all fields in parallel)."""
+    tasks = {
+        "sampleRate": _run_ffprobe_field(["-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate",
+            "-of", "default=nokey=1:noprint_wrappers=1", file_path]),
+        "frameRate": _run_ffprobe_field(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=nokey=1:noprint_wrappers=1", file_path]),
+        "duration": _run_ffprobe_field(["-i", file_path,
+            "-show_entries", "format=duration",
+            "-v", "quiet", "-of", "csv=p=0"]),
+        "width": _run_ffprobe_field(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width",
+            "-of", "default=nw=1:nk=1", file_path]),
+        "height": _run_ffprobe_field(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=height",
+            "-of", "default=nw=1:nk=1", file_path]),
+        "frameCount": _run_ffprobe_field(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1", file_path]),
+    }
+    results = {}
+    for key, coro in tasks.items():
+        results[key] = await coro
+    return results
+
+
+@bot.command(name="ffmpegprocess", aliases=["fmp"])
+async def ffmpeg_process_command(ctx: commands.Context, *, args: str = ""):
+    """Run FFmpeg on an attachment and inspect the input with ffprobe.
+
+    Gathers sample rate, frame rate, duration, resolution, and frame count
+    before processing, then shows them in the response footer.
+
+    Args go between -i <input> and <output>. Output filename matches input.
+
+    Usage:
+      t!ffmpegprocess -vf scale=1280:-1 -c:v libx264 -crf 23
+      t!ffmpegprocess -vf negate
+      t!ffmpegprocess -af volume=2.0
+    """
+    if not args:
+        await ctx.reply(
+            "**t!ffmpegprocess** — Run FFmpeg on an attachment with ffprobe metadata inspection.\n"
+            "Args are inserted between `-i <input>` and `<output>`.\n\n"
+            "**Usage:** `t!ffmpegprocess <ffmpeg args>`  *(alias: fmp)*\n"
+            "**Examples:**\n"
+            "`t!ffmpegprocess -vf scale=1280:-1 -c:v libx264 -crf 23`\n"
+            "`t!ffmpegprocess -vf negate`\n"
+            "`t!ffmpegprocess -af volume=2.0`"
+        )
+        return
+
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply("❌ Attach a file to use `t!ffmpegprocess`.")
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply("❌ File too large (max 25 MB).")
+        return
+
+    args_display = args if len(args) <= 80 else args[:79] + "…"
+    status_msg = await ctx.reply(f"⏳ Probing + processing `{args_display}`…")
+
+    start_time = time.time()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        suffix = Path(attachment.filename).suffix.lower()
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, attachment.filename)
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Download failed: {e}")
+            return
+
+        # Gather metadata with ffprobe
+        meta = await _gather_media_metadata(input_path)
+
+        try:
+            user_args = shlex.split(args)
+        except ValueError as e:
+            await status_msg.edit(content=f"❌ Invalid ffmpeg args: {e}")
+            return
+
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+        ] + user_args + [output_path]
+
+        loop = asyncio.get_event_loop()
+        ok, err_log = await loop.run_in_executor(None, _run_ffmpeg_raw, cmd, 180)
+
+        elapsed = round(time.time() - start_time, 3)
+
+        # Build metadata line
+        meta_parts = []
+        if meta["width"] != "N/A" and meta["height"] != "N/A":
+            meta_parts.append(f"{meta['width']}×{meta['height']}")
+        if meta["frameRate"] != "N/A":
+            meta_parts.append(f"{meta['frameRate']} fps")
+        if meta["duration"] != "N/A":
+            try:
+                meta_parts.append(f"{float(meta['duration']):.2f}s")
+            except ValueError:
+                meta_parts.append(meta["duration"])
+        if meta["sampleRate"] != "N/A":
+            meta_parts.append(f"{meta['sampleRate']} Hz")
+        if meta["frameCount"] != "N/A":
+            meta_parts.append(f"{meta['frameCount']} frames")
+        meta_line = f"-# Input: {' · '.join(meta_parts)}" if meta_parts else ""
+
+        if not ok:
+            err_block = f"\n```\n{err_log.strip()[-1200:]}\n```" if err_log and err_log.strip() else ""
+            await status_msg.edit(content=f"❌ FFmpeg failed (took {elapsed}s){err_block}")
+            return
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            await status_msg.edit(content="❌ FFmpeg produced no output file.")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output too large for Discord (>25 MB).")
+            return
+
+        footer_parts = []
+        if meta_line:
+            footer_parts.append(meta_line)
+        if err_log and err_log.strip():
+            footer_parts.append(f"-# Error Log:\n```\n{err_log.strip()[-800:]}\n```")
+        footer_parts.append(f"-# Took {elapsed} seconds.")
+        footer = "\n".join(footer_parts)
+
+        try:
+            await ctx.reply(
+                content=footer,
+                file=discord.File(output_path, filename=attachment.filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Upload failed: {e}")
+
+
 # ---------- t!trim — precise media trimmer ----------
 
 _TRIM_SUPPORTED_EXTS = {
@@ -6713,6 +6888,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.8",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!ffmpegprocess`** *(alias: fmp)* — FFmpeg on attachment with automatic ffprobe metadata inspection. Gathers sample rate, frame rate, duration, resolution (W×H), and frame count from the input before processing. All 6 ffprobe fields are gathered in parallel. Footer shows `-# Input: WxH · fps · duration · Hz · frames` plus any FFmpeg error log and elapsed time. Args placed between `-i <input>` and `<output>` just like `t!ffmpeg`. Also available as `t!fmp` in both the Python and TypeScript bots.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.7",
         "date": "2026-06-27",
