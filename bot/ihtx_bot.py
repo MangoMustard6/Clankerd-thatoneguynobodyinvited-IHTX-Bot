@@ -629,15 +629,29 @@ async def download_attachment(attachment: discord.Attachment, dest: str):
 
 
 async def download_url(url: str, dest: str):
-    """Download an arbitrary URL to path `dest`."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+    """Download an arbitrary URL to path `dest`.
+
+    Streams the response in chunks to avoid loading large files into memory,
+    sets a browser-like User-Agent to prevent server disconnects, and applies
+    a generous timeout so large video files complete reliably.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+    timeout = aiohttp.ClientTimeout(total=300, connect=15)
+    tmp = dest + ".part"
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as resp:
             if resp.status != 200:
                 raise ValueError(f"Failed to download URL (HTTP {resp.status})")
-            data = await resp.read()
-    tmp = dest + ".part"
-    with open(tmp, "wb") as f:
-        f.write(data)
+            with open(tmp, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 256):
+                    f.write(chunk)
     os.replace(tmp, dest)
 
 
@@ -5582,7 +5596,7 @@ async def huehsv_command(ctx: commands.Context, hue: float = 0.5):
 
 
 @bot.command(name="png2lut", aliases=["lut2cube"])
-async def png2lut_cmd(ctx: commands.Context, lut_size: int = 64, *, output_name: str = ""):
+async def png2lut_cmd(ctx: commands.Context, *, args: str = ""):
     """Convert a tiled LUT PNG to a .cube file.
 
     Usage:
@@ -5591,6 +5605,18 @@ async def png2lut_cmd(ctx: commands.Context, lut_size: int = 64, *, output_name:
     Attach a tiled LUT PNG (e.g. 512×512 for a 64-size LUT).
     lut_size defaults to 64. output_name sets the .cube filename stem.
     """
+    # Parse args manually to avoid discord.py failing to cast non-numeric first token to int
+    tokens = args.split()
+    lut_size = 64
+    output_name = ""
+    if tokens:
+        try:
+            lut_size = int(tokens[0])
+            output_name = " ".join(tokens[1:])
+        except ValueError:
+            # First token isn't a number — treat entire string as output_name
+            output_name = args.strip()
+
     if _PIL_Image is None:
         await ctx.reply("❌ Pillow is not installed — cannot read PNG pixel data.")
         return
@@ -6888,6 +6914,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.0",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!png2lut` bugfix** — Fixed `Bad argument: Converting to \"int\" failed for parameter \"lut_size\"`. The command now takes `*, args: str = \"\"` and parses `lut_size` manually, so `t!png2lut my_lut_name` no longer crashes before the function runs.",
+            "**`t!addsource` / `download_url` bugfix** — Fixed `Overlay download failed: Server disconnected`. `download_url` now uses a browser-like `User-Agent` header, 300 s total / 15 s connect timeout, `allow_redirects=True`, and streams the response in 256 KB chunks instead of loading the whole file into memory. Fixes disconnects from servers that reject headless clients and improves reliability on large video files.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.9",
         "date": "2026-06-27",
