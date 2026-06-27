@@ -1342,6 +1342,84 @@ def _run_autotune_reference(
         return True, f"{base_hz:.1f} Hz → {ref_hz:.1f} Hz ({shift_st:+.2f} st)"
 
 
+# ---------- Grid overlay (t!addsource) ----------
+
+def _run_grid_overlay(
+    base_path: str,
+    overlay_path: str,
+    rows: int,
+    cols: int,
+    pos: int,          # 1-indexed
+    output_path: str,
+    use_base_audio: bool = False,
+) -> tuple[bool, str]:
+    """Overlay overlay_path into a specific grid cell of base_path.
+
+    The base frame is divided into a rows×cols grid.  pos is 1-indexed,
+    counted left-to-right then top-to-bottom.  The overlay is scaled to
+    exactly fill the cell.  Audio defaults to the overlay track; pass
+    use_base_audio=True to inherit the base audio instead.
+    """
+    import subprocess as _sp
+
+    # ── 1. Probe base dimensions ───────────────────────────────────────────────
+    r = _sp.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", base_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return False, f"ffprobe (dimensions) failed: {r.stderr}"
+    try:
+        base_w, base_h = map(int, r.stdout.strip().split(","))
+    except Exception:
+        return False, f"Could not parse base dimensions: {r.stdout!r}"
+
+    # ── 2. Probe base duration ─────────────────────────────────────────────────
+    r2 = _sp.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", base_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    base_dur: float | None = None
+    if r2.returncode == 0:
+        try:
+            base_dur = float(r2.stdout.strip())
+        except Exception:
+            pass
+
+    # ── 3. Calculate cell geometry ─────────────────────────────────────────────
+    idx   = pos - 1
+    row   = idx // cols
+    col   = idx % cols
+    cell_w = base_w // cols
+    cell_h = base_h // rows
+    x_pos  = col * cell_w
+    y_pos  = row * cell_h
+
+    # ── 4. Build FFmpeg filter_complex ─────────────────────────────────────────
+    filter_complex = (
+        f"[0:v]scale={base_w}:{base_h}[base];"
+        f"[1:v]format=rgb24,scale={cell_w}:{cell_h}[ov];"
+        f"[base][ov]overlay={x_pos}:{y_pos}"
+    )
+
+    audio_map = ["-map", "0:a?"] if use_base_audio else ["-map", "1:a?"]
+    dur_args  = ["-t", str(base_dur)] if base_dur else []
+
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+        "-i", base_path,
+        "-i", overlay_path,
+        "-filter_complex", filter_complex,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+    ] + audio_map + dur_args + ["-shortest", output_path]
+
+    return _run_ffmpeg_raw(cmd, timeout=300)
+
+
 # ---------- Vocoder ----------
 
 _VOCODER_PROFILES: dict[str, dict] = {
@@ -4923,6 +5001,156 @@ async def autotune_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Upload failed: {exc}")
 
 
+# ---------- t!addsource — grid-cell video overlay ----------
+
+@bot.command(name="addsource")
+async def addsource_command(ctx: commands.Context, *, args: str = ""):
+    """Overlay a secondary video onto a specific grid cell of a base video.
+
+    Usage:
+      t!addsource <overlay_url> <grid> <pos> [--base-audio]
+
+    Arguments:
+      overlay_url   URL of the video to place in the cell
+      grid          Grid size as RxC, e.g. 2x2, 3x3, 4x4
+      pos           1-indexed cell number (left-to-right, top-to-bottom)
+      --base-audio  Use base video audio instead of overlay audio (optional)
+
+    Base video: attach to the message or reply to a message containing one.
+
+    Examples:
+      t!addsource https://example.com/clip.mp4 2x2 3
+      t!addsource https://example.com/clip.mp4 3x3 5 --base-audio
+    """
+    import re as _re
+
+    use_base_audio = "--base-audio" in args
+    args = args.replace("--base-audio", "").strip()
+
+    # ── Parse tokens ──────────────────────────────────────────────────────────
+    overlay_url: str | None = None
+    grid_str:    str | None = None
+    pos_str:     str | None = None
+
+    for tok in args.split():
+        if tok.startswith(("http://", "https://")) and overlay_url is None:
+            overlay_url = tok
+        elif _re.match(r"^\d+x\d+$", tok, _re.IGNORECASE) and grid_str is None:
+            grid_str = tok.lower()
+        elif tok.isdigit() and pos_str is None and grid_str is not None:
+            pos_str = tok
+
+    if not overlay_url or not grid_str or not pos_str:
+        await ctx.reply(
+            "❌ Usage: `t!addsource <overlay_url> <grid> <pos>`\n"
+            "Example: `t!addsource https://... 2x2 3`\n"
+            "Attach or reply to the base video.\n"
+            "Optional flag: `--base-audio` to keep base audio instead of overlay."
+        )
+        return
+
+    try:
+        rows, cols = map(int, grid_str.split("x"))
+        pos = int(pos_str)
+    except ValueError:
+        await ctx.reply("❌ Invalid grid format. Use `RxC` like `2x2` or `3x3`.")
+        return
+
+    if rows < 1 or cols < 1:
+        await ctx.reply("❌ Grid dimensions must be at least 1×1.")
+        return
+    if pos < 1 or pos > rows * cols:
+        await ctx.reply(f"❌ Position must be between 1 and {rows * cols} for a {rows}×{cols} grid.")
+        return
+
+    # ── Resolve base media ────────────────────────────────────────────────────
+    attachment: discord.Attachment | None = None
+    base_url: str | None = None
+
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message.reference:
+        try:
+            ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref_msg.attachments:
+                attachment = ref_msg.attachments[0]
+            else:
+                for tok in ref_msg.content.split():
+                    if tok.startswith(("http://", "https://")):
+                        base_url = tok
+                        break
+        except Exception:
+            pass
+
+    if attachment is None and base_url is None:
+        await ctx.reply("❌ No base video found. Attach one to the message or reply to a message that has one.")
+        return
+
+    src_name = attachment.filename if attachment else urllib.parse.urlparse(base_url).path
+    suffix   = Path(src_name).suffix.lower() or ".mp4"
+
+    status_msg = await ctx.reply("⬇️ Downloading base video…", mention_author=False)
+    loop = asyncio.get_event_loop()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base_path    = os.path.join(tmpdir, f"base{suffix}")
+        overlay_path = os.path.join(tmpdir, "overlay.mp4")
+        output_path  = os.path.join(tmpdir, "output.mp4")
+
+        # Download base
+        try:
+            if attachment:
+                await download_attachment(attachment, base_path)
+            else:
+                await download_url(base_url, base_path)
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Base download failed: `{exc}`")
+            return
+
+        # Download overlay
+        await status_msg.edit(content="⬇️ Downloading overlay…")
+        try:
+            await download_url(overlay_url, overlay_path)
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Overlay download failed: `{exc}`")
+            return
+
+        # Composite
+        await status_msg.edit(content=f"🔧 Compositing `{grid_str}` grid, cell {pos}…")
+        ok, err = await loop.run_in_executor(
+            None, _run_grid_overlay,
+            base_path, overlay_path, rows, cols, pos, output_path, use_base_audio,
+        )
+        if not ok:
+            await status_msg.edit(content=f"❌ FFmpeg failed:\n```\n{err[-1200:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            catbox_url = await _upload_to_catbox(output_path)
+            if catbox_url:
+                await status_msg.edit(
+                    content=f"✅ Grid overlay done (file >25 MB, uploaded to Catbox):\n{catbox_url}"
+                )
+            else:
+                await status_msg.edit(content="❌ Output too large for Discord (>25 MB) and Catbox upload failed.")
+            return
+
+        stem = Path(src_name).stem
+        out_filename = f"addsource_{grid_str}_pos{pos}_{stem}.mp4"
+        audio_note = "base audio" if use_base_audio else "overlay audio"
+
+        try:
+            await ctx.reply(
+                content=f"✅ Grid `{grid_str}`, cell {pos} — {audio_note}",
+                file=discord.File(output_path, filename=out_filename),
+                mention_author=False,
+            )
+            await status_msg.delete()
+        except discord.HTTPException as exc:
+            await status_msg.edit(content=f"❌ Upload failed: `{exc}`")
+
+
 # ---------- t!mirror — mirror presets via FFmpeg split/crop/flip/stack ----------
 
 # Each preset is (vf_filter, description)
@@ -6485,6 +6713,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.7",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!addsource`** — Grid-cell video overlay. Overlays a secondary video into a specific cell of a rows×cols grid on a base video. Usage: `t!addsource <overlay_url> <grid> <pos>` (e.g. `t!addsource https://... 2x2 3`). Grid is `RxC`, pos is 1-indexed left-to-right top-to-bottom. Optional `--base-audio` flag. Outputs to Catbox automatically when >25 MB. Mirrors the TypeScript overlayOnGrid() logic directly in Python/FFmpeg.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.6",
         "date": "2026-06-27",
