@@ -137,7 +137,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -1786,6 +1786,7 @@ PIPE_EFFECT_NAMES = {
     "swirl",
     "sierpinskiransomware",
     "preview1280", "scale1280",
+    "oppositep1280", "op1280",
     "earthquake", "nbfx",
     "ssmp", "soundstretchmultipitch",
     "folkvalley", "fv",
@@ -2483,6 +2484,23 @@ def _apply_pipe_effects(
                 )
                 if not ok:
                     return False, f"preview1280 pipe failed: {err}"
+                current = out
+                continue
+
+            # oppositep1280 / op1280 — inverse TV-simulator montage pipeline as a pipe step
+            if name in ("oppositep1280", "op1280"):
+                def _op1280(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                ok, err = _run_oppositep1280(
+                    current, out,
+                    start_offset=_op1280(0, 1.85),
+                    segment_dur=_op1280(1, 0.85),
+                )
+                if not ok:
+                    return False, f"oppositep1280 pipe failed: {err}"
                 current = out
                 continue
 
@@ -3923,6 +3941,259 @@ def _run_preview1280(
         return _run_ffmpeg_raw(cmd, timeout=180)
 
 
+def _generate_opposite_hald_cluts(workdir: str) -> list[str]:
+    """Generate Hald CLUT .ppm files for the *opposite* (negative) hue shifts used by oppositep1280.
+
+    Returns paths to [hslhue_neg54.ppm, hslhue_180.ppm, hslhue_neg21_6.ppm, hslhue_neg108_neg30.ppm].
+    These are the inverse hue shifts of the preview1280 CLUTs:
+      preview +54°  → opposite -54°
+      preview +22°  → opposite -21.6°
+      preview +108°/+30sat → opposite -108°/-30sat
+    The +180° CLUT is shared between both pipelines.
+    """
+    clut_specs = [
+        # hslhue_neg54: hue shift -54° → fraction -0.3, mod = -0.3*200+100 = 40... nope.
+        # ImageMagick formula: hue_shift_deg / 1.8 + 100
+        # -54/1.8+100 = -30+100 = 70
+        ("hslhue_neg54.ppm", 100, 100, 70),
+        # hslhue_180: same as preview1280 (fraction 0.5, mod = 0.5*200+100 = 200)
+        ("hslhue_180.ppm", 100, 100, 200),
+        # hslhue_neg21_6: -21.6/1.8+100 = -12+100 = 88
+        ("hslhue_neg21_6.ppm", 100, 100, 88),
+        # hslhue_neg108_neg30: -108° hue + saturation drop to 70
+        # -108/1.8+100 = -60+100 = 40
+        ("hslhue_neg108_neg30.ppm", 100, 70, 40),
+    ]
+    paths = []
+    for filename, brightness, saturation, hue_mod in clut_specs:
+        path = os.path.join(workdir, filename)
+        cmd = [
+            "magick", "hald:4",
+            "-modulate", f"{brightness},{saturation},{hue_mod}",
+            path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            pass  # CLUT effects will be skipped if magick isn't available
+        paths.append(path)
+    return paths
+
+
+def _run_oppositep1280(
+    input_path: str,
+    output_path: str,
+    start_offset: float = 1.85,
+    segment_dur: float = 0.85,
+    force_output_size: tuple[int, int] | None = None,
+) -> tuple[bool, str]:
+    """Run the oppositep1280 TV-simulator montage pipeline.
+
+    This is the *inverse* of preview1280: all hue shifts are negated and all
+    pitch shifts are inverted (positive semitones become negative and vice-versa).
+    The pipeline structure (12 segments, displacement map, timing) is identical.
+
+    Requires: ffmpeg, ImageMagick (magick), and the tvsimulator.mov displacement map.
+    Uses rubberband audio filter for high-quality pitch shifting.
+    """
+    # Helper: rubberband pitch filter string for N semitones
+    def _rb(semitones: float, transients: str = "mixed") -> str:
+        pitch_ratio = 2 ** (semitones / 12)
+        return (
+            f"rubberband=pitch={pitch_ratio:.6f}:"
+            f"window=short:transients={transients}:"
+            f"detector=soft:channels=together:pitchq=consistency"
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        info = _ffprobe_video_info(input_path)
+        w, h = info["width"], info["height"]
+        dur = info["duration"]
+
+        if w == 0 or h == 0:
+            return False, "Could not read input video dimensions."
+
+        # Generate Hald CLUTs (opposite/negative hues)
+        cluts = _generate_opposite_hald_cluts(tmpdir)
+        clut_neg54 = cluts[0] if os.path.exists(cluts[0]) else None
+        clut_180 = cluts[1] if os.path.exists(cluts[1]) else None
+        clut_neg21_6 = cluts[2] if os.path.exists(cluts[2]) else None
+        clut_neg108_neg30 = cluts[3] if os.path.exists(cluts[3]) else None
+
+        # Locate displacement map
+        disp_map = None
+        for candidate in [
+            "bot/displacemaps/tvsimulator.mov",
+            "displacemaps/tvsimulator.mov",
+            "/app/bot/displacemaps/tvsimulator.mov",
+        ]:
+            if os.path.exists(candidate):
+                disp_map = candidate
+                break
+
+        # Compute timing
+        t = segment_dur
+        t2 = segment_dur / 2
+        t3 = start_offset + segment_dur
+
+        # Step 1: Pre-process input to 640x360 FFV1
+        avi0 = os.path.join(tmpdir, "0.avi")
+        cmd = [
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", input_path,
+            "-vf", "scale=640:360,setsar=1:1",
+            "-ss", str(start_offset), "-to", str(t3),
+            "-c:v", "ffv1", "-c:a", "pcm_s16le",
+            avi0
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Step 1 (pre-process) failed: {err}"
+
+        avi_w = _ffprobe(avi0, "-select_streams", "v:0",
+                         "-show_entries", "stream=width",
+                         "-of", "default=nw=1:nk=1") or "640"
+        avi_h = _ffprobe(avi0, "-select_streams", "v:0",
+                         "-show_entries", "stream=height",
+                         "-of", "default=nw=1:nk=1") or "360"
+
+        # Helper to build segment ffmpeg commands
+        segments = []
+
+        # ── Segment 1: plain copy, duration t ─────────────────────────────
+        seg1 = os.path.join(tmpdir, "1.avi")
+        segments.append(([
+            "ffmpeg", "-y", "-i", avi0,
+            "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+            seg1
+        ], seg1))
+
+        # ── Segment 2: hue -54 (hslhue_neg54), pitch -1 semitone ──────────
+        seg2 = os.path.join(tmpdir, "2.avi")
+        if clut_neg54:
+            segments.append(([
+                "ffmpeg", "-y", "-i", avi0,
+                "-vf", f"movie={clut_neg54},[in]haldclut,format=yuv420p",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg2
+            ], seg2))
+        else:
+            segments.append(([
+                "ffmpeg", "-y", "-i", avi0,
+                "-vf", "hue=h=-54",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg2
+            ], seg2))
+
+        # ── Segment 3: hue +180 + displacement map + mirror + pitch +2 st ──
+        seg3 = os.path.join(tmpdir, "3.avi")
+        if disp_map and clut_180:
+            fc = (
+                f"movie={clut_180}[h];"
+                f"[0][h]haldclut,hflip,crop=iw/2:ih:0:0,split[left][tmp];"
+                f"[tmp]hflip[right];[left][right]hstack,format=yuv420p,format=bgr32[00];"
+                f"[1]crop=iw:ih/1:0:0,scale={avi_w}:{avi_h},eq=contrast=0.375,format=bgr32,hue=b=-0.033[x];"
+                f"nullsrc=1x1,geq=r=128:g=128:b=128,scale={avi_w}:{avi_h},format=bgr32[y];"
+                f"[00][x][y]displace=edge=wrap[v]"
+            )
+            segments.append(([
+                "ffmpeg", "-y", "-i", avi0, "-stream_loop", "-1", "-i", disp_map,
+                "-filter_complex", fc,
+                "-af", _rb(2),
+                "-map", "[v]", "-map", "0:a",
+                "-pix_fmt", "yuv420p",
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg3
+            ], seg3))
+        else:
+            # Fallback without displacement
+            segments.append(([
+                "ffmpeg", "-y", "-i", avi0,
+                "-vf", "hue=h=180,hflip,crop=iw/2:ih:0:0,split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p",
+                "-af", _rb(2),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg3
+            ], seg3))
+
+        # ── Segment 4: hue -54 (hslhue_neg54), pitch -1 semitone ──────────
+        seg4 = os.path.join(tmpdir, "4.avi")
+        if clut_neg54:
+            segments.append(([
+                "ffmpeg", "-y", "-i", avi0,
+                "-vf", f"movie={clut_neg54},[in]haldclut,format=yuv420p",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg4
+            ], seg4))
+        else:
+            segments.append(([
+                "ffmpeg", "-y", "-i", avi0,
+                "-vf", "hue=h=-54",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg4
+            ], seg4))
+
+        # ── Segments 5-12: shorter segments (t2 duration) ──────────────────
+        # oppositep1280 pitches are the inverse of preview1280:
+        #   preview +2 st (smooth) → opposite -2 st (smooth)
+        #   preview +1 st         → opposite -1 st
+        #   preview +3 st         → opposite -3 st
+        #   preview -2 st         → opposite +2 st
+        short_specs = [
+            # (seg_num, vf_filter, af_filter)
+            (5, None, None),  # plain copy
+            (6, f"movie={clut_neg21_6},[in]haldclut,hflip,format=yuv420p" if clut_neg21_6 else "hue=h=-21.6,hflip,format=yuv420p",
+             _rb(-2, "smooth")),  # hue-21.6, hflip, pitch-2 (smooth transients)
+            (7, f"movie={clut_neg54},[in]haldclut,format=yuv420p" if clut_neg54 else "hue=h=-54,format=yuv420p",
+             _rb(-1)),  # hue-54, pitch-1
+            (8, f"movie={clut_neg108_neg30},[in]haldclut,hflip,format=yuv420p" if clut_neg108_neg30 else "hue=h=-108,hflip,format=yuv420p",
+             _rb(-3)),  # hue-108-sat30, hflip, pitch-3
+            (9, f"movie={clut_180},[in]haldclut,format=yuv420p" if clut_180 else "hue=h=180,format=yuv420p",
+             _rb(2)),  # hue+180, pitch+2
+            (10, "hflip", None),  # just hflip
+            (11, f"movie={clut_neg54},[in]haldclut,format=yuv420p" if clut_neg54 else "hue=h=-54,format=yuv420p",
+             _rb(-1)),  # hue-54, pitch-1
+            (12, f"movie={clut_neg108_neg30},[in]haldclut,hflip,format=yuv420p" if clut_neg108_neg30 else "hue=h=-108,hflip,format=yuv420p",
+             _rb(-3)),  # hue-108-sat30, hflip, pitch-3
+        ]
+
+        for seg_num, vf, af in short_specs:
+            seg_path = os.path.join(tmpdir, f"{seg_num}.avi")
+            cmd = ["ffmpeg", "-y", "-i", avi0]
+            if vf:
+                cmd.extend(["-vf", vf])
+            if af:
+                cmd.extend(["-af", af])
+            cmd.extend(["-t", str(t2), "-c:v", "ffv1", "-c:a", "pcm_s16le", seg_path])
+            segments.append((cmd, seg_path))
+
+        # Render all segments
+        for i, (cmd, seg_path) in enumerate(segments):
+            ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+            if not ok:
+                return False, f"Segment {i+1}/{len(segments)} failed: {err}"
+
+        # Concat all segments using concat protocol
+        avi_files = [sp for _, sp in segments if os.path.exists(sp)]
+        if not avi_files:
+            return False, "No segments were produced."
+
+        concat_str = "|".join(avi_files)
+        out_w, out_h = force_output_size if force_output_size else (w, h)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", f"concat:{concat_str}",
+            "-vf", f"scale={out_w}:{out_h},setsar=1",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        return _run_ffmpeg_raw(cmd, timeout=180)
+
+
+
 # ---------- Bot events & commands ----------
 
 @tasks.loop(seconds=5)
@@ -4291,6 +4562,102 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
             embed_p1280.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
             await ctx.reply(
                 embed=embed_p1280,
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
+@bot.command(name="oppositep1280", aliases=["op1280", "opposite", "opposite1280"])
+async def oppositep1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
+    """Create a 12-segment inverse TV-simulator montage from an attached video.
+
+    The *opposite* of preview1280: all hue shifts are negated and all pitch
+    shifts are inverted. Usage: t!oppositep1280 [start_offset] [segment_duration]
+    Aliases: t!op1280, t!opposite, t!opposite1280
+    Default: start=1.85, duration=0.85
+    """
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "**IHTX OppositeP1280**\n"
+            "Attach a video and use `t!oppositep1280 [start] [duration]`.\n\n"
+            "Creates a 12-segment TV-simulator montage with **inverse** hue shifts "
+            "and **negated** pitch variations compared to preview1280.\n\n"
+            "Defaults: start=1.85s, duration=0.85s per segment.\n"
+            "Aliases: `t!op1280`, `t!opposite`, `t!opposite1280`\n"
+            "Example: `t!op1280 2.0 1.0`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"OppositeP1280 requires a video file. Got `{suffix}`.")
+        return
+
+    start = max(0.0, start)
+    duration = max(0.1, min(duration, 10.0))
+
+    status_msg = await ctx.reply(
+        f"⚙️ Creating **oppositep1280** montage (start={start}s, dur={duration}s)... this will take a while."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_op1280.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        # Ensure displacement map is available
+        try:
+            disp_path = await _ensure_displacement_map(tmpdir)
+        except FileNotFoundError as e:
+            await status_msg.edit(content=f"❌ {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_oppositep1280, input_path, output_path, start, duration
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ OppositeP1280 failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try shorter segments.")
+            return
+
+        out_filename = f"op1280_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed_op1280 = discord.Embed(
+                title="Opposite 1280 - Inverse TV-simulator montage",
+                description="All hue shifts negated · All pitch shifts inverted vs preview1280",
+                color=11578404,
+            )
+            embed_op1280.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
+            await ctx.reply(
+                embed=embed_op1280,
                 file=discord.File(output_path, filename=out_filename),
             )
             await status_msg.delete()
@@ -6700,6 +7067,11 @@ _HELP_ENTRIES: list[dict] = [
     },
     {
         "cat": "heavy",
+        "name": "t!oppositep1280 [start] [dur]  (aliases: op1280, opposite, opposite1280)",
+        "value": "Inverse TV-simulator montage: all hue shifts negated, all pitch shifts inverted vs preview1280. Defaults: start=1.85, dur=0.85",
+    },
+    {
+        "cat": "heavy",
         "name": "t!preview1280with640x360resize [start] [dur]  (aliases: p1280ff!3, p1280w16:9r)",
         "value": "Same 12-segment TV-simulator montage as preview1280 but the final output is locked to **640×360** regardless of input resolution. Defaults: start=1.85, dur=0.85",
     },
@@ -7012,6 +7384,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.2",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!oppositep1280` / `t!op1280`** — New command: inverse TV-simulator montage. All hue shifts are negated and all pitch shifts are inverted compared to preview1280, producing the visual/audio 'opposite' effect. Supports the same 12-segment pipeline with configurable start offset and segment duration. Also available as a pipe effect (`oppositep1280` / `op1280`) in custom IHTX chains.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v6.1",
         "date": "2026-06-27",
@@ -8599,6 +8980,7 @@ Heavy (media processing):
 - t!syncaudio [alt] — sync video and audio durations
 - t!trim <start> <end> — trim audio/video/GIF
 - t!preview1280 [start] [dur] — 12-segment TV-simulator montage
+- t!oppositep1280 [start] [dur] — inverse TV-simulator montage (negated hues, inverted pitches)
 - t!invlum [n] — luma-inversion loop
 - t!lexg — re-apply last export effect chain to new media
 
