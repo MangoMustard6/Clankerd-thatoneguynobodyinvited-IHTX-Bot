@@ -1196,6 +1196,152 @@ def _run_autotune(
         return True, f"autotune: {dominant_hz:.1f} Hz → {correction_st:+.2f} st correction"
 
 
+# ---------- Reference-based autotune (t!autotune / t!autotoon) ----------
+
+def _pitch_detect_wav_stdlib(wav_path: str, min_hz: float = 80.0, max_hz: float = 1200.0) -> float | None:
+    """Autocorrelation pitch detector — pure Python stdlib, no numpy required."""
+    import wave, struct, math
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            sr = wf.getframerate()
+            nch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            total = wf.getnframes()
+            skip = total // 4
+            use = min(sr, max(0, total - skip))  # ≤ 1 second
+            if use <= 0:
+                return None
+            wf.setpos(skip)
+            raw = wf.readframes(use)
+        fmt = {1: "b", 2: "h", 4: "i"}.get(sw)
+        if not fmt:
+            return None
+        n_raw = (len(raw) // (sw * nch)) * (sw * nch)
+        raw = raw[:n_raw]
+        all_s = struct.unpack(f"{len(raw) // sw}{fmt}", raw)
+        if nch > 1:
+            samples = [sum(all_s[i:i + nch]) / nch for i in range(0, len(all_s) - nch + 1, nch)]
+        else:
+            samples = list(all_s)
+        peak = max((abs(s) for s in samples), default=1) or 1
+        samples = [s / peak for s in samples]
+        frame_sz = 512
+        hop = frame_sz // 2
+        min_lag = max(1, int(sr / max_hz))
+        max_lag = int(sr / min_hz)
+        found: list[float] = []
+        for start in range(0, max(1, len(samples) - frame_sz), hop):
+            f = samples[start:start + frame_sz]
+            if len(f) < frame_sz:
+                break
+            rms = math.sqrt(sum(x * x for x in f) / frame_sz)
+            if rms < 0.01:
+                continue
+            best, best_lag = -1e18, min_lag
+            for lag in range(min_lag, min(max_lag, frame_sz // 2)):
+                c = sum(f[i] * f[i + lag] for i in range(frame_sz - lag))
+                if c > best:
+                    best, best_lag = c, lag
+            if best > 0:
+                found.append(sr / best_lag)
+        if not found:
+            return None
+        found.sort()
+        return found[len(found) // 2]
+    except Exception:
+        return None
+
+
+def _ytdlp_download_audio_wav(query_or_url: str, output_wav: str, max_dur: int = 600) -> tuple[bool, str]:
+    """Download audio as mono 44 100 Hz WAV using yt-dlp.
+
+    query_or_url may be a full URL or a plain search query (searched on YouTube).
+    """
+    import subprocess as _sp, tempfile as _tf, os as _os
+    is_url = query_or_url.startswith(("http://", "https://"))
+    source = query_or_url if is_url else f"ytsearch1:{query_or_url}"
+    with _tf.TemporaryDirectory() as dl_dir:
+        tmpl = _os.path.join(dl_dir, "ref.%(ext)s")
+        cmd = [
+            "yt-dlp", "--no-playlist", "-x",
+            "--audio-format", "wav",
+            "--audio-quality", "0",
+            "--no-warnings",
+            "-o", tmpl,
+            source,
+        ]
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return False, f"yt-dlp error: {r.stderr[-600:]}"
+        # Locate downloaded WAV (yt-dlp may produce any ext before conversion)
+        dl_path = None
+        for fn in _os.listdir(dl_dir):
+            dl_path = _os.path.join(dl_dir, fn)
+            break
+        if not dl_path or not _os.path.exists(dl_path):
+            return False, "yt-dlp: no output file found."
+        conv = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", dl_path,
+            "-ac", "1", "-ar", "44100",
+            "-t", str(max_dur),
+            output_wav,
+        ]
+        rc = _sp.run(conv, capture_output=True, timeout=120)
+        if rc.returncode != 0:
+            return False, f"ffmpeg convert: {rc.stderr.decode()[-400:]}"
+        return True, ""
+
+
+def _run_autotune_reference(
+    base_path: str,
+    ref_wav: str,
+    output_path: str,
+    strength: float = 1.0,
+) -> tuple[bool, str]:
+    """Pitch-correct base media to match dominant pitch of reference WAV.
+
+    Detects average pitch of both signals via autocorrelation, computes the
+    semitone offset, and applies it with FFmpeg's rubberband filter (formant-
+    preserved).  Falls back to passthrough if pitch detection fails.
+    """
+    import math
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base_wav = os.path.join(tmpdir, "base.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", base_path, "-vn", "-ac", "1", "-ar", "44100", base_wav,
+        ], timeout=90)
+        if not ok:
+            return False, f"Audio extraction failed: {err}"
+
+        base_hz = _pitch_detect_wav_stdlib(base_wav)
+        ref_hz = _pitch_detect_wav_stdlib(ref_wav)
+
+        if not base_hz or not ref_hz or base_hz <= 0 or ref_hz <= 0:
+            return _run_ffmpeg_raw([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", base_path, "-c", "copy", output_path,
+            ], timeout=60)
+
+        shift_st = 12.0 * math.log2(ref_hz / base_hz) * strength
+        shift_st = max(-24.0, min(24.0, shift_st))
+        pitch_ratio = 2.0 ** (shift_st / 12.0)
+
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", base_path,
+            "-af", f"rubberband=pitch={pitch_ratio:.6f}:formant=1",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path,
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+        if not ok:
+            return False, f"rubberband failed: {err}"
+        return True, f"{base_hz:.1f} Hz → {ref_hz:.1f} Hz ({shift_st:+.2f} st)"
+
+
 # ---------- Vocoder ----------
 
 _VOCODER_PROFILES: dict[str, dict] = {
@@ -4651,6 +4797,132 @@ async def trim_command(ctx: commands.Context, *, args: str = ""):
             await status_msg.edit(content=f"❌ Failed to upload result: {exc}")
 
 
+# ---------- t!autotune / t!autotoon — reference-based pitch correction ----------
+
+@bot.command(name="autotune", aliases=["autotoon"])
+async def autotune_command(ctx: commands.Context, *, args: str = ""):
+    """Pitch-correct a video/audio to match a reference track.
+
+    Usage:
+      t!autotune <YouTube URL or search query>
+      t!autotoon <YouTube URL or search query>
+
+    Attach or reply to the media you want to autotune.
+    The argument is the reference (URL or search terms).
+    Optional: append  --strength <0.0-1.0>  (default 1.0).
+    """
+    import re as _re
+
+    # ── Parse --strength flag ──────────────────────────────────────────────────
+    strength = 1.0
+    _sm = _re.search(r"--strength\s+([0-9]*\.?[0-9]+)", args)
+    if _sm:
+        try:
+            strength = max(0.0, min(1.0, float(_sm.group(1))))
+        except ValueError:
+            pass
+        args = (args[:_sm.start()] + args[_sm.end():]).strip()
+
+    ref_query = args.strip()
+
+    if not ref_query:
+        await ctx.reply(
+            "❌ Usage: `t!autotune <YouTube URL or search query>`\n"
+            "Attach or reply to the video/audio you want to autotune.\n"
+            "The argument is the reference track (URL or search terms).\n"
+            "Optional flag: `--strength 0.0-1.0` (default 1.0)"
+        )
+        return
+
+    # ── Resolve base media ─────────────────────────────────────────────────────
+    _AUTOTUNE_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".mp3", ".wav", ".flac", ".ogg", ".m4a"}
+    media_url: str | None = None
+    attachment: discord.Attachment | None = None
+
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message.reference:
+        try:
+            ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref_msg.attachments:
+                attachment = ref_msg.attachments[0]
+            else:
+                for tok in ref_msg.content.split():
+                    if tok.startswith(("http://", "https://")):
+                        media_url = tok
+                        break
+        except Exception:
+            pass
+
+    if attachment is None and media_url is None:
+        await ctx.reply("❌ No media found. Attach a video/audio, reply to one, or include a media URL.")
+        return
+
+    src_name = attachment.filename if attachment else urllib.parse.urlparse(media_url).path
+    suffix = Path(src_name).suffix.lower() or ".mp4"
+    if suffix not in _AUTOTUNE_EXTS:
+        await ctx.reply(f"❌ Unsupported format `{suffix}`. Supported: {', '.join(sorted(_AUTOTUNE_EXTS))}")
+        return
+
+    is_video = suffix in {".mp4", ".mov", ".webm", ".mkv"}
+    status_msg = await ctx.reply("🎵 Downloading reference track…", mention_author=False)
+
+    loop = asyncio.get_event_loop()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        ref_wav    = os.path.join(tmpdir, "ref.wav")
+        output_ext = suffix if is_video else ".mp4" if not is_video else suffix
+        output_path = os.path.join(tmpdir, f"autotuned{suffix}")
+
+        # ── Download reference ─────────────────────────────────────────────────
+        ok, err = await loop.run_in_executor(
+            None, _ytdlp_download_audio_wav, ref_query, ref_wav, 600
+        )
+        if not ok:
+            await status_msg.edit(content=f"❌ Reference download failed:\n```\n{err[-800:]}\n```")
+            return
+
+        # ── Download base media ────────────────────────────────────────────────
+        await status_msg.edit(content="⬇️ Downloading your media…")
+        try:
+            if attachment:
+                await download_attachment(attachment, input_path)
+            else:
+                await download_url(media_url, input_path)
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Media download failed: {exc}")
+            return
+
+        # ── Run autotune ───────────────────────────────────────────────────────
+        await status_msg.edit(content="🔧 Detecting pitches and applying correction…")
+        ok, info = await loop.run_in_executor(
+            None, _run_autotune_reference, input_path, ref_wav, output_path, strength
+        )
+        if not ok:
+            await status_msg.edit(content=f"❌ Autotune failed:\n```\n{info[-1000:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output is too large for Discord (>25 MB).")
+            return
+
+        stem = Path(src_name).stem
+        out_filename = f"autotune_{stem}{suffix}"
+        pitch_line = f"\n> {info}" if info else ""
+
+        try:
+            await ctx.reply(
+                content=f"✅ Autotuned!{pitch_line}",
+                file=discord.File(output_path, filename=out_filename),
+                mention_author=False,
+            )
+            await status_msg.delete()
+        except discord.HTTPException as exc:
+            await status_msg.edit(content=f"❌ Upload failed: {exc}")
+
+
 # ---------- t!mirror — mirror presets via FFmpeg split/crop/flip/stack ----------
 
 # Each preset is (vf_filter, description)
@@ -6213,6 +6485,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.6",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!autotune` / `t!autotoon`** — Reference-based pitch correction. Attach or reply to your video/audio, then give a YouTube URL or search query as the reference track. The bot detects the dominant pitch of the reference and shifts your audio to match using rubberband (formant-preserved). Optional `--strength 0.0-1.0` flag (default 1.0). Works on mp4/mov/webm/mkv/mp3/wav/flac/ogg/m4a. No Wine or external binaries needed — pure stdlib pitch detection + FFmpeg rubberband.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.5",
         "date": "2026-06-27",
