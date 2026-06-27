@@ -17,6 +17,7 @@ import math
 import os
 import random
 import re
+from collections import deque
 import shlex
 import tempfile
 import shutil
@@ -6915,6 +6916,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v6.1",
+        "date": "2026-06-27",
+        "heavy": [],
+        "fun": [
+            "**`t!chat` upgrade** — Now supports multilingual replies (EN/DE/ID/TL auto-detected), per-user profiles (preferred name + interests saved to `bot/chat_profiles.json`, interaction count tracked), rolling per-channel conversation history (14 messages / 7 turns, passed to Groq), and proper chunked replies instead of hard-truncating at 2000 chars. `t!clearchat` now clears the channel's shared history.",
+        ],
+        "owner": [],
+    },
+    {
         "version": "v6.0",
         "date": "2026-06-27",
         "heavy": [
@@ -8356,11 +8366,123 @@ Important:
 - Never invent real-world events involving users.
 - Never claim to have access to Discord data, DMs, channels, accounts, files, or servers unless provided in the conversation.
 - Stay helpful first, lore second.
-- If a query is NSFW, refuse calmly."""
+- If a query is NSFW, refuse calmly.
+
+LANGUAGE RULES (always apply):
+- Detect which language the user is writing in: English, Deutsch (German), Bahasa Indonesia, or Filipino/Tagalog.
+- Reply ENTIRELY in that same language. Adapt Clankered's personality naturally — slang, idioms, and energy should feel native to the language, not translated.
+- Never switch languages unless the user does first.
+- If the language is ambiguous, default to English."""
 
 _chat_histories: dict[int, list[dict]] = {}
 _ar2_groq_histories: dict[int, list[dict]] = {}
 _CHAT_MAX_HISTORY = 20
+
+# ── Per-channel rolling context + user profiles for t!chat ──────────────────
+
+_CHAT_PROFILES_PATH = Path(__file__).parent / "chat_profiles.json"
+_chat_profiles: dict[str, dict] = {}
+_chat_channel_histories: dict[int, deque] = {}
+_CHAT_CHANNEL_MAX = 14  # messages kept per channel (7 turns)
+
+
+def _load_chat_profiles() -> None:
+    global _chat_profiles
+    if _CHAT_PROFILES_PATH.exists():
+        try:
+            _chat_profiles = json.loads(_CHAT_PROFILES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _chat_profiles = {}
+
+
+def _save_chat_profiles() -> None:
+    try:
+        _CHAT_PROFILES_PATH.write_text(
+            json.dumps(_chat_profiles, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        print(f"[chat] Failed to save profiles: {exc}")
+
+
+def _get_chat_profile(user_id: int) -> dict:
+    key = str(user_id)
+    if key not in _chat_profiles:
+        _chat_profiles[key] = {"preferred_name": "", "interests": [], "interaction_count": 0}
+    return _chat_profiles[key]
+
+
+def _increment_chat_profile(user_id: int) -> dict:
+    profile = _get_chat_profile(user_id)
+    profile["interaction_count"] = profile.get("interaction_count", 0) + 1
+    _save_chat_profiles()
+    return profile
+
+
+def _extract_chat_name(text: str, profile: dict) -> None:
+    """Detect self-introductions in EN / DE / ID / TL and save the name."""
+    if profile.get("preferred_name"):
+        return
+    patterns = [
+        r"\b(?:i'm|i am|my name is|call me)\s+([A-Za-z][A-Za-z0-9_\-]{0,24})",
+        r"\bich\s+(?:bin|heiße)\s+([A-Za-z][A-Za-z0-9_\-]{0,24})",
+        r"\bnama\s+(?:saya|aku)\s+([A-Za-z][A-Za-z0-9_\-]{0,24})",
+        r"\b(?:ako\s+si|pangalan\s+ko(?:\s+ay)?)\s+([A-Za-z][A-Za-z0-9_\-]{0,24})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            profile["preferred_name"] = m.group(1).capitalize()
+            _save_chat_profiles()
+            return
+
+
+def _build_chat_system_prompt(profile: dict, username: str, prefix: str) -> str:
+    """Merge base system prompt with per-user profile context."""
+    base = (
+        _CHAT_SYSTEM_PROMPT
+        + f"\n\nCurrent context: You are talking to {username}. "
+        f"The bot prefix is '{prefix}'. "
+        f"Refer to commands with the prefix, e.g. '{prefix}ihtx'."
+    )
+    name = profile.get("preferred_name", "").strip()
+    interests = profile.get("interests", [])
+    count = profile.get("interaction_count", 0)
+    if name or interests or count:
+        base += "\n\nUSER PROFILE (use subtly — never read it back verbatim):"
+        if name:
+            base += f"\n- Preferred name: {name}"
+        if interests:
+            base += f"\n- Known interests: {', '.join(interests[:6])}"
+        if count == 1:
+            base += "\n- First time chatting with them."
+        elif count > 1:
+            base += f"\n- Chatted {count} time(s) before — be familiar."
+    return base
+
+
+def _get_chat_channel_history(channel_id: int) -> deque:
+    if channel_id not in _chat_channel_histories:
+        _chat_channel_histories[channel_id] = deque(maxlen=_CHAT_CHANNEL_MAX)
+    return _chat_channel_histories[channel_id]
+
+
+def _split_reply(text: str, limit: int = 1990) -> list[str]:
+    """Split a long reply into Discord-safe chunks on word boundaries."""
+    chunks: list[str] = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = text.rfind(" ", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+_load_chat_profiles()
 
 # Compact command reference appended to autoreply2 system prompt so the AI
 # knows every implemented command and can answer "what can you do?" questions.
@@ -8450,11 +8572,12 @@ async def _build_gemini_parts(text: str, attachments) -> list[dict]:
 
 @bot.command(name="chat", aliases=["ask", "ai"])
 async def chat(ctx: commands.Context, *, question: str = ""):
-    """Chat with the IHTX AI assistant. Attach images/files to have them analyzed."""
-    await ctx.defer()
+    """Chat with the IHTX AI assistant. Supports multilingual replies and remembers you."""
 
     username = ctx.author.display_name
     current_prefix = ctx.prefix if ctx.prefix else "t!"
+    user_id = ctx.author.id
+    channel_id = ctx.channel.id
 
     attachments = ctx.message.attachments if ctx.message else []
     has_attachments = bool(attachments)
@@ -8463,100 +8586,115 @@ async def chat(ctx: commands.Context, *, question: str = ""):
         await ctx.send("bradar say something or attach a file 😭")
         return
 
-    # Build the full system prompt: static lore + dynamic per-request context
-    system_identity = (
-        _CHAT_SYSTEM_PROMPT
-        + f"\n\nCurrent context: You are talking to {username}. "
-        f"The bot prefix is '{current_prefix}'. "
-        f"Refer to commands with the prefix, e.g. '{current_prefix}ihtx'."
-    )
-
     if _groq_client is None and _genai_client is None:
         await ctx.send("bradar no AI keys are configured rn 😭")
         return
 
+    # Profile: increment counter, detect name, build personalised system prompt
+    profile = _increment_chat_profile(user_id)
+    if question:
+        _extract_chat_name(question, profile)
+    system_identity = _build_chat_system_prompt(profile, username, current_prefix)
+
+    # Per-channel rolling history (shared across all users in the channel)
+    channel_hist = _get_chat_channel_history(channel_id)
+
     bot_response: str | None = None
 
-    # ── Attachments → always route through Gemini (vision support) ──────────
-    if has_attachments and _genai_client is not None:
-        try:
-            parts = await _build_gemini_parts(question, attachments)
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: _genai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=parts,
-                    config=_genai_types.GenerateContentConfig(
-                        system_instruction=system_identity,
-                        max_output_tokens=1024,
-                    ),
-                ),
-            )
+    async with ctx.typing():
+        # ── Attachments → always route through Gemini (vision support) ──────
+        if has_attachments and _genai_client is not None:
             try:
-                bot_response = response.text
-            except Exception:
-                bot_response = None
-            if not bot_response:
+                parts = await _build_gemini_parts(question, attachments)
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: _genai_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=parts,
+                        config=_genai_types.GenerateContentConfig(
+                            system_instruction=system_identity,
+                            max_output_tokens=1024,
+                        ),
+                    ),
+                )
                 try:
-                    bot_response = response.candidates[0].content.parts[0].text
+                    bot_response = response.text
                 except Exception:
                     bot_response = None
-        except Exception as _gem_att_exc:
-            print(f"[genai/chat/attach] error: {type(_gem_att_exc).__name__}: {_gem_att_exc}")
+                if not bot_response:
+                    try:
+                        bot_response = response.candidates[0].content.parts[0].text
+                    except Exception:
+                        bot_response = None
+            except Exception as exc:
+                print(f"[genai/chat/attach] error: {type(exc).__name__}: {exc}")
 
-    # ── Text-only: Groq primary ──────────────────────────────────────────────
-    if not bot_response and not has_attachments and _groq_client is not None:
-        try:
-            loop = asyncio.get_event_loop()
-            groq_resp = await loop.run_in_executor(
-                None,
-                lambda: _groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": system_identity},
-                        {"role": "user", "content": question},
-                    ],
-                    temperature=0.8,
-                    max_tokens=1024,
-                ),
-            )
-            bot_response = groq_resp.choices[0].message.content
-        except Exception as _groq_exc:
-            print(f"[groq] error: {type(_groq_exc).__name__}: {_groq_exc}")
-
-    # ── Fallback: Gemini (text-only) ─────────────────────────────────────────
-    if not bot_response and _genai_client is not None:
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: _genai_client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=question or "[no text]",
-                    config=_genai_types.GenerateContentConfig(
-                        system_instruction=system_identity,
-                        temperature=0.8,
-                        max_output_tokens=1024,
-                    ),
-                ),
-            )
+        # ── Text-only: Groq primary (with rolling channel history) ───────────
+        if not bot_response and not has_attachments and _groq_client is not None:
             try:
-                bot_response = response.text
-            except Exception:
-                bot_response = None
-            if not bot_response:
+                messages = (
+                    [{"role": "system", "content": system_identity}]
+                    + list(channel_hist)
+                    + [{"role": "user", "content": question}]
+                )
+                loop = asyncio.get_event_loop()
+                groq_resp = await loop.run_in_executor(
+                    None,
+                    lambda: _groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=messages,
+                        temperature=0.85,
+                        max_tokens=1024,
+                    ),
+                )
+                bot_response = groq_resp.choices[0].message.content
+            except Exception as exc:
+                print(f"[groq] error: {type(exc).__name__}: {exc}")
+
+        # ── Fallback: Gemini text-only ────────────────────────────────────────
+        if not bot_response and _genai_client is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: _genai_client.models.generate_content(
+                        model="gemini-2.0-flash",
+                        contents=question or "[no text]",
+                        config=_genai_types.GenerateContentConfig(
+                            system_instruction=system_identity,
+                            temperature=0.85,
+                            max_output_tokens=1024,
+                        ),
+                    ),
+                )
                 try:
-                    bot_response = response.candidates[0].content.parts[0].text
+                    bot_response = response.text
                 except Exception:
                     bot_response = None
-        except Exception as _gem_exc:
-            print(f"[genai] error: {type(_gem_exc).__name__}: {_gem_exc}")
+                if not bot_response:
+                    try:
+                        bot_response = response.candidates[0].content.parts[0].text
+                    except Exception:
+                        bot_response = None
+            except Exception as exc:
+                print(f"[genai] error: {type(exc).__name__}: {exc}")
 
     if bot_response:
-        if len(bot_response) > 2000:
-            bot_response = bot_response[:1995] + "..."
-        await ctx.send(bot_response)
+        # Save this exchange to the rolling channel history
+        if question:
+            channel_hist.append({"role": "user", "content": question})
+            channel_hist.append({"role": "assistant", "content": bot_response})
+
+        # Send — split into ≤1990-char chunks on word/newline boundaries
+        chunks = _split_reply(bot_response)
+        first = True
+        for chunk in chunks:
+            if first:
+                await ctx.send(chunk)
+                first = False
+            else:
+                await ctx.send(chunk)
     else:
         print(f"[chat] empty/blocked response for: {question[:80]!r}")
         await ctx.send("bradar something went wrong on my end 😭 try again")
@@ -8564,9 +8702,9 @@ async def chat(ctx: commands.Context, *, question: str = ""):
 
 @bot.command(name="clearchat", aliases=["resetai", "chatclear"])
 async def clearchat(ctx: commands.Context):
-    """Clear your personal AI conversation history."""
-    _chat_histories.pop(ctx.author.id, None)
-    await ctx.reply("🧹 Your conversation history has been cleared.")
+    """Clear the t!chat conversation history for this channel."""
+    _chat_channel_histories.pop(ctx.channel.id, None)
+    await ctx.reply("🧹 Chat history for this channel has been cleared.")
 
 
 
