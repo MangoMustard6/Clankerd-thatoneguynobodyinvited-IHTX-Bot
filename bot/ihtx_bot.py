@@ -137,7 +137,7 @@ _load_owner_ids()
 
 # Heavy command rate limiting
 HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
-HEAVY_LIMIT_DEFAULT = 10
+HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
 USAGE_FILE = Path("bot/usage.json")
@@ -1555,6 +1555,7 @@ PIPE_EFFECT_NAMES = {
     "freakzinga", "fzgm156", "freakzingagm156", "fgm156",
     "multipitch2", "mp2",
     "jitter",
+    "trim",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -2031,6 +2032,37 @@ def _apply_pipe_effects(
                     if not ok:
                         return False, f"Audio filter failed: {err}"
                     current = out
+                continue
+
+            # trim — cut from start to end: trim=5|15 or trim=1:30|2:45
+            if name == "trim":
+                if len(params) < 2:
+                    return False, "trim effect requires two params: trim=<start>|<end>  e.g. trim=5|15 or trim=1:30|2:45"
+                try:
+                    t_start = float(_parse_trim_timestamp(params[0]))
+                    t_end   = float(_parse_trim_timestamp(params[1]))
+                except ValueError as exc:
+                    return False, f"trim: invalid timestamp — {exc}"
+                if t_start < 0 or t_end < 0:
+                    return False, "trim: timestamps cannot be negative."
+                if t_start >= t_end:
+                    return False, "trim: start must be less than end."
+                t_dur = t_end - t_start
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-ss", str(t_start),
+                    "-i", current,
+                    "-t", str(t_dur),
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-pix_fmt", "yuv420p",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+                if not ok:
+                    return False, f"trim failed: {err}"
+                current = out
                 continue
 
             # Speed: change playback rate (video setpts + audio atempo chain)
@@ -6181,6 +6213,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v5.5",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`trim` pipe effect** — Cuts media to a time range inside any `t!ihtx` pipe chain. Params: `trim=<start>|<end>` (plain seconds, decimals, or HH:MM:SS). Example: `t!ihtx 1 10 - mp4 trim=5|8,negate`. Reencodes with libx264/aac at CRF 18 for clean keyframe alignment.",
+            "**Result embed icon updated** — Footer icon in all `t!ihtx` / `/ihtxgen` embeds (loading, processing, result) changed to the new animated GIF.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v5.4",
         "date": "2026-06-26",

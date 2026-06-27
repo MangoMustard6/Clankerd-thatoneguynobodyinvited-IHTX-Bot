@@ -600,7 +600,7 @@ class EconomyCog(commands.Cog, name="Economy"):
         _user_tag = str(ctx.author)
         _avatar_url = ctx.author.display_avatar.url
         _IHTX_COLOR = 0x001080
-        _IHTX_FOOTER_ICON = "https://files.catbox.moe/pdw8bi.webp"
+        _IHTX_FOOTER_ICON = "https://files.catbox.moe/4snvbu.gif"
 
         def _make_base_embed(color: int = _IHTX_COLOR) -> discord.Embed:
             e = discord.Embed(color=color, timestamp=discord.utils.utcnow())
