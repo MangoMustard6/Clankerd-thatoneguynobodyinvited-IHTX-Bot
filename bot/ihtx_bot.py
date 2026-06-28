@@ -7574,6 +7574,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v6.3",
+        "date": "2026-06-28",
+        "heavy": [],
+        "fun": [
+            "**`t!guesseffect` / `t!ge`** — New mini-game command! The bot picks a random logo-editing effect from a 15-entry pool sourced from the Logo Editing Fandom wiki (G-Major, CoNfUsIoN, Preview 2, RGB to BGR, Crying Effect, Orange Effect, and more). It posts a clue card with the effect's category, a letter-scrambled name hint, and a pipeline description — then opens a 20-second `wait_for` window. First person to type the correct name wins. Timeout gracefully reveals the answer with a wiki link.",
+        ],
+        "owner": [],
+    },
+    {
         "version": "v6.2",
         "date": "2026-06-27",
         "heavy": [
@@ -10896,6 +10905,283 @@ async def catbox_upload(ctx: commands.Context):
             await status_msg.edit(content=f"❌ catbox error: {result[:300]}")
     except Exception as e:
         await status_msg.edit(content=f"❌ upload failed: {e}")
+
+
+# ---------- Guess Effect Mini-Game ----------
+
+# Effect pool sourced from the Logo Editing Fandom wiki (Category:Effects /
+# Category:All_effect_articles). Each entry carries:
+#   name       – canonical display name
+#   accept     – list of lowercase strings that count as a correct answer
+#   category   – effect type label shown in the clue card
+#   wiki       – canonical wiki URL for the reveal
+#   description – flavour-text clue that describes the pipeline without naming it
+_GE_EFFECTS: list[dict] = [
+    {
+        "name": "G-Major",
+        "accept": ["g-major", "gmajor", "g major"],
+        "category": "Color grading + audio pitch shift",
+        "wiki": "https://logo-editing.fandom.com/wiki/G-Major",
+        "description": (
+            "One of the oldest and most recognisable logo editing effects, created in 2007. "
+            "The video runs through a hue-rotation that swings greens into purples, "
+            "followed by a full channel inversion that turns the picture inside-out. "
+            "The audio is pitch-shifted upward by roughly 7 semitones. "
+            "In FFmpeg-land: `hue=h=180,negate` on the video and `rubberband -p+7` on the audio."
+        ),
+    },
+    {
+        "name": "G-Major 4",
+        "accept": ["g-major 4", "gmajor 4", "g major 4", "g-major4", "gmajor4"],
+        "category": "Color grading + layered overlay + audio boost",
+        "wiki": "https://logo-editing.fandom.com/wiki/G-Major_4",
+        "description": (
+            "A souped-up variant of the classic G-Major pipeline. All RGB channels are inverted, "
+            "then a second pitch-shifted (+5 semitones) copy of the inverted video is blended "
+            "on top of itself as an overlay. The audio track is then doubled in volume. "
+            "The result has a harsh, glowing quality absent from its predecessor."
+        ),
+    },
+    {
+        "name": "CoNfUsIoN",
+        "accept": ["confusion", "confusión", "confushion"],
+        "category": "Complex color manipulation + mirror distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/CoNfUsIoN",
+        "description": (
+            "Charallony6000's 2014 creation stacks HSL Adjust, Invert, a horizontal mirror, "
+            "LAB Adjust, and Color Corrector (Secondary) in a single chain. "
+            "The mixed-case spelling of the name itself is part of the brand. "
+            "Audio typically receives a harsh reverb or echo on top of a pitch shift, "
+            "leaving the listener disoriented alongside the warped visuals."
+        ),
+    },
+    {
+        "name": "Preview 2",
+        "accept": ["preview 2", "preview2"],
+        "category": "Iconic logo-editing transition effect",
+        "wiki": "https://logo-editing.fandom.com/wiki/Preview_2",
+        "description": (
+            "A cornerstone of the logo editing community and one of the most heavily remixed effects "
+            "on the wiki. It reproduces the look of a classic broadcast preview bumper by "
+            "layering colour-wash filters over a zoomed or cropped frame, accompanied by a "
+            "distinctive pitched-up audio sting. Countless variants and spin-offs use it as a base."
+        ),
+    },
+    {
+        "name": "RGB to BGR",
+        "accept": ["rgb to bgr", "rgb2bgr", "bgr", "rgbtobgr"],
+        "category": "Color channel swap",
+        "wiki": "https://logo-editing.fandom.com/wiki/RGB_to_BGR",
+        "description": (
+            "A precise channel-manipulation effect: the red and blue planes are swapped while "
+            "green is left untouched. Warm colours become cold and vice versa — reds turn blue, "
+            "blues turn red, skies shift orange, and faces go alien. "
+            "In FFmpeg: `shuffleplanes=0:1:0:3` (or the `geq` RGB-component swap trick). "
+            "No audio processing — the change is purely visual."
+        ),
+    },
+    {
+        "name": "Crying Effect",
+        "accept": ["crying effect", "crying", "cry effect"],
+        "category": "Emotional visual distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Crying_Effect",
+        "description": (
+            "Named for the emotional reaction it's meant to evoke. The video is desaturated "
+            "toward cool blue-grey tones, then a gentle vertical wave distortion — simulating "
+            "tears streaming down the lens — is applied. "
+            "Audio usually shifts to a slow, lowered pitch with reverb, evoking a mournful tone. "
+            "Often used on logos to make them look like they're weeping."
+        ),
+    },
+    {
+        "name": "Orange Effect",
+        "accept": ["orange effect", "orange"],
+        "category": "Warm color grade",
+        "wiki": "https://logo-editing.fandom.com/wiki/Orange_Effect",
+        "description": (
+            "A straightforward but striking colour grade that pushes the entire palette toward "
+            "warm amber-orange tones. Achieved by boosting the red channel, reducing blue, and "
+            "slightly lifting shadows. In FFmpeg: `curves=r='0/0 0.5/0.6 1/1':b='0/0 0.5/0.35 1/0.8'`. "
+            "Often combined with slight saturation increases for an 'Instagram sunset' look. "
+            "No standard audio component."
+        ),
+    },
+    {
+        "name": "Center Effects",
+        "accept": ["center effects", "center effect", "centre effects", "centre effect"],
+        "category": "Crop and zoom distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Center_Effects",
+        "description": (
+            "Forces the subject to the exact centre of the frame by cropping outer regions and "
+            "scaling up the middle. The resulting image is zoomed in and often slightly blurred "
+            "at the edges, giving a tunnel-vision quality. "
+            "Frequently paired with a pitch-raised audio track to heighten the claustrophobic feel. "
+            "In FFmpeg: `crop=iw/2:ih/2,scale=iw*2:ih*2`."
+        ),
+    },
+    {
+        "name": "Electronic Sounds",
+        "accept": ["electronic sounds", "electronic sound", "electronic"],
+        "category": "Audio synthesis effect",
+        "wiki": "https://logo-editing.fandom.com/wiki/Electronic_Sounds",
+        "description": (
+            "Replaces or heavily processes the original audio to sound like vintage synthesiser "
+            "or arcade-machine output. Common techniques: aggressive bit-crushing, tremolo, "
+            "square-wave ring modulation, and heavy echo. "
+            "The visuals often receive a scanline or CRT-like overlay to match the retro-digital "
+            "audio aesthetic. Associated with the Klasky Csupo community."
+        ),
+    },
+    {
+        "name": "Render Pack Transition",
+        "accept": ["render pack transition", "render pack", "rpt"],
+        "category": "Stinger / transition effect",
+        "wiki": "https://logo-editing.fandom.com/wiki/Render_Pack_Transition",
+        "description": (
+            "A community-standard transition that bridges two clips using a short pre-rendered "
+            "motion graphic — typically a flash, wipe, or shatter — sourced from shared render packs. "
+            "The transition itself carries no permanent colour or audio transforms; "
+            "it's purely a between-clip stinger. Widely used in montage and compilation videos "
+            "across the logo editing scene."
+        ),
+    },
+    {
+        "name": "Mirror Effect",
+        "accept": ["mirror effect", "mirror", "hflip", "horizontal mirror"],
+        "category": "Geometric flip / mirror distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:Effects_that_are_mirrored",
+        "description": (
+            "Flips the video along its horizontal axis so that left becomes right. "
+            "The simplest application is `hflip` in FFmpeg, but many community variants stack "
+            "additional effects — colour inversion, pitch shift, or a palindrome reverse-concat — "
+            "on top of the basic flip. Text and logos become unreadable, creating a dreamlike, "
+            "backwards-world aesthetic."
+        ),
+    },
+    {
+        "name": "Color Inversion",
+        "accept": ["color inversion", "colour inversion", "invert", "color invert", "colour invert"],
+        "category": "Color channel inversion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:Effects_that_use_Invert",
+        "description": (
+            "Every pixel's brightness value is flipped: whites become black, bright reds become "
+            "cyan, sky-blue skies turn orange. Achieved with the `negate` filter in FFmpeg or "
+            "the 'Invert' effect in VEGAS/AVS. Often used as a base layer inside more complex "
+            "chains such as G-Major, CoNfUsIoN, and X-Major variants. "
+            "No inherent audio processing."
+        ),
+    },
+    {
+        "name": "X-Major",
+        "accept": ["x-major", "xmajor", "x major"],
+        "category": "G-Major variant — hue shift + audio pitch",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:Effects_by_names",
+        "description": (
+            "Closely related to G-Major but with different hue-rotation and pitch values. "
+            "Where G-Major swings ~180° and up 7 semitones, this variant uses a different "
+            "rotation angle and a distinct semitone offset — often negative — giving it a "
+            "cooler, more muted visual palette and a lower-pitched, murkier audio character. "
+            "It inherits the core inversion step from its predecessor."
+        ),
+    },
+    {
+        "name": "Vibe",
+        "accept": ["vibe", "the vibe"],
+        "category": "Audio vibrato + warm visual grade",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:All_effect_articles",
+        "description": (
+            "Centred on an audio vibrato filter — a periodic pitch wobble applied to the whole track — "
+            "combined with a warm, slightly desaturated visual grade that evokes lo-fi aesthetics. "
+            "In FFmpeg: `vibrato=f=5:d=0.5` for the audio wobble plus `eq=saturation=0.8,curves` "
+            "for the visual warmth. Often used on chill or nostalgic logo edits."
+        ),
+    },
+    {
+        "name": "Pitch Shift",
+        "accept": ["pitch shift", "pitchshift", "pitch"],
+        "category": "Audio pitch manipulation",
+        "wiki": "https://logo-editing.fandom.com/wiki/Audio_effects_of_AVS_Video_Editor",
+        "description": (
+            "The most fundamental audio-only effect in the logo editing toolkit — "
+            "transposing the entire audio track up or down by a set number of semitones "
+            "without changing its playback speed. "
+            "In FFmpeg: `asetrate=sr*2^(n/12),aresample=sr` (simple) or `rubberband -p<n>` (high quality). "
+            "Used as a building block inside almost every major community effect."
+        ),
+    },
+]
+
+
+def _ge_scramble(name: str) -> str:
+    """Scramble the alphabetic characters in *name* while keeping non-letter
+    characters (hyphens, spaces, digits) in their original positions."""
+    chars = list(name)
+    letter_idx = [i for i, c in enumerate(chars) if c.isalpha()]
+    letters = [chars[i] for i in letter_idx]
+    shuffled = letters[:]
+    # Keep shuffling until the result differs from the original (or give up after 15 tries)
+    for _ in range(15):
+        random.shuffle(shuffled)
+        if [c.lower() for c in shuffled] != [c.lower() for c in letters]:
+            break
+    for pos, idx in enumerate(letter_idx):
+        chars[idx] = shuffled[pos]
+    return "".join(chars)
+
+
+@bot.command(name="guesseffect", aliases=["ge"])
+async def guesseffect(ctx: commands.Context):
+    """Mini-game: guess the logo editing effect from clues! 20-second timer."""
+    effect = random.choice(_GE_EFFECTS)
+    scrambled = _ge_scramble(effect["name"])
+
+    embed = discord.Embed(
+        title="🎮 Guess the Effect!",
+        description=(
+            "A famous logo-editing effect is hiding below. "
+            "Study the clues and type its name in chat to win!\n"
+            "*(Case-insensitive — common spellings accepted)*"
+        ),
+        color=0x9b59b6,
+    )
+    embed.add_field(name="📂 Category", value=effect["category"], inline=False)
+    embed.add_field(name="🔀 Scrambled Name", value=f"```{scrambled}```", inline=False)
+    embed.add_field(name="📝 Pipeline Clue", value=effect["description"], inline=False)
+    embed.set_footer(text="⏱  You have 20 seconds — type the effect name!")
+    await ctx.send(embed=embed)
+
+    accept_set = {a.lower() for a in effect["accept"]}
+
+    def _check(m: discord.Message) -> bool:
+        return (
+            m.channel.id == ctx.channel.id
+            and not m.author.bot
+            and m.content.strip().lower() in accept_set
+        )
+
+    try:
+        winner: discord.Message = await bot.wait_for("message", check=_check, timeout=20.0)
+        result_embed = discord.Embed(
+            title="🎉 Correct!",
+            description=(
+                f"**{winner.author.display_name}** nailed it!\n"
+                f"The effect was **{effect['name']}**.\n"
+                f"[📖 Read about it on the wiki]({effect['wiki']})"
+            ),
+            color=0x2ecc71,
+        )
+        await ctx.send(embed=result_embed)
+    except asyncio.TimeoutError:
+        timeout_embed = discord.Embed(
+            title="⏰ Time's Up!",
+            description=(
+                f"Nobody guessed it in time.\n"
+                f"The effect was **{effect['name']}**.\n"
+                f"[📖 Read about it on the wiki]({effect['wiki']})"
+            ),
+            color=0xe74c3c,
+        )
+        await ctx.send(embed=timeout_embed)
 
 
 # ---------- Error handling & run ----------
