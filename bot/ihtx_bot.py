@@ -7,7 +7,7 @@ and the preview1280 TV-simulator montage command.
 Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp,
 ImageMagick/sox/etc. depending on advanced effects.
 """
-import sys; sys.exit("Intentional shutdown trigger.")
+
 import discord
 from discord.ext import commands, tasks
 from bot.tags.cog import TagCog
@@ -2696,8 +2696,8 @@ def _apply_pipe_effects(
 
             # freakzinga g major 156 — palindrome video + dual-voice pitch shift + bass mix
             if name in ("freakzinga", "fzgm156", "freakzingagm156", "fgm156"):
-                if not _ensure_multipitch_bin():
-                    return False, "fzgm156: multipitch binary unavailable — download failed."
+               #  if not _ensure_multipitch_bin():
+               #    return False, "fzgm156: multipitch binary unavailable — download failed."
 
                 def _fzp(idx, default):
                     try:
