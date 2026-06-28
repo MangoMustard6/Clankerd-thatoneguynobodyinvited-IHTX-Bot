@@ -7,7 +7,7 @@ and the preview1280 TV-simulator montage command.
 Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp,
 ImageMagick/sox/etc. depending on advanced effects.
 """
-
+import sys; sys.exit("Intentional shutdown trigger.")
 import discord
 from discord.ext import commands, tasks
 from bot.tags.cog import TagCog
