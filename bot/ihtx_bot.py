@@ -3126,7 +3126,6 @@ def _is_native_arch(match: str) -> bool:
 
 
 def _ensure_multipitch_bin() -> bool:
-    return True
     """Download the multipitch binary if it isn't already present and executable.
 
     Returns True if the binary is ready, False on failure.
@@ -3321,8 +3320,8 @@ def _run_multipitch_rb3(
             semitones.append(val)
 
     # ── 2. Ensure binary is available ────────────────────────────────────────
-    # if not _ensure_multipitch_bin():
-        return False, "❌ Multipitch binary unavailable — download failed."
+    # # if not _ensure_multipitch_bin():
+#         return False, "❌ Multipitch binary unavailable — download failed."
 
     # ── 3. Probe input ───────────────────────────────────────────────────────
     has_video = bool(_ffprobe(
