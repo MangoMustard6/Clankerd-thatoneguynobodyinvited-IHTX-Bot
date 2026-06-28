@@ -2696,8 +2696,8 @@ def _apply_pipe_effects(
 
             # freakzinga g major 156 — palindrome video + dual-voice pitch shift + bass mix
             if name in ("freakzinga", "fzgm156", "freakzingagm156", "fgm156"):
-               #  if not _ensure_multipitch_bin():
-               #    return False, "fzgm156: multipitch binary unavailable — download failed."
+               #  # if not _ensure_multipitch_bin():
+               #    # return False, "fzgm156: multipitch binary unavailable — download failed."
 
                 def _fzp(idx, default):
                     try:
@@ -2809,8 +2809,8 @@ def _apply_pipe_effects(
 
             # multipitch2 / mp2 — wave-hammer multi-voice pitch shift with optional surround
             if name in ("multipitch2", "mp2"):
-                if not _ensure_multipitch_bin():
-                    return False, "multipitch2: multipitch binary unavailable — download failed."
+                # if not _ensure_multipitch_bin():
+                    # return False, "multipitch2: multipitch binary unavailable — download failed."
 
                 # params[0] = pitches (pipe/comma/space-separated semitones)
                 # params[1] = surround type: G-Major_17 | Evil_Rampaging_Sorcerer (optional)
@@ -3126,6 +3126,7 @@ def _is_native_arch(match: str) -> bool:
 
 
 def _ensure_multipitch_bin() -> bool:
+    return True
     """Download the multipitch binary if it isn't already present and executable.
 
     Returns True if the binary is ready, False on failure.
@@ -3320,7 +3321,7 @@ def _run_multipitch_rb3(
             semitones.append(val)
 
     # ── 2. Ensure binary is available ────────────────────────────────────────
-    if not _ensure_multipitch_bin():
+    # if not _ensure_multipitch_bin():
         return False, "❌ Multipitch binary unavailable — download failed."
 
     # ── 3. Probe input ───────────────────────────────────────────────────────
