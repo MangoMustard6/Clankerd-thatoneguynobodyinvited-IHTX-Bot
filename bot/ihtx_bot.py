@@ -137,7 +137,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "realgmajor4", "realgm4", "rgm4", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -1786,6 +1786,8 @@ PIPE_EFFECT_NAMES = {
     "swirl",
     "sierpinskiransomware",
     "preview1280", "scale1280",
+    "oppositep1280", "op1280",
+    "realgmajor4", "realgm4", "rgm4",
     "earthquake", "nbfx",
     "ssmp", "soundstretchmultipitch",
     "folkvalley", "fv",
@@ -2486,6 +2488,33 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
+            # oppositep1280 / op1280 — inverse TV-simulator montage pipeline as a pipe step
+            if name in ("oppositep1280", "op1280"):
+                def _op1280(idx, default):
+                    try:
+                        return float(params[idx]) if idx < len(params) else default
+                    except (ValueError, TypeError):
+                        return default
+                ok, err = _run_oppositep1280(
+                    current, out,
+                    start_offset=_op1280(0, 1.85),
+                    segment_dur=_op1280(1, 0.85),
+                )
+                if not ok:
+                    return False, f"oppositep1280 pipe failed: {err}"
+                current = out
+                continue
+
+            # realgmajor4 / realgm4 / rgm4 — Real G-Major 4 (RGB invert + pitch overlay) as a pipe step
+            if name in ("realgmajor4", "realgm4", "rgm4"):
+                ok, err = _run_realmajor4(
+                    current, out,
+                )
+                if not ok:
+                    return False, f"realgmajor4 pipe failed: {err}"
+                current = out
+                continue
+
             # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
             if vf:
@@ -3089,12 +3118,33 @@ _MULTIPITCH_BIN = os.path.join(os.path.dirname(__file__), "fileaa")
 _MULTIPITCH_URL = "https://file.garden/aTXso15ukD3mnuPI/multipitch"
 
 
+def _is_native_arch(match: str) -> bool:
+    """Return True if the current machine architecture matches *match* (e.g. 'x86_64', 'aarch64')."""
+    import platform
+    return platform.machine().lower() == match.lower()
+
+
 def _ensure_multipitch_bin() -> bool:
     """Download the multipitch binary if it isn't already present and executable.
+
     Returns True if the binary is ready, False on failure.
+    On non-x86_64 hosts (e.g. Termux/aarch64) the x86-64 binary cannot run,
+    so we skip the download and return False immediately — callers must then
+    fall through to the rubberband/FFmpeg fallback path.
     """
     if os.path.isfile(_MULTIPITCH_BIN) and os.access(_MULTIPITCH_BIN, os.X_OK):
+        # Even if the file exists, it might be the wrong architecture
+        # (e.g. checked into the repo or downloaded on a different machine).
+        if not _is_native_arch("x86_64"):
+            print(f"[multipitch] skipping fileaa — host is {platform.machine()}, binary is x86-64 only")
+            return False
         return True
+
+    # Only x86_64 hosts can run the binary
+    if not _is_native_arch("x86_64"):
+        print(f"[multipitch] skipping fileaa download — host is {platform.machine()}, binary is x86-64 only")
+        return False
+
     try:
         import urllib.request
         tmp = _MULTIPITCH_BIN + ".tmp"
@@ -3124,22 +3174,70 @@ def _run_fileaa_with_fallback(
 ) -> tuple[bool, str]:
     """Run the fileaa multipitch binary; fall back to rubberband+amix on failure.
 
-    Drops the --backend and --no-normalize flags that Termux builds don't support.
+    Fallback chain (each tier tried only when the previous one fails):
+      1. fileaa binary   — fastest, single-process multi-voice (x86-64 only)
+      2. rubberband CLI  — one pass per voice, then amix (requires rubberband pkg)
+      3. FFmpeg rubberband audio filter — built into ffmpeg-full, works everywhere
     """
-    result = subprocess.run(
-        [_MULTIPITCH_BIN, in_wav, out_wav, pitches_csv],
-        capture_output=True, timeout=timeout,
-    )
-    if result.returncode == 0:
-        return True, ""
+    # ── Tier 1: fileaa binary ───────────────────────────────────────────────
+    if _ensure_multipitch_bin():
+        result = subprocess.run(
+            [_MULTIPITCH_BIN, in_wav, out_wav, pitches_csv],
+            capture_output=True, timeout=timeout,
+        )
+        if result.returncode == 0:
+            return True, ""
+        stderr_note = result.stderr.decode(errors="replace")[-300:] if result.stderr else ""
+        print(f"[multipitch] fileaa failed (exit {result.returncode}): {stderr_note}")
+    else:
+        print("[multipitch] fileaa unavailable — skipping to rubberband fallback")
 
-    # ── Fallback: rubberband CLI, one pass per semitone, then amix ────────────
+    # ── Tier 2: rubberband CLI, one pass per semitone, then amix ───────────
     rb_bin = shutil.which("rubberband")
-    if not rb_bin:
-        stderr = result.stderr.decode(errors="replace")[-600:] if result.stderr else ""
-        return False, f"fileaa failed (exit {result.returncode}) and rubberband not found. stderr: {stderr}"
+    if rb_bin:
+        voice_wavs: list[str] = []
+        all_ok = True
+        for idx, st_str in enumerate(pitches_csv.split(",")):
+            st_str = st_str.strip()
+            if not st_str:
+                continue
+            try:
+                st = float(st_str)
+            except ValueError:
+                return False, f"invalid semitone value: {st_str!r}"
+            v_wav = os.path.join(tmpdir, f"{prefix}_rb_{idx}.wav")
+            rb_res = subprocess.run(
+                [rb_bin, f"-p{st:+.4f}", "-t1", in_wav, v_wav],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if rb_res.returncode != 0:
+                print(f"[multipitch] rubberband CLI failed (voice {idx}, {st:+.2f}st): {rb_res.stderr[-300:]}")
+                all_ok = False
+                break
+            voice_wavs.append(v_wav)
 
-    voice_wavs: list[str] = []
+        if all_ok and voice_wavs:
+            mix_cmd = ["ffmpeg", "-y"]
+            for vw in voice_wavs:
+                mix_cmd += ["-i", vw]
+            mix_cmd += [
+                "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+                "-c:a", "pcm_s16le",
+                out_wav,
+            ]
+            ok, err = _run_ffmpeg_raw(mix_cmd, timeout=timeout)
+            if ok:
+                return True, ""
+            print(f"[multipitch] rubberband CLI amix failed: {err[-300:]}")
+        elif not all_ok:
+            print("[multipitch] rubberband CLI had failures — trying FFmpeg filter fallback")
+        else:
+            print("[multipitch] rubberband CLI produced no voices — trying FFmpeg filter fallback")
+
+    # ── Tier 3: FFmpeg rubberband audio filter (works on any arch) ──────────
+    #   Use one pass per voice with rubberband=pitch filter, then amix.
+    #   This requires ffmpeg compiled with --enable-librubberband (e.g. Termux ffmpeg-full).
+    voice_wavs_ff: list[str] = []
     for idx, st_str in enumerate(pitches_csv.split(",")):
         st_str = st_str.strip()
         if not st_str:
@@ -3148,23 +3246,27 @@ def _run_fileaa_with_fallback(
             st = float(st_str)
         except ValueError:
             return False, f"invalid semitone value: {st_str!r}"
-        v_wav = os.path.join(tmpdir, f"{prefix}_rb_{idx}.wav")
-        rb_res = subprocess.run(
-            [rb_bin, f"-p{st:+.4f}", "-t1", in_wav, v_wav],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if rb_res.returncode != 0:
-            return False, f"rubberband failed (voice {idx}, {st:+.2f}st): {rb_res.stderr[-400:]}"
-        voice_wavs.append(v_wav)
+        # Convert semitones to pitch ratio: 2^(N/12)
+        pitch_ratio = 2.0 ** (st / 12.0)
+        v_wav = os.path.join(tmpdir, f"{prefix}_ffrb_{idx}.wav")
+        ok, err = _run_ffmpeg_raw([
+            "ffmpeg", "-y", "-i", in_wav,
+            "-af", f"rubberband=pitch={pitch_ratio:.6f}",
+            "-c:a", "pcm_s16le",
+            v_wav,
+        ], timeout=timeout)
+        if not ok:
+            return False, f"FFmpeg rubberband filter failed (voice {idx}, {st:+.2f}st): {err[-400:]}"
+        voice_wavs_ff.append(v_wav)
 
-    if not voice_wavs:
+    if not voice_wavs_ff:
         return False, "no valid pitch voices produced"
 
     mix_cmd = ["ffmpeg", "-y"]
-    for vw in voice_wavs:
+    for vw in voice_wavs_ff:
         mix_cmd += ["-i", vw]
     mix_cmd += [
-        "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
+        "-filter_complex", f"amix=inputs={len(voice_wavs_ff)}:normalize=0",
         "-c:a", "pcm_s16le",
         out_wav,
     ]
@@ -3246,44 +3348,19 @@ def _run_multipitch_rb3(
         if not ok:
             return False, f"Audio extraction failed: {err}"
 
-        # ── 5. Run fileaa (all pitches in one call, comma-separated) ─────────
+        # ── 5. Run pitch shifting (all pitches via unified fallback) ───────
         pitch_arg = ",".join(
             str(int(s)) if s == int(s) else str(s)
             for s in semitones
         )
         out_wav = os.path.join(tmpdir, "pitched.wav")
-        result = subprocess.run(
-            [_MULTIPITCH_BIN, base_wav, out_wav, pitch_arg],
-            capture_output=True, text=True, timeout=300,
+
+        # Use the unified fallback chain: fileaa → rubberband CLI → FFmpeg rubberband filter
+        ok_pitch, err_pitch = _run_fileaa_with_fallback(
+            base_wav, out_wav, pitch_arg, tmpdir, prefix="mp3_rb", timeout=300,
         )
-        if result.returncode != 0:
-            # ── Fallback: rubberband CLI — one pass per voice, then amix ─────
-            rb_bin = shutil.which("rubberband")
-            if not rb_bin:
-                return False, f"❌ Multipitch processing failed: {result.stderr[-800:]}"
-            voice_wavs: list[str] = []
-            for idx, st in enumerate(semitones):
-                v_wav = os.path.join(tmpdir, f"voice_{idx}.wav")
-                pitch_flag = f"-p{st:+.4f}" if st != 0 else "-p+0.0"
-                rb_res = subprocess.run(
-                    [rb_bin, pitch_flag, "-t1", base_wav, v_wav],
-                    capture_output=True, text=True, timeout=300,
-                )
-                if rb_res.returncode != 0:
-                    return False, f"❌ rubberband fallback failed (voice {idx}): {rb_res.stderr[-600:]}"
-                voice_wavs.append(v_wav)
-            # Mix all voices with FFmpeg amix
-            mix_cmd = ["ffmpeg", "-y"]
-            for vw in voice_wavs:
-                mix_cmd += ["-i", vw]
-            mix_cmd += [
-                "-filter_complex", f"amix=inputs={len(voice_wavs)}:normalize=0",
-                "-c:a", "pcm_s16le",
-                out_wav,
-            ]
-            ok_mix, err_mix = _run_ffmpeg_raw(mix_cmd, timeout=180)
-            if not ok_mix:
-                return False, f"❌ amix failed: {err_mix}"
+        if not ok_pitch:
+            return False, f"❌ Multipitch processing failed: {err_pitch}"
 
         # ── 6. Remux pitched audio with original video (or audio-only) ───────
         # Use -c:v copy to preserve original timestamps exactly — re-encoding
@@ -3875,6 +3952,335 @@ def _run_preview1280(
         return _run_ffmpeg_raw(cmd, timeout=180)
 
 
+def _generate_opposite_hald_cluts(workdir: str) -> list[str]:
+    """Generate Hald CLUT .ppm files for the *opposite* (negative) hue shifts used by oppositep1280.
+
+    Returns paths to [hslhue_neg54.ppm, hslhue_180.ppm, hslhue_neg21_6.ppm, hslhue_neg108_neg30.ppm].
+    These are the inverse hue shifts of the preview1280 CLUTs:
+      preview +54°  → opposite -54°
+      preview +22°  → opposite -21.6°
+      preview +108°/+30sat → opposite -108°/-30sat
+    The +180° CLUT is shared between both pipelines.
+    """
+    clut_specs = [
+        # hslhue_neg54: hue shift -54° → fraction -0.3, mod = -0.3*200+100 = 40... nope.
+        # ImageMagick formula: hue_shift_deg / 1.8 + 100
+        # -54/1.8+100 = -30+100 = 70
+        ("hslhue_neg54.ppm", 100, 100, 70),
+        # hslhue_180: same as preview1280 (fraction 0.5, mod = 0.5*200+100 = 200)
+        ("hslhue_180.ppm", 100, 100, 200),
+        # hslhue_neg21_6: -21.6/1.8+100 = -12+100 = 88
+        ("hslhue_neg21_6.ppm", 100, 100, 88),
+        # hslhue_neg108_neg30: -108° hue + saturation drop to 70
+        # -108/1.8+100 = -60+100 = 40
+        ("hslhue_neg108_neg30.ppm", 100, 70, 40),
+    ]
+    paths = []
+    for filename, brightness, saturation, hue_mod in clut_specs:
+        path = os.path.join(workdir, filename)
+        cmd = [
+            "magick", "hald:4",
+            "-modulate", f"{brightness},{saturation},{hue_mod}",
+            path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            pass  # CLUT effects will be skipped if magick isn't available
+        paths.append(path)
+    return paths
+
+
+def _run_oppositep1280(
+    input_path: str,
+    output_path: str,
+    start_offset: float = 1.85,
+    segment_dur: float = 0.85,
+    force_output_size: tuple[int, int] | None = None,
+) -> tuple[bool, str]:
+    """Run the oppositep1280 TV-simulator montage pipeline.
+
+    This is the *inverse* of preview1280: all hue shifts are negated and all
+    pitch shifts are inverted (positive semitones become negative and vice-versa).
+    The pipeline structure (12 segments, displacement map, timing) is identical.
+
+    Requires: ffmpeg, ImageMagick (magick), and the tvsimulator.mov displacement map.
+    Uses rubberband audio filter for high-quality pitch shifting.
+    """
+    # Helper: rubberband pitch filter string for N semitones
+    def _rb(semitones: float, transients: str = "mixed") -> str:
+        pitch_ratio = 2 ** (semitones / 12)
+        return (
+            f"rubberband=pitch={pitch_ratio:.6f}:"
+            f"window=short:transients={transients}:"
+            f"detector=soft:channels=together:pitchq=consistency"
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        info = _ffprobe_video_info(input_path)
+        w, h = info["width"], info["height"]
+        dur = info["duration"]
+
+        if w == 0 or h == 0:
+            return False, "Could not read input video dimensions."
+
+        # Generate Hald CLUTs (opposite/negative hues)
+        cluts = _generate_opposite_hald_cluts(tmpdir)
+        clut_neg54 = cluts[0] if os.path.exists(cluts[0]) else None
+        clut_180 = cluts[1] if os.path.exists(cluts[1]) else None
+        clut_neg21_6 = cluts[2] if os.path.exists(cluts[2]) else None
+        clut_neg108_neg30 = cluts[3] if os.path.exists(cluts[3]) else None
+
+        # Locate displacement map
+        disp_map = None
+        for candidate in [
+            "bot/displacemaps/tvsimulator.mov",
+            "displacemaps/tvsimulator.mov",
+            "/app/bot/displacemaps/tvsimulator.mov",
+        ]:
+            if os.path.exists(candidate):
+                disp_map = candidate
+                break
+
+        # Compute timing
+        t = segment_dur
+        t2 = segment_dur / 2
+        t3 = start_offset + segment_dur
+
+        # Step 1: Pre-process input to 640x360 FFV1
+        avi0 = os.path.join(tmpdir, "0.avi")
+        cmd = [
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", input_path,
+            "-vf", "scale=640:360,setsar=1:1",
+            "-ss", str(start_offset), "-to", str(t3),
+            "-c:v", "ffv1", "-c:a", "pcm_s16le",
+            avi0
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Step 1 (pre-process) failed: {err}"
+
+        avi_w = _ffprobe(avi0, "-select_streams", "v:0",
+                         "-show_entries", "stream=width",
+                         "-of", "default=nw=1:nk=1") or "640"
+        avi_h = _ffprobe(avi0, "-select_streams", "v:0",
+                         "-show_entries", "stream=height",
+                         "-of", "default=nw=1:nk=1") or "360"
+
+        # Step 1b: Standardize fps to 29.97
+        modfps = os.path.join(tmpdir, "modfps.avi")
+        cmd = [
+            "ffmpeg", "-y", "-i", avi0,
+            "-vf", "fps=29.97",
+            "-c:v", "ffv1", "-c:a", "pcm_s16le",
+            modfps
+        ]
+        ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+        if not ok:
+            return False, f"Step 1b (fps standardize) failed: {err}"
+
+        # Helper to build segment ffmpeg commands
+        segments = []
+
+        # ── Segment 1: plain copy, duration t ─────────────────────────────
+        seg1 = os.path.join(tmpdir, "1.avi")
+        segments.append(([
+            "ffmpeg", "-y", "-i", modfps,
+            "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+            seg1
+        ], seg1))
+
+        # ── Segment 2: hue -54 (hslhue_neg54), pitch -1 semitone ──────────
+        seg2 = os.path.join(tmpdir, "2.avi")
+        if clut_neg54:
+            segments.append(([
+                "ffmpeg", "-y", "-i", modfps,
+                "-vf", f"movie={clut_neg54},[in]haldclut,format=yuv420p",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg2
+            ], seg2))
+        else:
+            segments.append(([
+                "ffmpeg", "-y", "-i", modfps,
+                "-vf", "hue=h=-54",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg2
+            ], seg2))
+
+        # ── Segment 3: hue +180 + displacement map + mirror + pitch +2 st ──
+        seg3 = os.path.join(tmpdir, "3.avi")
+        if disp_map and clut_180:
+            fc = (
+                f"movie={clut_180}[h];"
+                f"[0][h]haldclut,crop=iw/2:ih:0:0,split[left][tmp];"
+                f"[tmp]hflip[right];[left][right]hstack,format=yuv420p,format=bgr32[00];"
+                f"[1]crop=iw:ih/1:0:0,scale={avi_w}:{avi_h},eq=contrast=-0.375,format=bgr32,hue=b=-0.033[x];"
+                f"nullsrc=1x1,geq=r=128:g=128:b=128,scale={avi_w}:{avi_h},format=bgr32[y];"
+                f"[00][x][y]displace=edge=wrap[v]"
+            )
+            segments.append(([
+                "ffmpeg", "-y", "-i", modfps, "-stream_loop", "-1", "-i", disp_map,
+                "-filter_complex", fc,
+                "-af", _rb(2),
+                "-map", "[v]", "-map", "0:a",
+                "-pix_fmt", "yuv420p",
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg3
+            ], seg3))
+        else:
+            # Fallback without displacement
+            segments.append(([
+                "ffmpeg", "-y", "-i", modfps,
+                "-vf", "hue=h=180,crop=iw/2:ih:0:0,split[left][tmp];[tmp]hflip[right];[left][right]hstack,format=yuv420p",
+                "-af", _rb(2),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg3
+            ], seg3))
+
+        # ── Segment 4: hue -54 (hslhue_neg54), pitch -1 semitone ──────────
+        seg4 = os.path.join(tmpdir, "4.avi")
+        if clut_neg54:
+            segments.append(([
+                "ffmpeg", "-y", "-i", modfps,
+                "-vf", f"movie={clut_neg54},[in]haldclut,format=yuv420p",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg4
+            ], seg4))
+        else:
+            segments.append(([
+                "ffmpeg", "-y", "-i", modfps,
+                "-vf", "hue=h=-54",
+                "-af", _rb(-1),
+                "-t", str(t), "-c:v", "ffv1", "-c:a", "pcm_s16le",
+                seg4
+            ], seg4))
+
+        # ── Segments 5-12: shorter segments (t2 duration) ──────────────────
+        # oppositep1280 pitches are the inverse of preview1280:
+        #   preview +2 st (smooth) → opposite -2 st (smooth)
+        #   preview +1 st         → opposite -1 st
+        #   preview +3 st         → opposite -3 st
+        #   preview -2 st         → opposite +2 st
+        short_specs = [
+            # (seg_num, vf_filter, af_filter)
+            (5, None, None),  # plain copy
+            (6, f"movie={clut_neg21_6},[in]haldclut,hflip,format=yuv420p" if clut_neg21_6 else "hue=h=-21.6,hflip,format=yuv420p",
+             _rb(-2, "smooth")),  # hue-21.6, hflip, pitch-2 (smooth transients)
+            (7, f"movie={clut_neg54},[in]haldclut,format=yuv420p" if clut_neg54 else "hue=h=-54,format=yuv420p",
+             _rb(-1)),  # hue-54, pitch-1
+            (8, f"movie={clut_neg108_neg30},[in]haldclut,hflip,format=yuv420p" if clut_neg108_neg30 else "hue=h=-108,hflip,format=yuv420p",
+             _rb(-3)),  # hue-108-sat30, hflip, pitch-3
+            (9, f"movie={clut_180},[in]haldclut,format=yuv420p" if clut_180 else "hue=h=180,format=yuv420p",
+             _rb(2)),  # hue+180, pitch+2
+            (10, "hflip", None),  # just hflip
+            (11, f"movie={clut_neg54},[in]haldclut,format=yuv420p" if clut_neg54 else "hue=h=-54,format=yuv420p",
+             _rb(-1)),  # hue-54, pitch-1
+            (12, f"movie={clut_neg108_neg30},[in]haldclut,hflip,format=yuv420p" if clut_neg108_neg30 else "hue=h=-108,hflip,format=yuv420p",
+             _rb(-3)),  # hue-108-sat30, hflip, pitch-3
+        ]
+
+        for seg_num, vf, af in short_specs:
+            seg_path = os.path.join(tmpdir, f"{seg_num}.avi")
+            cmd = ["ffmpeg", "-y", "-i", modfps]
+            if vf:
+                cmd.extend(["-vf", vf])
+            if af:
+                cmd.extend(["-af", af])
+            cmd.extend(["-t", str(t2), "-c:v", "ffv1", "-c:a", "pcm_s16le", seg_path])
+            segments.append((cmd, seg_path))
+
+        # Render all segments
+        for i, (cmd, seg_path) in enumerate(segments):
+            ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+            if not ok:
+                return False, f"Segment {i+1}/{len(segments)} failed: {err}"
+
+        # Concat all segments using concat protocol
+        avi_files = [sp for _, sp in segments if os.path.exists(sp)]
+        if not avi_files:
+            return False, "No segments were produced."
+
+        concat_str = "|".join(avi_files)
+        out_w, out_h = force_output_size if force_output_size else (w, h)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", f"concat:{concat_str}",
+            "-vf", f"scale={out_w}:{out_h},setsar=1",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        return _run_ffmpeg_raw(cmd, timeout=180)
+
+
+
+
+
+def _run_realmajor4(
+    input_path: str,
+    output_path: str,
+) -> tuple[bool, str]:
+    """Run the Real G-Major 4 effect pipeline.
+
+    Implements the mediascript:
+      1. Invert all RGB channels (curves r/g/b = 0/1 1/0)
+      2. Copy the inverted video and pitch-shift it up by 5 semitones
+      3. Overlay the pitch-shifted copy on top of the inverted original
+      4. Double the audio volume
+
+    The result is an RGB-inverted video with a ghosted/brightened overlay
+    of the same inverted content, accompanied by a mix of the original
+    (inverted) audio and a +5 semitone pitch-shifted version, with overall
+    volume doubled.
+    """
+    # Pitch ratio for +5 semitones: 2^(5/12)
+    pitch_ratio = 2 ** (5 / 12)
+
+    info = _ffprobe_video_info(input_path)
+    w, h = info["width"], info["height"]
+
+    if w == 0 or h == 0:
+        return False, "Could not read input video dimensions."
+
+    # Complex filter graph:
+    # [0] = original input
+    # Split into two branches:
+    #   Branch A: RGB invert → [base] (video) + [aud0] (audio)
+    #   Branch B: RGB invert + rubberband pitch +5st → [over] (video) + [aud1] (audio)
+    # Overlay [over] on [base] → [vout]
+    # Mix [aud0] + [aud1] with volume 2 → [aout]
+    fc = (
+        f"[0:v]split=2[va][vb];"
+        # Branch A: RGB invert (curves)
+        f"[va]curves=r='0/1 1/0':g='0/1 1/0':b='0/1 1/0',format=yuv420p[base];"
+        # Branch B: RGB invert + pitch shift (rubberband on audio later)
+        f"[vb]curves=r='0/1 1/0':g='0/1 1/0':b='0/1 1/0',format=yuv420p[over];"
+        # Overlay: pitch-shifted inverted copy on top of inverted base
+        f"[base][over]overlay=0:0:format=auto[vout];"
+        # Audio: split, pitch-shift one branch, mix both, double volume
+        f"[0:a]asplit=2[aud0][aud1];"
+        f"[aud1]rubberband=pitch={pitch_ratio:.6f}:window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency[pitched];"
+        f"[aud0][pitched]amix=inputs=2:duration=first:dropout_transition=0,volume=2[aout]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-filter_complex", fc,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    return _run_ffmpeg_raw(cmd, timeout=180)
+
+
 # ---------- Bot events & commands ----------
 
 @tasks.loop(seconds=5)
@@ -4249,6 +4655,199 @@ async def preview1280_command(ctx: commands.Context, start: float = 1.85, durati
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
+
+@bot.command(name="oppositep1280", aliases=["op1280", "opposite", "opposite1280"])
+async def oppositep1280_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
+    """Create a 12-segment inverse TV-simulator montage from an attached video.
+
+    The *opposite* of preview1280: all hue shifts are negated and all pitch
+    shifts are inverted. Usage: t!oppositep1280 [start_offset] [segment_duration]
+    Aliases: t!op1280, t!opposite, t!opposite1280
+    Default: start=1.85, duration=0.85
+    """
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "**IHTX OppositeP1280**\n"
+            "Attach a video and use `t!oppositep1280 [start] [duration]`.\n\n"
+            "Creates a 12-segment TV-simulator montage with **inverse** hue shifts "
+            "and **negated** pitch variations compared to preview1280.\n\n"
+            "Defaults: start=1.85s, duration=0.85s per segment.\n"
+            "Aliases: `t!op1280`, `t!opposite`, `t!opposite1280`\n"
+            "Example: `t!op1280 2.0 1.0`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        await ctx.reply(f"OppositeP1280 requires a video file. Got `{suffix}`.")
+        return
+
+    start = max(0.0, start)
+    duration = max(0.1, min(duration, 10.0))
+
+    status_msg = await ctx.reply(
+        f"⚙️ Creating **oppositep1280** montage (start={start}s, dur={duration}s)... this will take a while."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, "output_op1280.mp4")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        # Ensure displacement map is available
+        try:
+            disp_path = await _ensure_displacement_map(tmpdir)
+        except FileNotFoundError as e:
+            await status_msg.edit(content=f"❌ {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_oppositep1280, input_path, output_path, start, duration
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ OppositeP1280 failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try shorter segments.")
+            return
+
+        out_filename = f"op1280_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed_op1280 = discord.Embed(
+                title="Opposite 1280 - Inverse TV-simulator montage",
+                description="All hue shifts negated · All pitch shifts inverted vs preview1280",
+                color=11578404,
+            )
+            embed_op1280.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
+            await ctx.reply(
+                embed=embed_op1280,
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
+
+
+
+
+@bot.command(name="realgmajor4", aliases=["realgm4", "rgm4"])
+async def realgmajor4_command(ctx: commands.Context):
+    """Real G-Major 4 effect: RGB invert + pitch-shifted overlay + doubled volume.
+
+    Implements the mediascript:
+      1. Invert all RGB channels
+      2. Pitch-shift a copy up by 5 semitones
+      3. Overlay the pitch-shifted inverted copy on the inverted original
+      4. Double the audio volume
+
+    Usage: t!realgmajor4
+    Aliases: t!realgm4, t!rgm4
+    """
+    # Resolve attachment
+    attachment = None
+    if ctx.message and ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+    elif ctx.message and ctx.message.reference:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if ref.attachments:
+                attachment = ref.attachments[0]
+        except Exception:
+            pass
+
+    if not attachment:
+        await ctx.reply(
+            "**IHTX Real G-Major 4**\n"
+            "Attach a video and use `t!realgmajor4`.\n\n"
+            "Applies RGB inversion, overlays a pitch-shifted (+5 semitones) copy,\n"
+            "and doubles the audio volume.\n\n"
+            "Aliases: `t!realgm4`, `t!rgm4`"
+        )
+        return
+
+    if attachment.size > MAX_FILE_SIZE:
+        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
+        return
+
+    suffix = Path(attachment.filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        await ctx.reply(f"Unsupported file type `{suffix}`. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        return
+
+    is_video = suffix in VIDEO_EXTENSIONS
+    if not is_video:
+        await ctx.reply("Real G-Major 4 requires a video file (audio pitch shifting is part of the effect).")
+        return
+
+    out_ext = get_output_ext(suffix, is_video)
+
+    status_msg = await ctx.reply(
+        f"⚙️ Creating **Real G-Major 4** effect... this may take a moment."
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{suffix}")
+        output_path = os.path.join(tmpdir, f"output{out_ext}")
+
+        try:
+            await download_attachment(attachment, input_path)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
+            return
+
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _run_realmajor4, input_path, output_path
+        )
+
+        if not ok:
+            await status_msg.edit(content=f"❌ Real G-Major 4 failed:\n```\n{err[-1500:]}\n```")
+            return
+
+        out_size = os.path.getsize(output_path)
+        if out_size > MAX_FILE_SIZE:
+            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
+            return
+
+        out_filename = f"rgm4_{Path(attachment.filename).stem}.mp4"
+        try:
+            embed_rgm4 = discord.Embed(
+                title="Real G-Major 4",
+                description="RGB inverted · +5 semitone pitch overlay · Volume doubled",
+                color=discord.Color.dark_magenta(),
+            )
+            embed_rgm4.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
+            await ctx.reply(
+                embed=embed_rgm4,
+                file=discord.File(output_path, filename=out_filename),
+            )
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 @bot.command(name="preview1280with640x360resize", aliases=["p1280ff!3", "p1280w16:9r"])
 async def preview1280_640x360resize_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
@@ -6652,6 +7251,16 @@ _HELP_ENTRIES: list[dict] = [
     },
     {
         "cat": "heavy",
+        "name": "t!oppositep1280 [start] [dur]  (aliases: op1280, opposite, opposite1280)",
+        "value": "Inverse TV-simulator montage: all hue shifts negated, all pitch shifts inverted vs preview1280. Defaults: start=1.85, dur=0.85",
+    },
+    {
+        "cat": "heavy",
+        "name": "t!realgmajor4  (aliases: realgm4, rgm4)",
+        "value": "Real G-Major 4: RGB inversion + pitch-shifted (+5 semitones) overlay + doubled volume",
+    },
+    {
+        "cat": "heavy",
         "name": "t!preview1280with640x360resize [start] [dur]  (aliases: p1280ff!3, p1280w16:9r)",
         "value": "Same 12-segment TV-simulator montage as preview1280 but the final output is locked to **640×360** regardless of input resolution. Defaults: start=1.85, dur=0.85",
     },
@@ -6965,6 +7574,26 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v6.3",
+        "date": "2026-06-28",
+        "heavy": [],
+        "fun": [
+            "**`t!guesseffect` / `t!ge`** — New mini-game command! The bot picks a random logo-editing effect from a 15-entry pool sourced from the Logo Editing Fandom wiki (G-Major, CoNfUsIoN, Preview 2, RGB to BGR, Crying Effect, Orange Effect, and more). It posts a clue card with the effect's category, a letter-scrambled name hint, and a pipeline description — then opens a 20-second `wait_for` window. First person to type the correct name wins. Timeout gracefully reveals the answer with a wiki link.",
+        ],
+        "owner": [],
+    },
+    {
+        "version": "v6.2",
+        "date": "2026-06-27",
+        "heavy": [
+            "**`t!oppositep1280` / `t!op1280`** — New command: inverse TV-simulator montage. All hue shifts are negated and all pitch shifts are inverted compared to preview1280, producing the visual/audio 'opposite' effect. Supports the same 12-segment pipeline with configurable start offset and segment duration. Also available as a pipe effect (`oppositep1280` / `op1280`) in custom IHTX chains.",
+            "**`t!realgmajor4` / `t!realgm4` / `t!rgm4`** — New command: Real G-Major 4 effect. Inverts all RGB channels, overlays a pitch-shifted (+5 semitones) copy of the inverted video, and doubles the audio volume. Also available as a pipe effect (`realgmajor4` / `realgm4` / `rgm4`) in custom IHTX chains.",
+            "**`t!op1280` / `t!oppositep1280`** — Updated: Added fps=29.97 standardization step (modfps.avi intermediate), segment 3 mirror now uses crop-then-mirror (no pre-hflip), and segment 3 contrast corrected to -0.375.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
         "version": "v6.1",
         "date": "2026-06-27",
         "heavy": [],
@@ -7046,7 +7675,7 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-26",
         "heavy": [
             "**fzgm156 / freakzingagm156 / fgm156 aliases** — All four aliases (`freakzinga`, `fzgm156`, `freakzingagm156`, `fgm156`) now work for the G Major 156 pipe effect.",
-            "**multipitch2 / mp2 pipe effect** — Wave-hammer multi-voice pitch shift. Params: `<pitches> [surround_type] [sr]`. Pitches are pipe/comma-separated semitones (e.g. `mp2=1|7|8`). Optional surround types: `G-Major_17` (alimiter=15) or `Evil_Rampaging_Sorcerer` (alimiter=30). Pipeline: (1) downsample audio to sr/2, (2) run Signalsmith multipitch binary, (3) asetrate back to sr + optional alimiter, (4) remux over original video.",
+            "**multipitch2 / mp2 pipe effect** — Wave-hammer multi-voice pitch shift. Params: `<pitches> [surround_type] [sr]`. Pitches are pipe/comma-separated semitones (e.g. `mp2=1|7|8`). Optional surround types: `G-Major_17` (alimiter=15) or `Evil_Rampaging_Sorcerer` (alimiter=30). Pipeline: (1) downsample audio to sr/2, (2) pitch-shift with auto fallback (Signalsmith binary on x86_64, rubberband CLI, or FFmpeg rubberband filter on ARM/Termux), (3) asetrate back to sr + optional alimiter, (4) remux over original video. Works on all architectures including Termux (aarch64).",
         ],
         "fun": [],
         "owner": [],
@@ -8551,6 +9180,8 @@ Heavy (media processing):
 - t!syncaudio [alt] — sync video and audio durations
 - t!trim <start> <end> — trim audio/video/GIF
 - t!preview1280 [start] [dur] — 12-segment TV-simulator montage
+- t!oppositep1280 [start] [dur] — inverse TV-simulator montage (negated hues, inverted pitches)
+- t!realgmajor4 — RGB invert + pitch-shifted overlay + doubled volume (aliases: realgm4, rgm4)
 - t!invlum [n] — luma-inversion loop
 - t!lexg — re-apply last export effect chain to new media
 
@@ -10274,6 +10905,283 @@ async def catbox_upload(ctx: commands.Context):
             await status_msg.edit(content=f"❌ catbox error: {result[:300]}")
     except Exception as e:
         await status_msg.edit(content=f"❌ upload failed: {e}")
+
+
+# ---------- Guess Effect Mini-Game ----------
+
+# Effect pool sourced from the Logo Editing Fandom wiki (Category:Effects /
+# Category:All_effect_articles). Each entry carries:
+#   name       – canonical display name
+#   accept     – list of lowercase strings that count as a correct answer
+#   category   – effect type label shown in the clue card
+#   wiki       – canonical wiki URL for the reveal
+#   description – flavour-text clue that describes the pipeline without naming it
+_GE_EFFECTS: list[dict] = [
+    {
+        "name": "G-Major",
+        "accept": ["g-major", "gmajor", "g major"],
+        "category": "Color grading + audio pitch shift",
+        "wiki": "https://logo-editing.fandom.com/wiki/G-Major",
+        "description": (
+            "One of the oldest and most recognisable logo editing effects, created in 2007. "
+            "The video runs through a hue-rotation that swings greens into purples, "
+            "followed by a full channel inversion that turns the picture inside-out. "
+            "The audio is pitch-shifted upward by roughly 7 semitones. "
+            "In FFmpeg-land: `hue=h=180,negate` on the video and `rubberband -p+7` on the audio."
+        ),
+    },
+    {
+        "name": "G-Major 4",
+        "accept": ["g-major 4", "gmajor 4", "g major 4", "g-major4", "gmajor4"],
+        "category": "Color grading + layered overlay + audio boost",
+        "wiki": "https://logo-editing.fandom.com/wiki/G-Major_4",
+        "description": (
+            "A souped-up variant of the classic G-Major pipeline. All RGB channels are inverted, "
+            "then a second pitch-shifted (+5 semitones) copy of the inverted video is blended "
+            "on top of itself as an overlay. The audio track is then doubled in volume. "
+            "The result has a harsh, glowing quality absent from its predecessor."
+        ),
+    },
+    {
+        "name": "CoNfUsIoN",
+        "accept": ["confusion", "confusión", "confushion"],
+        "category": "Complex color manipulation + mirror distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/CoNfUsIoN",
+        "description": (
+            "Charallony6000's 2014 creation stacks HSL Adjust, Invert, a horizontal mirror, "
+            "LAB Adjust, and Color Corrector (Secondary) in a single chain. "
+            "The mixed-case spelling of the name itself is part of the brand. "
+            "Audio typically receives a harsh reverb or echo on top of a pitch shift, "
+            "leaving the listener disoriented alongside the warped visuals."
+        ),
+    },
+    {
+        "name": "Preview 2",
+        "accept": ["preview 2", "preview2"],
+        "category": "Iconic logo-editing transition effect",
+        "wiki": "https://logo-editing.fandom.com/wiki/Preview_2",
+        "description": (
+            "A cornerstone of the logo editing community and one of the most heavily remixed effects "
+            "on the wiki. It reproduces the look of a classic broadcast preview bumper by "
+            "layering colour-wash filters over a zoomed or cropped frame, accompanied by a "
+            "distinctive pitched-up audio sting. Countless variants and spin-offs use it as a base."
+        ),
+    },
+    {
+        "name": "RGB to BGR",
+        "accept": ["rgb to bgr", "rgb2bgr", "bgr", "rgbtobgr"],
+        "category": "Color channel swap",
+        "wiki": "https://logo-editing.fandom.com/wiki/RGB_to_BGR",
+        "description": (
+            "A precise channel-manipulation effect: the red and blue planes are swapped while "
+            "green is left untouched. Warm colours become cold and vice versa — reds turn blue, "
+            "blues turn red, skies shift orange, and faces go alien. "
+            "In FFmpeg: `shuffleplanes=0:1:0:3` (or the `geq` RGB-component swap trick). "
+            "No audio processing — the change is purely visual."
+        ),
+    },
+    {
+        "name": "Crying Effect",
+        "accept": ["crying effect", "crying", "cry effect"],
+        "category": "Emotional visual distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Crying_Effect",
+        "description": (
+            "Named for the emotional reaction it's meant to evoke. The video is desaturated "
+            "toward cool blue-grey tones, then a gentle vertical wave distortion — simulating "
+            "tears streaming down the lens — is applied. "
+            "Audio usually shifts to a slow, lowered pitch with reverb, evoking a mournful tone. "
+            "Often used on logos to make them look like they're weeping."
+        ),
+    },
+    {
+        "name": "Orange Effect",
+        "accept": ["orange effect", "orange"],
+        "category": "Warm color grade",
+        "wiki": "https://logo-editing.fandom.com/wiki/Orange_Effect",
+        "description": (
+            "A straightforward but striking colour grade that pushes the entire palette toward "
+            "warm amber-orange tones. Achieved by boosting the red channel, reducing blue, and "
+            "slightly lifting shadows. In FFmpeg: `curves=r='0/0 0.5/0.6 1/1':b='0/0 0.5/0.35 1/0.8'`. "
+            "Often combined with slight saturation increases for an 'Instagram sunset' look. "
+            "No standard audio component."
+        ),
+    },
+    {
+        "name": "Center Effects",
+        "accept": ["center effects", "center effect", "centre effects", "centre effect"],
+        "category": "Crop and zoom distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Center_Effects",
+        "description": (
+            "Forces the subject to the exact centre of the frame by cropping outer regions and "
+            "scaling up the middle. The resulting image is zoomed in and often slightly blurred "
+            "at the edges, giving a tunnel-vision quality. "
+            "Frequently paired with a pitch-raised audio track to heighten the claustrophobic feel. "
+            "In FFmpeg: `crop=iw/2:ih/2,scale=iw*2:ih*2`."
+        ),
+    },
+    {
+        "name": "Electronic Sounds",
+        "accept": ["electronic sounds", "electronic sound", "electronic"],
+        "category": "Audio synthesis effect",
+        "wiki": "https://logo-editing.fandom.com/wiki/Electronic_Sounds",
+        "description": (
+            "Replaces or heavily processes the original audio to sound like vintage synthesiser "
+            "or arcade-machine output. Common techniques: aggressive bit-crushing, tremolo, "
+            "square-wave ring modulation, and heavy echo. "
+            "The visuals often receive a scanline or CRT-like overlay to match the retro-digital "
+            "audio aesthetic. Associated with the Klasky Csupo community."
+        ),
+    },
+    {
+        "name": "Render Pack Transition",
+        "accept": ["render pack transition", "render pack", "rpt"],
+        "category": "Stinger / transition effect",
+        "wiki": "https://logo-editing.fandom.com/wiki/Render_Pack_Transition",
+        "description": (
+            "A community-standard transition that bridges two clips using a short pre-rendered "
+            "motion graphic — typically a flash, wipe, or shatter — sourced from shared render packs. "
+            "The transition itself carries no permanent colour or audio transforms; "
+            "it's purely a between-clip stinger. Widely used in montage and compilation videos "
+            "across the logo editing scene."
+        ),
+    },
+    {
+        "name": "Mirror Effect",
+        "accept": ["mirror effect", "mirror", "hflip", "horizontal mirror"],
+        "category": "Geometric flip / mirror distortion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:Effects_that_are_mirrored",
+        "description": (
+            "Flips the video along its horizontal axis so that left becomes right. "
+            "The simplest application is `hflip` in FFmpeg, but many community variants stack "
+            "additional effects — colour inversion, pitch shift, or a palindrome reverse-concat — "
+            "on top of the basic flip. Text and logos become unreadable, creating a dreamlike, "
+            "backwards-world aesthetic."
+        ),
+    },
+    {
+        "name": "Color Inversion",
+        "accept": ["color inversion", "colour inversion", "invert", "color invert", "colour invert"],
+        "category": "Color channel inversion",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:Effects_that_use_Invert",
+        "description": (
+            "Every pixel's brightness value is flipped: whites become black, bright reds become "
+            "cyan, sky-blue skies turn orange. Achieved with the `negate` filter in FFmpeg or "
+            "the 'Invert' effect in VEGAS/AVS. Often used as a base layer inside more complex "
+            "chains such as G-Major, CoNfUsIoN, and X-Major variants. "
+            "No inherent audio processing."
+        ),
+    },
+    {
+        "name": "X-Major",
+        "accept": ["x-major", "xmajor", "x major"],
+        "category": "G-Major variant — hue shift + audio pitch",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:Effects_by_names",
+        "description": (
+            "Closely related to G-Major but with different hue-rotation and pitch values. "
+            "Where G-Major swings ~180° and up 7 semitones, this variant uses a different "
+            "rotation angle and a distinct semitone offset — often negative — giving it a "
+            "cooler, more muted visual palette and a lower-pitched, murkier audio character. "
+            "It inherits the core inversion step from its predecessor."
+        ),
+    },
+    {
+        "name": "Vibe",
+        "accept": ["vibe", "the vibe"],
+        "category": "Audio vibrato + warm visual grade",
+        "wiki": "https://logo-editing.fandom.com/wiki/Category:All_effect_articles",
+        "description": (
+            "Centred on an audio vibrato filter — a periodic pitch wobble applied to the whole track — "
+            "combined with a warm, slightly desaturated visual grade that evokes lo-fi aesthetics. "
+            "In FFmpeg: `vibrato=f=5:d=0.5` for the audio wobble plus `eq=saturation=0.8,curves` "
+            "for the visual warmth. Often used on chill or nostalgic logo edits."
+        ),
+    },
+    {
+        "name": "Pitch Shift",
+        "accept": ["pitch shift", "pitchshift", "pitch"],
+        "category": "Audio pitch manipulation",
+        "wiki": "https://logo-editing.fandom.com/wiki/Audio_effects_of_AVS_Video_Editor",
+        "description": (
+            "The most fundamental audio-only effect in the logo editing toolkit — "
+            "transposing the entire audio track up or down by a set number of semitones "
+            "without changing its playback speed. "
+            "In FFmpeg: `asetrate=sr*2^(n/12),aresample=sr` (simple) or `rubberband -p<n>` (high quality). "
+            "Used as a building block inside almost every major community effect."
+        ),
+    },
+]
+
+
+def _ge_scramble(name: str) -> str:
+    """Scramble the alphabetic characters in *name* while keeping non-letter
+    characters (hyphens, spaces, digits) in their original positions."""
+    chars = list(name)
+    letter_idx = [i for i, c in enumerate(chars) if c.isalpha()]
+    letters = [chars[i] for i in letter_idx]
+    shuffled = letters[:]
+    # Keep shuffling until the result differs from the original (or give up after 15 tries)
+    for _ in range(15):
+        random.shuffle(shuffled)
+        if [c.lower() for c in shuffled] != [c.lower() for c in letters]:
+            break
+    for pos, idx in enumerate(letter_idx):
+        chars[idx] = shuffled[pos]
+    return "".join(chars)
+
+
+@bot.command(name="guesseffect", aliases=["ge"])
+async def guesseffect(ctx: commands.Context):
+    """Mini-game: guess the logo editing effect from clues! 20-second timer."""
+    effect = random.choice(_GE_EFFECTS)
+    scrambled = _ge_scramble(effect["name"])
+
+    embed = discord.Embed(
+        title="🎮 Guess the Effect!",
+        description=(
+            "A famous logo-editing effect is hiding below. "
+            "Study the clues and type its name in chat to win!\n"
+            "*(Case-insensitive — common spellings accepted)*"
+        ),
+        color=0x9b59b6,
+    )
+    embed.add_field(name="📂 Category", value=effect["category"], inline=False)
+    embed.add_field(name="🔀 Scrambled Name", value=f"```{scrambled}```", inline=False)
+    embed.add_field(name="📝 Pipeline Clue", value=effect["description"], inline=False)
+    embed.set_footer(text="⏱  You have 20 seconds — type the effect name!")
+    await ctx.send(embed=embed)
+
+    accept_set = {a.lower() for a in effect["accept"]}
+
+    def _check(m: discord.Message) -> bool:
+        return (
+            m.channel.id == ctx.channel.id
+            and not m.author.bot
+            and m.content.strip().lower() in accept_set
+        )
+
+    try:
+        winner: discord.Message = await bot.wait_for("message", check=_check, timeout=20.0)
+        result_embed = discord.Embed(
+            title="🎉 Correct!",
+            description=(
+                f"**{winner.author.display_name}** nailed it!\n"
+                f"The effect was **{effect['name']}**.\n"
+                f"[📖 Read about it on the wiki]({effect['wiki']})"
+            ),
+            color=0x2ecc71,
+        )
+        await ctx.send(embed=result_embed)
+    except asyncio.TimeoutError:
+        timeout_embed = discord.Embed(
+            title="⏰ Time's Up!",
+            description=(
+                f"Nobody guessed it in time.\n"
+                f"The effect was **{effect['name']}**.\n"
+                f"[📖 Read about it on the wiki]({effect['wiki']})"
+            ),
+            color=0xe74c3c,
+        )
+        await ctx.send(embed=timeout_embed)
 
 
 # ---------- Error handling & run ----------
