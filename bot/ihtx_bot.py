@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import aiohttp
 import sys
+import platform
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
