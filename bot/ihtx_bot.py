@@ -3202,7 +3202,9 @@ def _apply_pipe_effects(
                     ], timeout=300)
                     if not ok:
                         return False, f"leftsplit: hstack failed: {err}"
-                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream
+                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream.
+                # Do NOT use -shortest: it causes compounding duration truncation across iterations,
+                # eventually producing a 0-duration/unreadable file. Let the video drive duration.
                 with tempfile.TemporaryDirectory() as mux_tmp:
                     muted_out = os.path.join(mux_tmp, "muted.mp4")
                     os.replace(out, muted_out)
@@ -3212,7 +3214,6 @@ def _apply_pipe_effects(
                         "-i", current,
                         "-map", "0:v", "-map", "1:a?",
                         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                        "-shortest",
                         out,
                     ], timeout=120)
                     if not ok:
@@ -3290,7 +3291,9 @@ def _apply_pipe_effects(
                     ], timeout=300)
                     if not ok:
                         return False, f"rightsplit: hstack failed: {err}"
-                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream
+                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream.
+                # Do NOT use -shortest: it causes compounding duration truncation across iterations,
+                # eventually producing a 0-duration/unreadable file. Let the video drive duration.
                 with tempfile.TemporaryDirectory() as mux_tmp:
                     muted_out = os.path.join(mux_tmp, "muted.mp4")
                     os.replace(out, muted_out)
@@ -3300,7 +3303,6 @@ def _apply_pipe_effects(
                         "-i", current,
                         "-map", "0:v", "-map", "1:a?",
                         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                        "-shortest",
                         out,
                     ], timeout=120)
                     if not ok:
