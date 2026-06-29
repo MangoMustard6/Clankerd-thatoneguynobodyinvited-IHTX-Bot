@@ -46,3 +46,16 @@ python-dotenv
 replicate
 uvloop
 yt-dlp
+aiohttp
+anthropic
+discord.py
+fal-client
+flask
+google-genai
+groq
+openai
+Pillow
+python-dotenv
+replicate
+uvloop
+yt-dlp
