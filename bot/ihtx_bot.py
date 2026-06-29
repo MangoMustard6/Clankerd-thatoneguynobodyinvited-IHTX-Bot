@@ -137,7 +137,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "realgmajor4", "realgm4", "rgm4", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -1778,7 +1778,7 @@ PIPE_EFFECT_NAMES = {
     "hflip", "vflip", "invert", "negate", "grayscale", "sepia", "rotate",
     "ccshue", "brightness", "contrast", "saturation", "swapuv", "mirror",
     "zoom", "pinch&punch", "p&p", "pinchpunch", "gm91deform",
-    "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse", "vreverse",
+    "invertrgb", "invlum", "volume", "vibrato", "areverse", "vreverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio", "speed", "ffmpeg", "frei0r",
     "wave",
@@ -1787,7 +1787,6 @@ PIPE_EFFECT_NAMES = {
     "sierpinskiransomware",
     "preview1280", "scale1280",
     "oppositep1280", "op1280",
-    "realgmajor4", "realgm4", "rgm4",
     "earthquake", "nbfx",
     "ssmp", "soundstretchmultipitch",
     "folkvalley", "fv",
@@ -1796,6 +1795,7 @@ PIPE_EFFECT_NAMES = {
     "freakzinga", "fzgm156", "freakzingagm156", "fgm156",
     "multipitch2", "mp2",
     "jitter",
+    "randomjitter",
     "trim",
 }
 
@@ -2070,8 +2070,6 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f"geq='{deform_geq}',"
             f"scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale=iw:ih,setsar=1,format=yuv420p"
         )
-    if name == "realgm4":
-        return "curves=r='0/0 0.5/0.75 1/0':g='0/0 0.5/0.75 1/0':b='0/0 0.5/0.75 1/0',format=yuv420p"
     if name == "invertrgb":
         r_inv = params[0] if len(params) > 0 else "1"
         g_inv = params[1] if len(params) > 1 else "0"
@@ -2505,15 +2503,6 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # realgmajor4 / realgm4 / rgm4 — Real G-Major 4 (RGB invert + pitch overlay) as a pipe step
-            if name in ("realgmajor4", "realgm4", "rgm4"):
-                ok, err = _run_realmajor4(
-                    current, out,
-                )
-                if not ok:
-                    return False, f"realgmajor4 pipe failed: {err}"
-                current = out
-                continue
 
             # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
@@ -2916,6 +2905,49 @@ def _apply_pipe_effects(
                 ], timeout=300)
                 if not ok:
                     return False, f"jitter: ffmpeg failed: {err}"
+                current = out
+                continue
+
+            # randomjitter — sinusoidal per-frame pixel displacement via geq
+            # (exact formula from the TypeScript effects.ts reference).
+            # Param: <strength> (default 10). Uses rotate→geq→crop with
+            # dynamic pixel matrix expressions:
+            #   indexX = i+67, indexY = i+670, divisor = 2.6666666666666665
+            #   exprX = ((strength/(25/3))/divisor)*(2*mod(1000*sin(N*indexX),1)-1)
+            #   exprY = (strength/divisor)*(2*mod(1000*sin(N+1000)*indexY,1)-1)
+            if name == "randomjitter":
+                try:
+                    strength = float(params[0]) if params else 10.0
+                except (ValueError, TypeError):
+                    strength = 10.0
+
+                info = _ffprobe_video_info(current)
+                w, h = info["width"], info["height"]
+                if w == 0 or h == 0:
+                    return False, "randomjitter: could not read video dimensions"
+
+                idx_i = 1
+                index_x = idx_i + 67
+                index_y = idx_i + 670
+                divisor = 2.6666666666666665
+
+                expr_x = f"(({strength}/(25/3))/{divisor})*(2*mod(1000*sin(N*{index_x}),1)-1)"
+                expr_y = f"({strength}/{divisor})*(2*mod(1000*sin(N+1000)*{index_y},1)-1)"
+
+                vf = (
+                    f"rotate=0:iw*1.1:ih*1.1,format=yuv444p,"
+                    f"geq='p(X+{expr_x},Y+{expr_y})',"
+                    f"crop={w}:{h},format=yuv420p"
+                )
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-vf", vf,
+                    "-c:a", "copy",
+                    out,
+                ], timeout=300)
+                if not ok:
+                    return False, f"randomjitter: ffmpeg failed: {err}"
                 current = out
                 continue
 
@@ -4219,66 +4251,7 @@ def _run_oppositep1280(
 
 
 
-def _run_realmajor4(
-    input_path: str,
-    output_path: str,
-) -> tuple[bool, str]:
-    """Run the Real G-Major 4 effect pipeline.
 
-    Implements the mediascript:
-      1. Invert all RGB channels (curves r/g/b = 0/1 1/0)
-      2. Copy the inverted video and pitch-shift it up by 5 semitones
-      3. Overlay the pitch-shifted copy on top of the inverted original
-      4. Double the audio volume
-
-    The result is an RGB-inverted video with a ghosted/brightened overlay
-    of the same inverted content, accompanied by a mix of the original
-    (inverted) audio and a +5 semitone pitch-shifted version, with overall
-    volume doubled.
-    """
-    # Pitch ratio for +5 semitones: 2^(5/12)
-    pitch_ratio = 2 ** (5 / 12)
-
-    info = _ffprobe_video_info(input_path)
-    w, h = info["width"], info["height"]
-
-    if w == 0 or h == 0:
-        return False, "Could not read input video dimensions."
-
-    # Complex filter graph:
-    # [0] = original input
-    # Split into two branches:
-    #   Branch A: RGB invert → [base] (video) + [aud0] (audio)
-    #   Branch B: RGB invert + rubberband pitch +5st → [over] (video) + [aud1] (audio)
-    # Overlay [over] on [base] → [vout]
-    # Mix [aud0] + [aud1] with volume 2 → [aout]
-    fc = (
-        f"[0:v]split=2[va][vb];"
-        # Branch A: RGB invert (curves)
-        f"[va]curves=r='0/1 1/0':g='0/1 1/0':b='0/1 1/0',format=yuv420p[base];"
-        # Branch B: RGB invert + pitch shift (rubberband on audio later)
-        f"[vb]curves=r='0/1 1/0':g='0/1 1/0':b='0/1 1/0',format=yuv420p[over];"
-        # Overlay: pitch-shifted inverted copy on top of inverted base
-        f"[base][over]overlay=0:0:format=auto[vout];"
-        # Audio: split, pitch-shift one branch, mix both, double volume
-        f"[0:a]asplit=2[aud0][aud1];"
-        f"[aud1]rubberband=pitch={pitch_ratio:.6f}:window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency[pitched];"
-        f"[aud0][pitched]amix=inputs=2:duration=first:dropout_transition=0,volume=2[aout]"
-    )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-filter_complex", fc,
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    return _run_ffmpeg_raw(cmd, timeout=180)
 
 
 # ---------- Bot events & commands ----------
@@ -4754,100 +4727,7 @@ async def oppositep1280_command(ctx: commands.Context, start: float = 1.85, dura
 
 
 
-@bot.command(name="realgmajor4", aliases=["realgm4", "rgm4"])
-async def realgmajor4_command(ctx: commands.Context):
-    """Real G-Major 4 effect: RGB invert + pitch-shifted overlay + doubled volume.
 
-    Implements the mediascript:
-      1. Invert all RGB channels
-      2. Pitch-shift a copy up by 5 semitones
-      3. Overlay the pitch-shifted inverted copy on the inverted original
-      4. Double the audio volume
-
-    Usage: t!realgmajor4
-    Aliases: t!realgm4, t!rgm4
-    """
-    # Resolve attachment
-    attachment = None
-    if ctx.message and ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message and ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
-
-    if not attachment:
-        await ctx.reply(
-            "**IHTX Real G-Major 4**\n"
-            "Attach a video and use `t!realgmajor4`.\n\n"
-            "Applies RGB inversion, overlays a pitch-shifted (+5 semitones) copy,\n"
-            "and doubles the audio volume.\n\n"
-            "Aliases: `t!realgm4`, `t!rgm4`"
-        )
-        return
-
-    if attachment.size > MAX_FILE_SIZE:
-        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
-        return
-
-    suffix = Path(attachment.filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        await ctx.reply(f"Unsupported file type `{suffix}`. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-        return
-
-    is_video = suffix in VIDEO_EXTENSIONS
-    if not is_video:
-        await ctx.reply("Real G-Major 4 requires a video file (audio pitch shifting is part of the effect).")
-        return
-
-    out_ext = get_output_ext(suffix, is_video)
-
-    status_msg = await ctx.reply(
-        f"⚙️ Creating **Real G-Major 4** effect... this may take a moment."
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, f"output{out_ext}")
-
-        try:
-            await download_attachment(attachment, input_path)
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
-            return
-
-        loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(
-            None, _run_realmajor4, input_path, output_path
-        )
-
-        if not ok:
-            await status_msg.edit(content=f"❌ Real G-Major 4 failed:\n```\n{err[-1500:]}\n```")
-            return
-
-        out_size = os.path.getsize(output_path)
-        if out_size > MAX_FILE_SIZE:
-            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
-            return
-
-        out_filename = f"rgm4_{Path(attachment.filename).stem}.mp4"
-        try:
-            embed_rgm4 = discord.Embed(
-                title="Real G-Major 4",
-                description="RGB inverted · +5 semitone pitch overlay · Volume doubled",
-                color=discord.Color.dark_magenta(),
-            )
-            embed_rgm4.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
-            await ctx.reply(
-                embed=embed_rgm4,
-                file=discord.File(output_path, filename=out_filename),
-            )
-            await status_msg.delete()
-        except discord.HTTPException as e:
-            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 @bot.command(name="preview1280with640x360resize", aliases=["p1280ff!3", "p1280w16:9r"])
 async def preview1280_640x360resize_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
@@ -7088,7 +6968,7 @@ _HELP_ENTRIES: list[dict] = [
         "value": (
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
-            "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
+            "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`\n"
             "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
@@ -7253,11 +7133,6 @@ _HELP_ENTRIES: list[dict] = [
         "cat": "heavy",
         "name": "t!oppositep1280 [start] [dur]  (aliases: op1280, opposite, opposite1280)",
         "value": "Inverse TV-simulator montage: all hue shifts negated, all pitch shifts inverted vs preview1280. Defaults: start=1.85, dur=0.85",
-    },
-    {
-        "cat": "heavy",
-        "name": "t!realgmajor4  (aliases: realgm4, rgm4)",
-        "value": "Real G-Major 4: RGB inversion + pitch-shifted (+5 semitones) overlay + doubled volume",
     },
     {
         "cat": "heavy",
@@ -7587,7 +7462,7 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-27",
         "heavy": [
             "**`t!oppositep1280` / `t!op1280`** — New command: inverse TV-simulator montage. All hue shifts are negated and all pitch shifts are inverted compared to preview1280, producing the visual/audio 'opposite' effect. Supports the same 12-segment pipeline with configurable start offset and segment duration. Also available as a pipe effect (`oppositep1280` / `op1280`) in custom IHTX chains.",
-            "**`t!realgmajor4` / `t!realgm4` / `t!rgm4`** — New command: Real G-Major 4 effect. Inverts all RGB channels, overlays a pitch-shifted (+5 semitones) copy of the inverted video, and doubles the audio volume. Also available as a pipe effect (`realgmajor4` / `realgm4` / `rgm4`) in custom IHTX chains.",
+            "**`t!realgmajor4` / `t!realgm4` / `t!rgm4`** — Migrated to TypeScript bot. RGB inversion + pitch-shifted (+5 semitones) overlay + doubled volume. No longer a Python command or pipe effect — use the standalone TypeScript command instead.",
             "**`t!op1280` / `t!oppositep1280`** — Updated: Added fps=29.97 standardization step (modfps.avi intermediate), segment 3 mirror now uses crop-then-mirror (no pre-hflip), and segment 3 contrast corrected to -0.375.",
         ],
         "fun": [],
@@ -7665,6 +7540,7 @@ _UPDATELOG: list[dict] = [
             "**`>` pipe segment delimiter** — `>` now works alongside `,` as a top-level pipe separator (e.g. `mp2=-4.5|5>negate`), allowing `|` in pitch lists without ambiguity.",
             "**`::` explicit param separator** — `name=val1::val2` keeps each `::` chunk as one verbatim param, fixing mp2 multi-pitch inputs: `mp2=-5|5::G-Major_17` → pitches=`-5|5`, surround=`G-Major_17`.",
             "**jitter pipe effect** — Sinusoidal per-frame pixel displacement camera shake. Param: `<strength>` (default 15). Uses pad→crop with sin(n·seed) offsets. Example: `jitter=20`.",
+            "**randomjitter pipe effect** — Dynamic per-frame pixel displacement via geq matrix. Param: `<strength>` (default 10). Uses rotate→geq→crop with sinusoidal pixel-offset expressions. Example: `randomjitter=20`.",
             "**Processing embed: elapsed timer + weather fun facts** — Status embed now ticks every 4s showing seconds elapsed, and includes a random weather fact while processing runs.",
         ],
         "fun": [],
@@ -9181,7 +9057,6 @@ Heavy (media processing):
 - t!trim <start> <end> — trim audio/video/GIF
 - t!preview1280 [start] [dur] — 12-segment TV-simulator montage
 - t!oppositep1280 [start] [dur] — inverse TV-simulator montage (negated hues, inverted pitches)
-- t!realgmajor4 — RGB invert + pitch-shifted overlay + doubled volume (aliases: realgm4, rgm4)
 - t!invlum [n] — luma-inversion loop
 - t!lexg — re-apply last export effect chain to new media
 
