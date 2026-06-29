@@ -43,7 +43,7 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
             '**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` `huehsv=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`',
             '**Color:** `ccshue=hue|sat|gamma|gain|offset`  `brightness=<v>` `contrast=<v>` `saturation=<v>`',
             '**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`',
-            '**Scroll:** `scroll=hpos=V` · `scroll=h;v` · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n**Split:** `leftsplit=<inner>` · `rightsplit=<inner>` — apply inner effects to one half\n**Reverse:** `vreverse` (frames) · `areverse` (audio)',
+            '**Scroll:** `scroll=hpos=V` · `scroll=h;v` · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n**Split:** `leftsplit(<inner>)` · `rightsplit(<inner>)` — apply inner effects to one half\n**Reverse:** `vreverse` (frames) · `areverse` (audio)',
             '**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`',
             '**Plugins:** `frei0r=plugin:params` `lut=<url>` `speed=<factor>` `ffmpeg(<args>)`',
           ].join('\n'),
@@ -70,8 +70,7 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
         {
           name: '⬇️ Download',
           value: [
-            '`t!dl <url>` *dv download dlv* — Download video/image from URL → Discord',
-            '`t!download <url>` — Same via yt-dlp (TypeScript bot)',
+            '`t!ytdl <url or search>` *youtubedownload* — Download video from URL or search query → Discord or catbox',
             '`t!ffmpegprocess <args>` *fmp* — FFmpeg on attachment with ffprobe metadata inspection (TypeScript bot)',
             '`t!catbox` *cb upload* — Upload attachment to catbox.moe (200 MB, permanent link)',
           ].join('\n'),
