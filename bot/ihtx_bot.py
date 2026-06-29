@@ -137,7 +137,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -1890,6 +1890,16 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
             effects.append(("ffmpeg", [ffmpeg_m.group(1).strip()]))
             continue
 
+        # leftsplit(...) / rightsplit(...) — inner effects in parens
+        split_m = re.match(r'^(leftsplit|rightsplit)\s*\((.+)\)\s*$', part, re.IGNORECASE | re.DOTALL)
+        if split_m:
+            if current_name is not None:
+                effects.append((current_name, current_params))
+                current_name = None
+                current_params = []
+            effects.append((split_m.group(1).lower(), [split_m.group(2).strip()]))
+            continue
+
         if "=" in part:
             if current_name is not None:
                 effects.append((current_name, current_params))
@@ -3127,7 +3137,7 @@ def _apply_pipe_effects(
             # Process: split → crop left half → apply inner effects to left half →
             #          crop right half → hstack (with hflip for mirror effect)
             if name == "leftsplit":
-                inner_str = ";".join(params) if params else ""
+                inner_str = params[0] if params else ""
                 if not inner_str:
                     # No inner effects — just pass through
                     if current != out:
@@ -3192,22 +3202,21 @@ def _apply_pipe_effects(
                     ], timeout=300)
                     if not ok:
                         return False, f"leftsplit: hstack failed: {err}"
-                # Copy audio from original
-                has_audio = bool(info.get("audio_codec"))
-                if has_audio:
-                    with tempfile.TemporaryDirectory() as mux_tmp:
-                        muted_out = os.path.join(mux_tmp, "muted.mp4")
-                        os.replace(out, muted_out)
-                        ok, err = _run_ffmpeg_raw([
-                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                            "-i", muted_out,
-                            "-i", current,
-                            "-map", "0:v", "-map", "1:a",
-                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                            out,
-                        ], timeout=120)
-                        if not ok:
-                            return False, f"leftsplit: audio mux failed: {err}"
+                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream
+                with tempfile.TemporaryDirectory() as mux_tmp:
+                    muted_out = os.path.join(mux_tmp, "muted.mp4")
+                    os.replace(out, muted_out)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", muted_out,
+                        "-i", current,
+                        "-map", "0:v", "-map", "1:a?",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                        "-shortest",
+                        out,
+                    ], timeout=120)
+                    if not ok:
+                        return False, f"leftsplit: audio mux failed: {err}"
                 current = out
                 continue
 
@@ -3217,7 +3226,7 @@ def _apply_pipe_effects(
             # Process: split → crop right half → apply inner effects to right half →
             #          crop left half → hstack left+right(affected)
             if name == "rightsplit":
-                inner_str = ";".join(params) if params else ""
+                inner_str = params[0] if params else ""
                 if not inner_str:
                     if current != out:
                         import shutil as _shutil
@@ -3281,22 +3290,21 @@ def _apply_pipe_effects(
                     ], timeout=300)
                     if not ok:
                         return False, f"rightsplit: hstack failed: {err}"
-                # Copy audio from original
-                has_audio = bool(info.get("audio_codec"))
-                if has_audio:
-                    with tempfile.TemporaryDirectory() as mux_tmp:
-                        muted_out = os.path.join(mux_tmp, "muted.mp4")
-                        os.replace(out, muted_out)
-                        ok, err = _run_ffmpeg_raw([
-                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                            "-i", muted_out,
-                            "-i", current,
-                            "-map", "0:v", "-map", "1:a",
-                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                            out,
-                        ], timeout=120)
-                        if not ok:
-                            return False, f"rightsplit: audio mux failed: {err}"
+                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream
+                with tempfile.TemporaryDirectory() as mux_tmp:
+                    muted_out = os.path.join(mux_tmp, "muted.mp4")
+                    os.replace(out, muted_out)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", muted_out,
+                        "-i", current,
+                        "-map", "0:v", "-map", "1:a?",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                        "-shortest",
+                        out,
+                    ], timeout=120)
+                    if not ok:
+                        return False, f"rightsplit: audio mux failed: {err}"
                 current = out
                 continue
 
@@ -7320,7 +7328,7 @@ _HELP_ENTRIES: list[dict] = [
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`\n"
             "**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Scroll:** `scroll=hpos=V` · `scroll=hpos=V;ypos=V` · `scroll=h;v` (continuous) · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n"
-            "**Split:** `leftsplit=<inner_effects>` · `rightsplit=<inner_effects>` — apply inner effects to one half, mirror/combine\n"
+            "**Split:** `leftsplit(<inner_effects>)` · `rightsplit(<inner_effects>)` — apply inner effects to one half, mirror/combine\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
@@ -7440,10 +7448,10 @@ _HELP_ENTRIES: list[dict] = [
         "name": "leftsplit / rightsplit pipe effects",
         "value": (
             "Split the video in half, apply inner effects to one half, then recombine.\\n"
-            "\u2022 **leftsplit=<effects>** \u2014 apply inner effects to left half, then hflip+hstack with right half\\n"
-            "\u2022 **rightsplit=<effects>** \u2014 apply inner effects to right half, then hstack with left half\\n"
-            "Example: `t!ihtx 3 1.0 - mp4 leftsplit=grayscale`\\n"
-            "Example (chained): `t!ihtx 3 1.0 - mp4 rightsplit=huehsv=0.5;brightness=0.2`"
+            "\u2022 **leftsplit(<effects>)** \u2014 apply inner effects to left half, then hflip+hstack with right half\\n"
+            "\u2022 **rightsplit(<effects>)** \u2014 apply inner effects to right half, then hstack with left half\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 leftsplit(grayscale)`\\n"
+            "Example (chained): `t!ihtx 3 1.0 - mp4 rightsplit(huehsv=0.5,brightness=0.2)`"
         ),
     },
     {
@@ -7591,11 +7599,6 @@ _HELP_ENTRIES: list[dict] = [
         "cat": "fun",
         "name": "t!trim <start> <end>",
         "value": "Trim audio, video, or GIF. Supports HH:MM:SS.frac and plain seconds.",
-    },
-    {
-        "cat": "fun",
-        "name": "t!dl <url>  (aliases: dv, download, dlv)",
-        "value": "Download a video or image from a URL and upload it to Discord.",
     },
     {
         "cat": "fun",
@@ -7867,6 +7870,18 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.5",
+        "date": "2026-06-29",
+        "heavy": [
+            "**t!ihtx** — `leftsplit` and `rightsplit` now use paren syntax: `leftsplit(filters)` / `rightsplit(filters)` — inner effects are comma-separated just like the outer pipe",
+            "**t!ihtx** — fixed `leftsplit`/`rightsplit` producing silent output (audio was never muxed back due to missing `audio_codec` field in ffprobe result)",
+        ],
+        "fun": [
+            "**t!dl / t!dlv** — removed; replaced by **t!ytdl** (TypeScript bot) — supports URLs and search queries, auto-uploads to catbox if file exceeds Discord limit",
+        ],
+        "owner": [],
+    },
     {
         "version": "v6.4",
         "date": "2026-06-28",
@@ -8535,102 +8550,6 @@ async def lexg_command(ctx: commands.Context, duration: float = 5.0):
             await status_msg.delete()
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload: {e}")
-
-
-# ---------- Download video ----------
-
-@bot.command(name="dl", aliases=["dv", "download", "dlv"])
-async def dl_command(ctx: commands.Context, url: str = ""):
-    """Download a video or image from a URL.
-
-    Works with:
-    - Direct video/image links
-    - YouTube, TikTok, etc (via yt-dlp if available)
-    - Images too
-    """
-    # If no URL provided, try to get one from message content
-    if not url:
-        if ctx.message:
-            # Try to find a URL in the message content
-            parts = ctx.message.content.split()
-            for p in parts[1:]:  # Skip command name
-                if p.startswith("http://") or p.startswith("https://"):
-                    url = p
-                    break
-
-    if not url:
-        await ctx.reply(
-            "**t!dl** — Download a video or image from a URL.\n\n"
-            "Usage:\n"
-            "`t!dl <url>`\n"
-            "`t!dlv https://youtube.com/watch?v=...`\n"
-            "`t!dl https://example.com/image.png`\n\n"
-            "Aliases: `t!dv`, `t!dlv`, `t!download`"
-        )
-        return
-
-    status_msg = await ctx.reply(f"\u2699\ufe0f Downloading from URL...")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Try yt-dlp first if it's a video URL
-        if yt_dlp and re.search(r"(youtube|youtu\.be|tiktok|x\.com|twitter|instagram|reddit|vimeo|twitch|fb\.watch|facebook|bilibili)", url, re.I):
-            try:
-                output_path = os.path.join(tmpdir, "downloaded")
-                ydl_opts = {
-                    "format": "best[filesize<25M]/bestvideo[height<=720][filesize<25M]+bestaudio/best[filesize<25M]/best",
-                    "outtmpl": output_path + ".%(ext)s",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "max_filesize": MAX_FILE_SIZE,
-                    "cookiefile": None,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    downloaded = ydl.prepare_filename(info)
-                    if os.path.exists(downloaded):
-                        out_size = os.path.getsize(downloaded)
-                        if out_size > MAX_FILE_SIZE:
-                            await status_msg.edit(content="\u274c Downloaded file too large (>25 MB).")
-                            return
-                        filename = os.path.basename(downloaded)
-                        await ctx.reply(
-                            content=f"\u2705 Downloaded via yt-dlp: `{info.get('title', 'Untitled')}`",
-                            file=discord.File(downloaded, filename=filename),
-                        )
-                        await status_msg.delete()
-                        return
-            except Exception as e:
-                # Fall back to direct download
-                pass
-
-        # Direct download
-        try:
-            import urllib.request
-            import ssl
-            ssl_ctx = ssl.create_default_context()
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            )
-            # Try to guess extension from URL
-            parsed = urllib.parse.urlparse(url)
-            ext = Path(parsed.path).suffix or ".mp4"
-            output_path = os.path.join(tmpdir, f"downloaded{ext}")
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as resp:
-                with open(output_path, "wb") as f:
-                    f.write(resp.read())
-            out_size = os.path.getsize(output_path)
-            if out_size > MAX_FILE_SIZE:
-                await status_msg.edit(content="\u274c Downloaded file too large (>25 MB).")
-                return
-            filename = os.path.basename(output_path)
-            await ctx.reply(
-                content=f"\u2705 Downloaded from URL!",
-                file=discord.File(output_path, filename=filename),
-            )
-            await status_msg.delete()
-        except Exception as e:
-            await status_msg.edit(content=f"\u274c Failed to download: {e}")
 
 
 # ---------- Owner-only moderation / utility commands ----------
@@ -9491,7 +9410,7 @@ Heavy (media processing):
 - t!lexg — re-apply last export effect chain to new media
 
 Downloads & Upload:
-- t!dl <url> — download video/image from URL
+- t!ytdl <url or search> — download video from YouTube/URL or search query (TypeScript bot)
 - t!catbox — upload file to catbox.moe (up to 200 MB)
 
 AI & Chat:
