@@ -137,7 +137,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "realgmajor4", "realgm4", "rgm4", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -1778,7 +1778,7 @@ PIPE_EFFECT_NAMES = {
     "hflip", "vflip", "invert", "negate", "grayscale", "sepia", "rotate",
     "ccshue", "brightness", "contrast", "saturation", "swapuv", "mirror",
     "zoom", "pinch&punch", "p&p", "pinchpunch", "gm91deform",
-    "realgm4", "invertrgb", "invlum", "volume", "vibrato", "areverse", "vreverse",
+    "invertrgb", "invlum", "volume", "vibrato", "areverse", "vreverse",
     "channelblend", "huehsv", "multipitch", "mp", "multi", "lut",
     "syncaudio", "speed", "ffmpeg", "frei0r",
     "wave",
@@ -1787,7 +1787,6 @@ PIPE_EFFECT_NAMES = {
     "sierpinskiransomware",
     "preview1280", "scale1280",
     "oppositep1280", "op1280",
-    "realgmajor4", "realgm4", "rgm4",
     "earthquake", "nbfx",
     "ssmp", "soundstretchmultipitch",
     "folkvalley", "fv",
@@ -1796,7 +1795,14 @@ PIPE_EFFECT_NAMES = {
     "freakzinga", "fzgm156", "freakzingagm156", "fgm156",
     "multipitch2", "mp2",
     "jitter",
+    "randomjitter",
     "trim",
+    "leftsplit",
+    "rightsplit",
+    "ripple",
+    "scroll",
+    "pan",
+    "tile",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -2030,21 +2036,80 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             height = "-2"
         return f"scale={width}:{height}"
     if name == "zoom":
-        # params: amount|cx|cy  (cx/cy = zoom centre as 0.0–1.0 fraction, default 0.5)
-        amount = params[0] if params else "1.1"
+        # Updated: scale+crop zoom effect (matches TypeScript spec).
+        # params: amount (default 2). Scales up by amount, then crops center back
+        # to original dimensions, producing a zoom-in effect.
         try:
-            cx = float(params[1]) if len(params) > 1 else 0.5
+            s = float(params[0]) if params else 2.0
         except (ValueError, TypeError):
-            cx = 0.5
-        try:
-            cy = float(params[2]) if len(params) > 2 else 0.5
-        except (ValueError, TypeError):
-            cy = 0.5
-        zoom_geq = f"p(W*{cx}+(X-W*{cx})/{amount},H*{cy}+(Y-H*{cy})/{amount})"
+            s = 2.0
+        s = max(0.1, s)
         return (
-            f"format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
-            f"geq='{zoom_geq}',"
-            f"scale=iw:ih,crop=iw:ih,format=yuv420p"
+            f"scale=iw*{s}:ih*{s},"
+            f"crop=iw/{s}:ih/{s}:(iw-iw/{s})/2:(ih-ih/{s})/2"
+        )
+    if name == "ripple":
+        # Radial displacement using geq with hypot/sin/cos formulas.
+        # params: speed|frequency|amplitude|phase  (all optional)
+        try:
+            speed = float(params[0]) if len(params) > 0 else 1.0
+        except (ValueError, TypeError):
+            speed = 1.0
+        try:
+            frequency = float(params[1]) if len(params) > 1 else 30.0
+        except (ValueError, TypeError):
+            frequency = 30.0
+        try:
+            amplitude = float(params[2]) if len(params) > 2 else 10.0
+        except (ValueError, TypeError):
+            amplitude = 10.0
+        try:
+            phase = float(params[3]) if len(params) > 3 else 0.0
+        except (ValueError, TypeError):
+            phase = 0.0
+        r_expr = "hypot(X-W*0.5,Y-H*0.5)"
+        disp = f"({r_expr}+{amplitude}*sin(2*PI*{speed}*T-({phase})+(-({r_expr})/{frequency})))"
+        angle = "atan2(Y-H*0.5,X-W*0.5)"
+        return (
+            f"format=yuv444p,"
+            f"geq='p(W*0.5+{disp}*cos({angle}),H*0.5+{disp}*sin({angle}))',"
+            f"scale=iw:ih,format=yuv420p"
+        )
+    if name == "pan":
+        # Simple pixel offset via geq with clip for boundary safety.
+        # params: px|py  (pixel offset amounts, default 0)
+        try:
+            px = float(params[0]) if len(params) > 0 else 0.0
+        except (ValueError, TypeError):
+            px = 0.0
+        try:
+            py = float(params[1]) if len(params) > 1 else 0.0
+        except (ValueError, TypeError):
+            py = 0.0
+        return (
+            f"format=yuv444p,"
+            f"geq='p(clip(X+{px},0,W-1),clip(Y+{py},0,H-1))"
+            f":cb(clip(X+{px},0,W-1),clip(Y+{py},0,H-1))"
+            f":cr(clip(X+{px},0,W-1),clip(Y+{py},0,H-1))',"
+            f"scale=iw:ih,format=yuv420p"
+        )
+    if name == "tile":
+        # Repetitive tiling via geq mod expressions.
+        # params: tx|ty  (tile repeat counts, default 2x2)
+        try:
+            tx = float(params[0]) if len(params) > 0 else 2.0
+        except (ValueError, TypeError):
+            tx = 2.0
+        try:
+            ty = float(params[1]) if len(params) > 1 else 2.0
+        except (ValueError, TypeError):
+            ty = 2.0
+        return (
+            f"format=yuv444p,"
+            f"geq='p(mod(X*{tx},W),mod(Y*{ty},H))"
+            f":cb(mod(X*{tx},W),mod(Y*{ty},H))"
+            f":cr(mod(X*{tx},W),mod(Y*{ty},H))',"
+            f"scale=iw:ih,format=yuv420p"
         )
     if name in ("pinch&punch", "p&p", "pinchpunch"):
         strength = params[0] if len(params) > 0 else "1"
@@ -2070,8 +2135,6 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f"geq='{deform_geq}',"
             f"scale=640*1.05:360*1.05,crop=640:360:(in_w-in_h)/2+8,scale=iw:ih,setsar=1,format=yuv420p"
         )
-    if name == "realgm4":
-        return "curves=r='0/0 0.5/0.75 1/0':g='0/0 0.5/0.75 1/0':b='0/0 0.5/0.75 1/0',format=yuv420p"
     if name == "invertrgb":
         r_inv = params[0] if len(params) > 0 else "1"
         g_inv = params[1] if len(params) > 1 else "0"
@@ -2505,15 +2568,6 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
-            # realgmajor4 / realgm4 / rgm4 — Real G-Major 4 (RGB invert + pitch overlay) as a pipe step
-            if name in ("realgmajor4", "realgm4", "rgm4"):
-                ok, err = _run_realmajor4(
-                    current, out,
-                )
-                if not ok:
-                    return False, f"realgmajor4 pipe failed: {err}"
-                current = out
-                continue
 
             # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
@@ -2916,6 +2970,333 @@ def _apply_pipe_effects(
                 ], timeout=300)
                 if not ok:
                     return False, f"jitter: ffmpeg failed: {err}"
+                current = out
+                continue
+
+            # randomjitter — sinusoidal per-frame pixel displacement via geq
+            # (exact formula from the TypeScript effects.ts reference).
+            # Param: <strength> (default 10). Uses rotate→geq→crop with
+            # dynamic pixel matrix expressions:
+            #   indexX = i+67, indexY = i+670, divisor = 2.6666666666666665
+            #   exprX = ((strength/(25/3))/divisor)*(2*mod(1000*sin(N*indexX),1)-1)
+            #   exprY = (strength/divisor)*(2*mod(1000*sin(N+1000)*indexY,1)-1)
+            if name == "randomjitter":
+                try:
+                    strength = float(params[0]) if params else 10.0
+                except (ValueError, TypeError):
+                    strength = 10.0
+
+                info = _ffprobe_video_info(current)
+                w, h = info["width"], info["height"]
+                if w == 0 or h == 0:
+                    return False, "randomjitter: could not read video dimensions"
+
+                idx_i = 1
+                index_x = idx_i + 67
+                index_y = idx_i + 670
+                divisor = 2.6666666666666665
+
+                expr_x = f"(({strength}/(25/3))/{divisor})*(2*mod(1000*sin(N*{index_x}),1)-1)"
+                expr_y = f"({strength}/{divisor})*(2*mod(1000*sin(N+1000)*{index_y},1)-1)"
+
+                vf = (
+                    f"rotate=0:iw*1.1:ih*1.1,format=yuv444p,"
+                    f"geq='p(X+{expr_x},Y+{expr_y})',"
+                    f"crop={w}:{h},format=yuv420p"
+                )
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-vf", vf,
+                    "-c:a", "copy",
+                    out,
+                ], timeout=300)
+                if not ok:
+                    return False, f"randomjitter: ffmpeg failed: {err}"
+                current = out
+                continue
+
+            # scroll — multi-mode scroll/pan effect
+            # Mode 1: scroll=hpos=0.5 or scroll=hpos=0.5;ypos=0.3
+            #   → uses FFmpeg's native scroll filter with named params
+            # Mode 2: scroll=h;v (0.0–1.0 per axis continuous scroll)
+            #   → uses FFmpeg's native scroll filter
+            # Mode 3: scroll=x1:y1:x2:y2[:dur] (4+ numeric params → animated pan via geq)
+            #   → animated pan using geq with time-dependent expressions
+            if name == "scroll":
+                # Check if params contain named hpos/vpos params
+                has_named = any(p.startswith("hpos") or p.startswith("vpos") or p.startswith("ypos") for p in params)
+                all_numeric = True
+                for p in params:
+                    try:
+                        float(p.split("=")[-1] if "=" in p else p)
+                    except (ValueError, TypeError):
+                        all_numeric = False
+                        break
+
+                if has_named:
+                    # Mode 1: Named params (hpos=, ypos=) → native scroll filter
+                    scroll_parts = []
+                    for p in params:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            k = k.strip().lower()
+                            v = v.strip()
+                            if k == "hpos":
+                                scroll_parts.append(f"hpos={v}")
+                            elif k in ("vpos", "ypos"):
+                                scroll_parts.append(f"vpos={v}")
+                    vf_scroll = ",".join(scroll_parts) if scroll_parts else "hpos=0.5"
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"scroll={vf_scroll}",
+                        "-c:a", "copy",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"scroll: ffmpeg failed: {err}"
+                    current = out
+                    continue
+                elif len(params) >= 4 and all_numeric:
+                    # Mode 3: Animated pan via geq — x1:y1:x2:y2[:dur]
+                    def _sp(idx, default):
+                        try:
+                            return float(params[idx]) if idx < len(params) else default
+                        except (ValueError, TypeError):
+                            return default
+                    x1 = _sp(0, 0.0)
+                    y1 = _sp(1, 0.0)
+                    x2 = _sp(2, 0.0)
+                    y2 = _sp(3, 0.0)
+                    dur = _sp(4, 0.0)
+                    if dur > 0:
+                        t_expr = f"T/{dur}"
+                    else:
+                        t_expr = "T"
+                    pan_x = f"{x1}+({x2}-{x1})*{t_expr}"
+                    pan_y = f"{y1}+({y2}-{y1})*{t_expr}"
+                    vf = (
+                        f"format=yuv444p,"
+                        f"geq='p(clip(X+{pan_x},0,W-1),clip(Y+{pan_y},0,H-1))"
+                        f":cb(clip(X+{pan_x},0,W-1),clip(Y+{pan_y},0,H-1))"
+                        f":cr(clip(X+{pan_x},0,W-1),clip(Y+{pan_y},0,H-1))',"
+                        f"scale=iw:ih,format=yuv420p"
+                    )
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", vf,
+                        "-c:a", "copy",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"scroll: ffmpeg failed: {err}"
+                    current = out
+                    continue
+                else:
+                    # Mode 2: Continuous scroll — h;v (0.0–1.0 per axis)
+                    def _sp2(idx, default):
+                        try:
+                            return float(params[idx]) if idx < len(params) else default
+                        except (ValueError, TypeError):
+                            return default
+                    h_speed = _sp2(0, 0.0)
+                    v_speed = _sp2(1, 0.0)
+                    scroll_args = []
+                    if h_speed != 0.0:
+                        scroll_args.append(f"hpos={h_speed}")
+                    if v_speed != 0.0:
+                        scroll_args.append(f"vpos={v_speed}")
+                    vf_scroll = ",".join(scroll_args) if scroll_args else "hpos=0.5"
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"scroll={vf_scroll}",
+                        "-c:a", "copy",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"scroll: ffmpeg failed: {err}"
+                    current = out
+                    continue
+
+            # leftsplit — split video, apply inner effects to left half, hflip+hstack
+            # Syntax: leftsplit=<inner_effects>
+            #   e.g. leftsplit=grayscale  →  left half gets grayscale, right half is mirrored
+            # Process: split → crop left half → apply inner effects to left half →
+            #          crop right half → hstack (with hflip for mirror effect)
+            if name == "leftsplit":
+                inner_str = ";".join(params) if params else ""
+                if not inner_str:
+                    # No inner effects — just pass through
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                inner_effects = _parse_pipe_effects(inner_str)
+                if not inner_effects:
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                info = _ffprobe_video_info(current)
+                w, h = info["width"], info["height"]
+                if w == 0 or h == 0:
+                    return False, "leftsplit: could not read video dimensions"
+                half_w = w // 2
+                with tempfile.TemporaryDirectory() as split_tmp:
+                    left_raw = os.path.join(split_tmp, "left_raw.mp4")
+                    left_fx = os.path.join(split_tmp, "left_fx.mp4")
+                    right_raw = os.path.join(split_tmp, "right_raw.mp4")
+                    # Step 1: Extract left half
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:0:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        left_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"leftsplit: crop left failed: {err}"
+                    # Step 2: Apply inner effects to left half
+                    ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects)
+                    if not ok:
+                        return False, f"leftsplit: inner effects failed: {err}"
+                    # Step 3: Extract right half (no effects)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:{half_w}:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        right_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"leftsplit: crop right failed: {err}"
+                    # Step 4: hflip left half, then hstack left(hflipped)+right
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", left_fx,
+                        "-i", right_raw,
+                        "-filter_complex",
+                        f"[0:v]hflip[lflipped];[lflipped][1:v]hstack=inputs=2[vout]",
+                        "-map", "[vout]",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-an",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"leftsplit: hstack failed: {err}"
+                # Copy audio from original
+                has_audio = bool(info.get("audio_codec"))
+                if has_audio:
+                    with tempfile.TemporaryDirectory() as mux_tmp:
+                        muted_out = os.path.join(mux_tmp, "muted.mp4")
+                        os.replace(out, muted_out)
+                        ok, err = _run_ffmpeg_raw([
+                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                            "-i", muted_out,
+                            "-i", current,
+                            "-map", "0:v", "-map", "1:a",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            out,
+                        ], timeout=120)
+                        if not ok:
+                            return False, f"leftsplit: audio mux failed: {err}"
+                current = out
+                continue
+
+            # rightsplit — split video, apply inner effects to right half, hstack
+            # Syntax: rightsplit=<inner_effects>
+            #   e.g. rightsplit=grayscale  →  right half gets grayscale, left half stays
+            # Process: split → crop right half → apply inner effects to right half →
+            #          crop left half → hstack left+right(affected)
+            if name == "rightsplit":
+                inner_str = ";".join(params) if params else ""
+                if not inner_str:
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                inner_effects = _parse_pipe_effects(inner_str)
+                if not inner_effects:
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                info = _ffprobe_video_info(current)
+                w, h = info["width"], info["height"]
+                if w == 0 or h == 0:
+                    return False, "rightsplit: could not read video dimensions"
+                half_w = w // 2
+                with tempfile.TemporaryDirectory() as split_tmp:
+                    left_raw = os.path.join(split_tmp, "left_raw.mp4")
+                    right_raw = os.path.join(split_tmp, "right_raw.mp4")
+                    right_fx = os.path.join(split_tmp, "right_fx.mp4")
+                    # Step 1: Extract left half (no effects)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:0:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        left_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"rightsplit: crop left failed: {err}"
+                    # Step 2: Extract right half
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:{half_w}:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        right_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"rightsplit: crop right failed: {err}"
+                    # Step 3: Apply inner effects to right half
+                    ok, err = _apply_pipe_effects(right_raw, right_fx, inner_effects)
+                    if not ok:
+                        return False, f"rightsplit: inner effects failed: {err}"
+                    # Step 4: hstack left + right(affected)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", left_raw,
+                        "-i", right_fx,
+                        "-filter_complex",
+                        f"[0:v][1:v]hstack=inputs=2[vout]",
+                        "-map", "[vout]",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-an",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"rightsplit: hstack failed: {err}"
+                # Copy audio from original
+                has_audio = bool(info.get("audio_codec"))
+                if has_audio:
+                    with tempfile.TemporaryDirectory() as mux_tmp:
+                        muted_out = os.path.join(mux_tmp, "muted.mp4")
+                        os.replace(out, muted_out)
+                        ok, err = _run_ffmpeg_raw([
+                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                            "-i", muted_out,
+                            "-i", current,
+                            "-map", "0:v", "-map", "1:a",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            out,
+                        ], timeout=120)
+                        if not ok:
+                            return False, f"rightsplit: audio mux failed: {err}"
                 current = out
                 continue
 
@@ -4219,66 +4600,7 @@ def _run_oppositep1280(
 
 
 
-def _run_realmajor4(
-    input_path: str,
-    output_path: str,
-) -> tuple[bool, str]:
-    """Run the Real G-Major 4 effect pipeline.
 
-    Implements the mediascript:
-      1. Invert all RGB channels (curves r/g/b = 0/1 1/0)
-      2. Copy the inverted video and pitch-shift it up by 5 semitones
-      3. Overlay the pitch-shifted copy on top of the inverted original
-      4. Double the audio volume
-
-    The result is an RGB-inverted video with a ghosted/brightened overlay
-    of the same inverted content, accompanied by a mix of the original
-    (inverted) audio and a +5 semitone pitch-shifted version, with overall
-    volume doubled.
-    """
-    # Pitch ratio for +5 semitones: 2^(5/12)
-    pitch_ratio = 2 ** (5 / 12)
-
-    info = _ffprobe_video_info(input_path)
-    w, h = info["width"], info["height"]
-
-    if w == 0 or h == 0:
-        return False, "Could not read input video dimensions."
-
-    # Complex filter graph:
-    # [0] = original input
-    # Split into two branches:
-    #   Branch A: RGB invert → [base] (video) + [aud0] (audio)
-    #   Branch B: RGB invert + rubberband pitch +5st → [over] (video) + [aud1] (audio)
-    # Overlay [over] on [base] → [vout]
-    # Mix [aud0] + [aud1] with volume 2 → [aout]
-    fc = (
-        f"[0:v]split=2[va][vb];"
-        # Branch A: RGB invert (curves)
-        f"[va]curves=r='0/1 1/0':g='0/1 1/0':b='0/1 1/0',format=yuv420p[base];"
-        # Branch B: RGB invert + pitch shift (rubberband on audio later)
-        f"[vb]curves=r='0/1 1/0':g='0/1 1/0':b='0/1 1/0',format=yuv420p[over];"
-        # Overlay: pitch-shifted inverted copy on top of inverted base
-        f"[base][over]overlay=0:0:format=auto[vout];"
-        # Audio: split, pitch-shift one branch, mix both, double volume
-        f"[0:a]asplit=2[aud0][aud1];"
-        f"[aud1]rubberband=pitch={pitch_ratio:.6f}:window=short:transients=mixed:detector=soft:channels=together:pitchq=consistency[pitched];"
-        f"[aud0][pitched]amix=inputs=2:duration=first:dropout_transition=0,volume=2[aout]"
-    )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-filter_complex", fc,
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    return _run_ffmpeg_raw(cmd, timeout=180)
 
 
 # ---------- Bot events & commands ----------
@@ -4754,100 +5076,7 @@ async def oppositep1280_command(ctx: commands.Context, start: float = 1.85, dura
 
 
 
-@bot.command(name="realgmajor4", aliases=["realgm4", "rgm4"])
-async def realgmajor4_command(ctx: commands.Context):
-    """Real G-Major 4 effect: RGB invert + pitch-shifted overlay + doubled volume.
 
-    Implements the mediascript:
-      1. Invert all RGB channels
-      2. Pitch-shift a copy up by 5 semitones
-      3. Overlay the pitch-shifted inverted copy on the inverted original
-      4. Double the audio volume
-
-    Usage: t!realgmajor4
-    Aliases: t!realgm4, t!rgm4
-    """
-    # Resolve attachment
-    attachment = None
-    if ctx.message and ctx.message.attachments:
-        attachment = ctx.message.attachments[0]
-    elif ctx.message and ctx.message.reference:
-        try:
-            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if ref.attachments:
-                attachment = ref.attachments[0]
-        except Exception:
-            pass
-
-    if not attachment:
-        await ctx.reply(
-            "**IHTX Real G-Major 4**\n"
-            "Attach a video and use `t!realgmajor4`.\n\n"
-            "Applies RGB inversion, overlays a pitch-shifted (+5 semitones) copy,\n"
-            "and doubles the audio volume.\n\n"
-            "Aliases: `t!realgm4`, `t!rgm4`"
-        )
-        return
-
-    if attachment.size > MAX_FILE_SIZE:
-        await ctx.reply(f"File too large (max 25 MB). Your file is {attachment.size / 1024 / 1024:.1f} MB.")
-        return
-
-    suffix = Path(attachment.filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        await ctx.reply(f"Unsupported file type `{suffix}`. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-        return
-
-    is_video = suffix in VIDEO_EXTENSIONS
-    if not is_video:
-        await ctx.reply("Real G-Major 4 requires a video file (audio pitch shifting is part of the effect).")
-        return
-
-    out_ext = get_output_ext(suffix, is_video)
-
-    status_msg = await ctx.reply(
-        f"⚙️ Creating **Real G-Major 4** effect... this may take a moment."
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"input{suffix}")
-        output_path = os.path.join(tmpdir, f"output{out_ext}")
-
-        try:
-            await download_attachment(attachment, input_path)
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Failed to download your file: {e}")
-            return
-
-        loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(
-            None, _run_realmajor4, input_path, output_path
-        )
-
-        if not ok:
-            await status_msg.edit(content=f"❌ Real G-Major 4 failed:\n```\n{err[-1500:]}\n```")
-            return
-
-        out_size = os.path.getsize(output_path)
-        if out_size > MAX_FILE_SIZE:
-            await status_msg.edit(content="❌ Output file too large for Discord (>25 MB). Try a shorter clip.")
-            return
-
-        out_filename = f"rgm4_{Path(attachment.filename).stem}.mp4"
-        try:
-            embed_rgm4 = discord.Embed(
-                title="Real G-Major 4",
-                description="RGB inverted · +5 semitone pitch overlay · Volume doubled",
-                color=discord.Color.dark_magenta(),
-            )
-            embed_rgm4.set_thumbnail(url="https://files.catbox.moe/dnjdty.png")
-            await ctx.reply(
-                embed=embed_rgm4,
-                file=discord.File(output_path, filename=out_filename),
-            )
-            await status_msg.delete()
-        except discord.HTTPException as e:
-            await status_msg.edit(content=f"❌ Failed to upload result: {e}")
 
 @bot.command(name="preview1280with640x360resize", aliases=["p1280ff!3", "p1280w16:9r"])
 async def preview1280_640x360resize_command(ctx: commands.Context, start: float = 1.85, duration: float = 0.85):
@@ -7088,8 +7317,10 @@ _HELP_ENTRIES: list[dict] = [
         "value": (
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
-            "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `realgm4` `gm91deform`\n"
-            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
+            "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`\n"
+            "**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
+            "**Scroll:** `scroll=hpos=V` · `scroll=hpos=V;ypos=V` · `scroll=h;v` (continuous) · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n"
+            "**Split:** `leftsplit=<inner_effects>` · `rightsplit=<inner_effects>` — apply inner effects to one half, mirror/combine\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
@@ -7155,6 +7386,74 @@ _HELP_ENTRIES: list[dict] = [
             "• **v** — vertical shake strength in pixels (default 0)\n"
             "Example: `t!ihtx 3 1.0 - mp4 shake=3`\n"
             "Example with both axes: `t!ihtx 3 1.0 - mp4 shake=5|3`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "ripple pipe effect  (ripple=spd|freq|amp|phase)",
+        "value": (
+            "Radial displacement distortion using geq with sinusoidal ripple around the center.\\n"
+            "\u2022 **spd** \u2014 animation speed (default 1.0)\\n"
+            "\u2022 **freq** \u2014 ripple frequency (default 30.0)\\n"
+            "\u2022 **amp** \u2014 displacement amplitude in pixels (default 10.0)\\n"
+            "\u2022 **phase** \u2014 initial phase offset (default 0.0)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 ripple`\\n"
+            "Example (custom): `t!ihtx 3 1.0 - mp4 ripple=2|20|15|0`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "pan pipe effect  (pan=px|py)",
+        "value": (
+            "Simple pixel offset panning using geq with boundary clipping.\\n"
+            "\u2022 **px** \u2014 horizontal pixel offset (default 0)\\n"
+            "\u2022 **py** \u2014 vertical pixel offset (default 0)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 pan=50|30`\\n"
+            "Example (horizontal only): `t!ihtx 3 1.0 - mp4 pan=100`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "tile pipe effect  (tile=tx|ty)",
+        "value": (
+            "Repetitive tiling effect using geq mod expressions. Repeats the frame tx\u00d7ty times.\\n"
+            "\u2022 **tx** \u2014 horizontal tile count (default 2)\\n"
+            "\u2022 **ty** \u2014 vertical tile count (default 2)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 tile`\\n"
+            "Example (3\u00d73): `t!ihtx 3 1.0 - mp4 tile=3|3`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "scroll pipe effect  (scroll=...)",
+        "value": (
+            "Multi-mode scroll/pan effect with three variants:\\n"
+            "\u2022 **Named params:** `scroll=hpos=0.5` or `scroll=hpos=0.5;ypos=0.3` \u2014 FFmpeg native scroll filter\\n"
+            "\u2022 **Continuous:** `scroll=h;v` \u2014 0.0\u20131.0 speed per axis\\n"
+            "\u2022 **Animated pan:** `scroll=x1:y1:x2:y2[:dur]` \u2014 geq-based time-dependent pan\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 scroll=hpos=0.5`\\n"
+            "Example (animated): `t!ihtx 3 1.0 - mp4 scroll=0:0:100:50:5`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "leftsplit / rightsplit pipe effects",
+        "value": (
+            "Split the video in half, apply inner effects to one half, then recombine.\\n"
+            "\u2022 **leftsplit=<effects>** \u2014 apply inner effects to left half, then hflip+hstack with right half\\n"
+            "\u2022 **rightsplit=<effects>** \u2014 apply inner effects to right half, then hstack with left half\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 leftsplit=grayscale`\\n"
+            "Example (chained): `t!ihtx 3 1.0 - mp4 rightsplit=huehsv=0.5;brightness=0.2`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "zoom pipe effect  (zoom=<amt>)",
+        "value": (
+            "Scale+crop zoom effect. Scales up by `amt` then crops back to original size (center crop).\\n"
+            "\u2022 **amt** \u2014 zoom multiplier (default 2.0, must be > 0.1)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 zoom=2`\\n"
+            "Example (subtle): `t!ihtx 3 1.0 - mp4 zoom=1.5`"
         ),
     },
     {
@@ -7253,11 +7552,6 @@ _HELP_ENTRIES: list[dict] = [
         "cat": "heavy",
         "name": "t!oppositep1280 [start] [dur]  (aliases: op1280, opposite, opposite1280)",
         "value": "Inverse TV-simulator montage: all hue shifts negated, all pitch shifts inverted vs preview1280. Defaults: start=1.85, dur=0.85",
-    },
-    {
-        "cat": "heavy",
-        "name": "t!realgmajor4  (aliases: realgm4, rgm4)",
-        "value": "Real G-Major 4: RGB inversion + pitch-shifted (+5 semitones) overlay + doubled volume",
     },
     {
         "cat": "heavy",
@@ -7574,6 +7868,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v6.4",
+        "date": "2026-06-28",
+        "heavy": [
+            "**t!ihtx** — new pipe effects: `ripple` (radial displacement), `pan` (pixel offset), `tile` (repetitive tiling), `scroll` (multi-mode scroll/pan with animated geq support)",
+            "**t!ihtx** — new split effects: `leftsplit=<inner>` applies inner effects to left half then hflip+hstack; `rightsplit=<inner>` applies inner effects to right half then hstack",
+            "**t!ihtx zoom** — updated to scale+crop approach (no longer geq-based); `zoom=2` scales up 2x then center-crops back to original size",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
         "version": "v6.3",
         "date": "2026-06-28",
         "heavy": [],
@@ -7587,7 +7892,7 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-27",
         "heavy": [
             "**`t!oppositep1280` / `t!op1280`** — New command: inverse TV-simulator montage. All hue shifts are negated and all pitch shifts are inverted compared to preview1280, producing the visual/audio 'opposite' effect. Supports the same 12-segment pipeline with configurable start offset and segment duration. Also available as a pipe effect (`oppositep1280` / `op1280`) in custom IHTX chains.",
-            "**`t!realgmajor4` / `t!realgm4` / `t!rgm4`** — New command: Real G-Major 4 effect. Inverts all RGB channels, overlays a pitch-shifted (+5 semitones) copy of the inverted video, and doubles the audio volume. Also available as a pipe effect (`realgmajor4` / `realgm4` / `rgm4`) in custom IHTX chains.",
+            "**`t!realgmajor4` / `t!realgm4` / `t!rgm4`** — Migrated to TypeScript bot. RGB inversion + pitch-shifted (+5 semitones) overlay + doubled volume. No longer a Python command or pipe effect — use the standalone TypeScript command instead.",
             "**`t!op1280` / `t!oppositep1280`** — Updated: Added fps=29.97 standardization step (modfps.avi intermediate), segment 3 mirror now uses crop-then-mirror (no pre-hflip), and segment 3 contrast corrected to -0.375.",
         ],
         "fun": [],
@@ -7665,6 +7970,7 @@ _UPDATELOG: list[dict] = [
             "**`>` pipe segment delimiter** — `>` now works alongside `,` as a top-level pipe separator (e.g. `mp2=-4.5|5>negate`), allowing `|` in pitch lists without ambiguity.",
             "**`::` explicit param separator** — `name=val1::val2` keeps each `::` chunk as one verbatim param, fixing mp2 multi-pitch inputs: `mp2=-5|5::G-Major_17` → pitches=`-5|5`, surround=`G-Major_17`.",
             "**jitter pipe effect** — Sinusoidal per-frame pixel displacement camera shake. Param: `<strength>` (default 15). Uses pad→crop with sin(n·seed) offsets. Example: `jitter=20`.",
+            "**randomjitter pipe effect** — Dynamic per-frame pixel displacement via geq matrix. Param: `<strength>` (default 10). Uses rotate→geq→crop with sinusoidal pixel-offset expressions. Example: `randomjitter=20`.",
             "**Processing embed: elapsed timer + weather fun facts** — Status embed now ticks every 4s showing seconds elapsed, and includes a random weather fact while processing runs.",
         ],
         "fun": [],
@@ -9181,7 +9487,6 @@ Heavy (media processing):
 - t!trim <start> <end> — trim audio/video/GIF
 - t!preview1280 [start] [dur] — 12-segment TV-simulator montage
 - t!oppositep1280 [start] [dur] — inverse TV-simulator montage (negated hues, inverted pitches)
-- t!realgmajor4 — RGB invert + pitch-shifted overlay + doubled volume (aliases: realgm4, rgm4)
 - t!invlum [n] — luma-inversion loop
 - t!lexg — re-apply last export effect chain to new media
 
