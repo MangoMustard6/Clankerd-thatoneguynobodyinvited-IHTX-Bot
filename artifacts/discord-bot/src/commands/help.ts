@@ -42,8 +42,10 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
           value: [
             '**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` `huehsv=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`',
             '**Color:** `ccshue=hue|sat|gamma|gain|offset`  `brightness=<v>` `contrast=<v>` `saturation=<v>`',
-            '**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`',
-            '**Reverse:** `vreverse` (frames) · `areverse` (audio)',
+            '**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`',
+            '**Scroll:** `scroll=hpos=V` · `scroll=h;v` · `scroll=x1:y1:x2:y2[:dur]` (animated pan)
+**Split:** `leftsplit=<inner>` · `rightsplit=<inner>` — apply inner effects to one half
+**Reverse:** `vreverse` (frames) · `areverse` (audio)',
             '**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`',
             '**Plugins:** `frei0r=plugin:params` `lut=<url>` `speed=<factor>` `ffmpeg(<args>)`',
           ].join('\n'),

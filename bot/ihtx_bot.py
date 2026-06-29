@@ -1797,6 +1797,12 @@ PIPE_EFFECT_NAMES = {
     "jitter",
     "randomjitter",
     "trim",
+    "leftsplit",
+    "rightsplit",
+    "ripple",
+    "scroll",
+    "pan",
+    "tile",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -2030,21 +2036,80 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             height = "-2"
         return f"scale={width}:{height}"
     if name == "zoom":
-        # params: amount|cx|cy  (cx/cy = zoom centre as 0.0–1.0 fraction, default 0.5)
-        amount = params[0] if params else "1.1"
+        # Updated: scale+crop zoom effect (matches TypeScript spec).
+        # params: amount (default 2). Scales up by amount, then crops center back
+        # to original dimensions, producing a zoom-in effect.
         try:
-            cx = float(params[1]) if len(params) > 1 else 0.5
+            s = float(params[0]) if params else 2.0
         except (ValueError, TypeError):
-            cx = 0.5
-        try:
-            cy = float(params[2]) if len(params) > 2 else 0.5
-        except (ValueError, TypeError):
-            cy = 0.5
-        zoom_geq = f"p(W*{cx}+(X-W*{cx})/{amount},H*{cy}+(Y-H*{cy})/{amount})"
+            s = 2.0
+        s = max(0.1, s)
         return (
-            f"format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
-            f"geq='{zoom_geq}',"
-            f"scale=iw:ih,crop=iw:ih,format=yuv420p"
+            f"scale=iw*{s}:ih*{s},"
+            f"crop=iw/{s}:ih/{s}:(iw-iw/{s})/2:(ih-ih/{s})/2"
+        )
+    if name == "ripple":
+        # Radial displacement using geq with hypot/sin/cos formulas.
+        # params: speed|frequency|amplitude|phase  (all optional)
+        try:
+            speed = float(params[0]) if len(params) > 0 else 1.0
+        except (ValueError, TypeError):
+            speed = 1.0
+        try:
+            frequency = float(params[1]) if len(params) > 1 else 30.0
+        except (ValueError, TypeError):
+            frequency = 30.0
+        try:
+            amplitude = float(params[2]) if len(params) > 2 else 10.0
+        except (ValueError, TypeError):
+            amplitude = 10.0
+        try:
+            phase = float(params[3]) if len(params) > 3 else 0.0
+        except (ValueError, TypeError):
+            phase = 0.0
+        r_expr = "hypot(X-W*0.5,Y-H*0.5)"
+        disp = f"({r_expr}+{amplitude}*sin(2*PI*{speed}*T-({phase})+(-({r_expr})/{frequency})))"
+        angle = "atan2(Y-H*0.5,X-W*0.5)"
+        return (
+            f"format=yuv444p,"
+            f"geq='p(W*0.5+{disp}*cos({angle}),H*0.5+{disp}*sin({angle}))',"
+            f"scale=iw:ih,format=yuv420p"
+        )
+    if name == "pan":
+        # Simple pixel offset via geq with clip for boundary safety.
+        # params: px|py  (pixel offset amounts, default 0)
+        try:
+            px = float(params[0]) if len(params) > 0 else 0.0
+        except (ValueError, TypeError):
+            px = 0.0
+        try:
+            py = float(params[1]) if len(params) > 1 else 0.0
+        except (ValueError, TypeError):
+            py = 0.0
+        return (
+            f"format=yuv444p,"
+            f"geq='p(clip(X+{px},0,W-1),clip(Y+{py},0,H-1))"
+            f":cb(clip(X+{px},0,W-1),clip(Y+{py},0,H-1))"
+            f":cr(clip(X+{px},0,W-1),clip(Y+{py},0,H-1))',"
+            f"scale=iw:ih,format=yuv420p"
+        )
+    if name == "tile":
+        # Repetitive tiling via geq mod expressions.
+        # params: tx|ty  (tile repeat counts, default 2x2)
+        try:
+            tx = float(params[0]) if len(params) > 0 else 2.0
+        except (ValueError, TypeError):
+            tx = 2.0
+        try:
+            ty = float(params[1]) if len(params) > 1 else 2.0
+        except (ValueError, TypeError):
+            ty = 2.0
+        return (
+            f"format=yuv444p,"
+            f"geq='p(mod(X*{tx},W),mod(Y*{ty},H))"
+            f":cb(mod(X*{tx},W),mod(Y*{ty},H))"
+            f":cr(mod(X*{tx},W),mod(Y*{ty},H))',"
+            f"scale=iw:ih,format=yuv420p"
         )
     if name in ("pinch&punch", "p&p", "pinchpunch"):
         strength = params[0] if len(params) > 0 else "1"
@@ -2948,6 +3013,290 @@ def _apply_pipe_effects(
                 ], timeout=300)
                 if not ok:
                     return False, f"randomjitter: ffmpeg failed: {err}"
+                current = out
+                continue
+
+            # scroll — multi-mode scroll/pan effect
+            # Mode 1: scroll=hpos=0.5 or scroll=hpos=0.5;ypos=0.3
+            #   → uses FFmpeg's native scroll filter with named params
+            # Mode 2: scroll=h;v (0.0–1.0 per axis continuous scroll)
+            #   → uses FFmpeg's native scroll filter
+            # Mode 3: scroll=x1:y1:x2:y2[:dur] (4+ numeric params → animated pan via geq)
+            #   → animated pan using geq with time-dependent expressions
+            if name == "scroll":
+                # Check if params contain named hpos/vpos params
+                has_named = any(p.startswith("hpos") or p.startswith("vpos") or p.startswith("ypos") for p in params)
+                all_numeric = True
+                for p in params:
+                    try:
+                        float(p.split("=")[-1] if "=" in p else p)
+                    except (ValueError, TypeError):
+                        all_numeric = False
+                        break
+
+                if has_named:
+                    # Mode 1: Named params (hpos=, ypos=) → native scroll filter
+                    scroll_parts = []
+                    for p in params:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            k = k.strip().lower()
+                            v = v.strip()
+                            if k == "hpos":
+                                scroll_parts.append(f"hpos={v}")
+                            elif k in ("vpos", "ypos"):
+                                scroll_parts.append(f"vpos={v}")
+                    vf_scroll = ",".join(scroll_parts) if scroll_parts else "hpos=0.5"
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"scroll={vf_scroll}",
+                        "-c:a", "copy",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"scroll: ffmpeg failed: {err}"
+                    current = out
+                    continue
+                elif len(params) >= 4 and all_numeric:
+                    # Mode 3: Animated pan via geq — x1:y1:x2:y2[:dur]
+                    def _sp(idx, default):
+                        try:
+                            return float(params[idx]) if idx < len(params) else default
+                        except (ValueError, TypeError):
+                            return default
+                    x1 = _sp(0, 0.0)
+                    y1 = _sp(1, 0.0)
+                    x2 = _sp(2, 0.0)
+                    y2 = _sp(3, 0.0)
+                    dur = _sp(4, 0.0)
+                    if dur > 0:
+                        t_expr = f"T/{dur}"
+                    else:
+                        t_expr = "T"
+                    pan_x = f"{x1}+({x2}-{x1})*{t_expr}"
+                    pan_y = f"{y1}+({y2}-{y1})*{t_expr}"
+                    vf = (
+                        f"format=yuv444p,"
+                        f"geq='p(clip(X+{pan_x},0,W-1),clip(Y+{pan_y},0,H-1))"
+                        f":cb(clip(X+{pan_x},0,W-1),clip(Y+{pan_y},0,H-1))"
+                        f":cr(clip(X+{pan_x},0,W-1),clip(Y+{pan_y},0,H-1))',"
+                        f"scale=iw:ih,format=yuv420p"
+                    )
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", vf,
+                        "-c:a", "copy",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"scroll: ffmpeg failed: {err}"
+                    current = out
+                    continue
+                else:
+                    # Mode 2: Continuous scroll — h;v (0.0–1.0 per axis)
+                    def _sp2(idx, default):
+                        try:
+                            return float(params[idx]) if idx < len(params) else default
+                        except (ValueError, TypeError):
+                            return default
+                    h_speed = _sp2(0, 0.0)
+                    v_speed = _sp2(1, 0.0)
+                    scroll_args = []
+                    if h_speed != 0.0:
+                        scroll_args.append(f"hpos={h_speed}")
+                    if v_speed != 0.0:
+                        scroll_args.append(f"vpos={v_speed}")
+                    vf_scroll = ",".join(scroll_args) if scroll_args else "hpos=0.5"
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"scroll={vf_scroll}",
+                        "-c:a", "copy",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"scroll: ffmpeg failed: {err}"
+                    current = out
+                    continue
+
+            # leftsplit — split video, apply inner effects to left half, hflip+hstack
+            # Syntax: leftsplit=<inner_effects>
+            #   e.g. leftsplit=grayscale  →  left half gets grayscale, right half is mirrored
+            # Process: split → crop left half → apply inner effects to left half →
+            #          crop right half → hstack (with hflip for mirror effect)
+            if name == "leftsplit":
+                inner_str = ";".join(params) if params else ""
+                if not inner_str:
+                    # No inner effects — just pass through
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                inner_effects = _parse_pipe_effects(inner_str)
+                if not inner_effects:
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                info = _ffprobe_video_info(current)
+                w, h = info["width"], info["height"]
+                if w == 0 or h == 0:
+                    return False, "leftsplit: could not read video dimensions"
+                half_w = w // 2
+                with tempfile.TemporaryDirectory() as split_tmp:
+                    left_raw = os.path.join(split_tmp, "left_raw.mp4")
+                    left_fx = os.path.join(split_tmp, "left_fx.mp4")
+                    right_raw = os.path.join(split_tmp, "right_raw.mp4")
+                    # Step 1: Extract left half
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:0:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        left_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"leftsplit: crop left failed: {err}"
+                    # Step 2: Apply inner effects to left half
+                    ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects)
+                    if not ok:
+                        return False, f"leftsplit: inner effects failed: {err}"
+                    # Step 3: Extract right half (no effects)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:{half_w}:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        right_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"leftsplit: crop right failed: {err}"
+                    # Step 4: hflip left half, then hstack left(hflipped)+right
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", left_fx,
+                        "-i", right_raw,
+                        "-filter_complex",
+                        f"[0:v]hflip[lflipped];[lflipped][1:v]hstack=inputs=2[vout]",
+                        "-map", "[vout]",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-an",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"leftsplit: hstack failed: {err}"
+                # Copy audio from original
+                has_audio = bool(info.get("audio_codec"))
+                if has_audio:
+                    with tempfile.TemporaryDirectory() as mux_tmp:
+                        muted_out = os.path.join(mux_tmp, "muted.mp4")
+                        os.replace(out, muted_out)
+                        ok, err = _run_ffmpeg_raw([
+                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                            "-i", muted_out,
+                            "-i", current,
+                            "-map", "0:v", "-map", "1:a",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            out,
+                        ], timeout=120)
+                        if not ok:
+                            return False, f"leftsplit: audio mux failed: {err}"
+                current = out
+                continue
+
+            # rightsplit — split video, apply inner effects to right half, hstack
+            # Syntax: rightsplit=<inner_effects>
+            #   e.g. rightsplit=grayscale  →  right half gets grayscale, left half stays
+            # Process: split → crop right half → apply inner effects to right half →
+            #          crop left half → hstack left+right(affected)
+            if name == "rightsplit":
+                inner_str = ";".join(params) if params else ""
+                if not inner_str:
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                inner_effects = _parse_pipe_effects(inner_str)
+                if not inner_effects:
+                    if current != out:
+                        import shutil as _shutil
+                        _shutil.copyfile(current, out)
+                    current = out
+                    continue
+                info = _ffprobe_video_info(current)
+                w, h = info["width"], info["height"]
+                if w == 0 or h == 0:
+                    return False, "rightsplit: could not read video dimensions"
+                half_w = w // 2
+                with tempfile.TemporaryDirectory() as split_tmp:
+                    left_raw = os.path.join(split_tmp, "left_raw.mp4")
+                    right_raw = os.path.join(split_tmp, "right_raw.mp4")
+                    right_fx = os.path.join(split_tmp, "right_fx.mp4")
+                    # Step 1: Extract left half (no effects)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:0:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        left_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"rightsplit: crop left failed: {err}"
+                    # Step 2: Extract right half
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", current,
+                        "-vf", f"crop={half_w}:{h}:{half_w}:0",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy",
+                        right_raw,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"rightsplit: crop right failed: {err}"
+                    # Step 3: Apply inner effects to right half
+                    ok, err = _apply_pipe_effects(right_raw, right_fx, inner_effects)
+                    if not ok:
+                        return False, f"rightsplit: inner effects failed: {err}"
+                    # Step 4: hstack left + right(affected)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", left_raw,
+                        "-i", right_fx,
+                        "-filter_complex",
+                        f"[0:v][1:v]hstack=inputs=2[vout]",
+                        "-map", "[vout]",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-an",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"rightsplit: hstack failed: {err}"
+                # Copy audio from original
+                has_audio = bool(info.get("audio_codec"))
+                if has_audio:
+                    with tempfile.TemporaryDirectory() as mux_tmp:
+                        muted_out = os.path.join(mux_tmp, "muted.mp4")
+                        os.replace(out, muted_out)
+                        ok, err = _run_ffmpeg_raw([
+                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                            "-i", muted_out,
+                            "-i", current,
+                            "-map", "0:v", "-map", "1:a",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            out,
+                        ], timeout=120)
+                        if not ok:
+                            return False, f"rightsplit: audio mux failed: {err}"
                 current = out
                 continue
 
@@ -6969,7 +7318,9 @@ _HELP_ENTRIES: list[dict] = [
             "**Video:** `hflip` `vflip` `negate` `grayscale` `sepia` `rotate=<deg>` "
             "`huehsv=<val>` `ccshue=hue|sat|gamma|gain|offset` `brightness=<val>` `contrast=<val>` "
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`\n"
-            "**Distortion:** `mirror=<deg>` `zoom=<amt>` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
+            "**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
+            "**Scroll:** `scroll=hpos=V` · `scroll=hpos=V;ypos=V` · `scroll=h;v` (continuous) · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n"
+            "**Split:** `leftsplit=<inner_effects>` · `rightsplit=<inner_effects>` — apply inner effects to one half, mirror/combine\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
@@ -7035,6 +7386,74 @@ _HELP_ENTRIES: list[dict] = [
             "• **v** — vertical shake strength in pixels (default 0)\n"
             "Example: `t!ihtx 3 1.0 - mp4 shake=3`\n"
             "Example with both axes: `t!ihtx 3 1.0 - mp4 shake=5|3`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "ripple pipe effect  (ripple=spd|freq|amp|phase)",
+        "value": (
+            "Radial displacement distortion using geq with sinusoidal ripple around the center.\\n"
+            "\u2022 **spd** \u2014 animation speed (default 1.0)\\n"
+            "\u2022 **freq** \u2014 ripple frequency (default 30.0)\\n"
+            "\u2022 **amp** \u2014 displacement amplitude in pixels (default 10.0)\\n"
+            "\u2022 **phase** \u2014 initial phase offset (default 0.0)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 ripple`\\n"
+            "Example (custom): `t!ihtx 3 1.0 - mp4 ripple=2|20|15|0`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "pan pipe effect  (pan=px|py)",
+        "value": (
+            "Simple pixel offset panning using geq with boundary clipping.\\n"
+            "\u2022 **px** \u2014 horizontal pixel offset (default 0)\\n"
+            "\u2022 **py** \u2014 vertical pixel offset (default 0)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 pan=50|30`\\n"
+            "Example (horizontal only): `t!ihtx 3 1.0 - mp4 pan=100`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "tile pipe effect  (tile=tx|ty)",
+        "value": (
+            "Repetitive tiling effect using geq mod expressions. Repeats the frame tx\u00d7ty times.\\n"
+            "\u2022 **tx** \u2014 horizontal tile count (default 2)\\n"
+            "\u2022 **ty** \u2014 vertical tile count (default 2)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 tile`\\n"
+            "Example (3\u00d73): `t!ihtx 3 1.0 - mp4 tile=3|3`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "scroll pipe effect  (scroll=...)",
+        "value": (
+            "Multi-mode scroll/pan effect with three variants:\\n"
+            "\u2022 **Named params:** `scroll=hpos=0.5` or `scroll=hpos=0.5;ypos=0.3` \u2014 FFmpeg native scroll filter\\n"
+            "\u2022 **Continuous:** `scroll=h;v` \u2014 0.0\u20131.0 speed per axis\\n"
+            "\u2022 **Animated pan:** `scroll=x1:y1:x2:y2[:dur]` \u2014 geq-based time-dependent pan\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 scroll=hpos=0.5`\\n"
+            "Example (animated): `t!ihtx 3 1.0 - mp4 scroll=0:0:100:50:5`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "leftsplit / rightsplit pipe effects",
+        "value": (
+            "Split the video in half, apply inner effects to one half, then recombine.\\n"
+            "\u2022 **leftsplit=<effects>** \u2014 apply inner effects to left half, then hflip+hstack with right half\\n"
+            "\u2022 **rightsplit=<effects>** \u2014 apply inner effects to right half, then hstack with left half\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 leftsplit=grayscale`\\n"
+            "Example (chained): `t!ihtx 3 1.0 - mp4 rightsplit=huehsv=0.5;brightness=0.2`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "zoom pipe effect  (zoom=<amt>)",
+        "value": (
+            "Scale+crop zoom effect. Scales up by `amt` then crops back to original size (center crop).\\n"
+            "\u2022 **amt** \u2014 zoom multiplier (default 2.0, must be > 0.1)\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 zoom=2`\\n"
+            "Example (subtle): `t!ihtx 3 1.0 - mp4 zoom=1.5`"
         ),
     },
     {
@@ -7448,6 +7867,17 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.4",
+        "date": "2026-06-28",
+        "heavy": [
+            "**t!ihtx** — new pipe effects: `ripple` (radial displacement), `pan` (pixel offset), `tile` (repetitive tiling), `scroll` (multi-mode scroll/pan with animated geq support)",
+            "**t!ihtx** — new split effects: `leftsplit=<inner>` applies inner effects to left half then hflip+hstack; `rightsplit=<inner>` applies inner effects to right half then hstack",
+            "**t!ihtx zoom** — updated to scale+crop approach (no longer geq-based); `zoom=2` scales up 2x then center-crops back to original size",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v6.3",
         "date": "2026-06-28",
