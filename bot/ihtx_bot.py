@@ -1817,6 +1817,7 @@ PIPE_EFFECT_NAMES = {
     "gm4", "realgm4",
     "acontrast", "adestroy", "audioequalizer",
     "avflip",
+    "pinkandgreenrender", "p&g",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -3405,6 +3406,104 @@ def _apply_pipe_effects(
                     ], timeout=120)
                     if not ok:
                         return False, f"rightsplit: audio mux failed: {err}"
+                current = out
+                continue
+
+            # pinkandgreenrender / p&g — two-pass ASF pipe blend with a.mp4 using ffv1+aac
+            # Pass 1: encode input → ASF/H264 pipe → stdout
+            # Pass 2: stdin + a.mp4 (looped) → blend → ffv1 mkv → remux to out
+            if name in ("pinkandgreenrender", "p&g"):
+                _pag_candidates = [
+                    os.path.join(os.getcwd(), "a.mp4"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "a.mp4"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "a.mp4"),
+                ]
+                _pag_amp4 = next((p for p in _pag_candidates if os.path.isfile(p)), None)
+                if _pag_amp4 is None:
+                    return False, (
+                        "pinkandgreenrender: `a.mp4` not found — place it in the project root "
+                        "or bot/ directory."
+                    )
+                _pag_info = _ffprobe_video_info(current)
+                _pag_w, _pag_h = _pag_info["width"], _pag_info["height"]
+                if _pag_w == 0 or _pag_h == 0:
+                    return False, "pinkandgreenrender: could not read video dimensions"
+                _pag_tmp_mkv = os.path.join(tmpdir, f"pag_{i}.mkv")
+                _pag_cmd1 = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-f", "asf", "-c:v", "h264", "-preset", "ultrafast",
+                    "-profile:v", "high444", "-tune", "zerolatency",
+                    "-q:v", "1", "-r", "29.97",
+                    "-x264-params",
+                    "ref=2:slices=4:vbv-maxrate=1000000:vbv-bufsize=500000:pframes=69:weightp=999",
+                    "-bf", "9", "-g", "8", "-crf", "17",
+                    "-c:a", "pcm_s16le", "-ar", "48000",
+                    "pipe:1",
+                ]
+                _pag_cmd2 = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-f", "asf", "-i", "pipe:0",
+                    "-stream_loop", "-1", "-i", _pag_amp4,
+                    "-af", "atrim=0.0214",
+                    "-filter_complex",
+                    (
+                        f"[0]format=yuvj444p[00];"
+                        f"[1]scale={_pag_w}:{_pag_h},format=yuvj444p[11];"
+                        f"[00][11]blend=shortest=true"
+                    ),
+                    "-pix_fmt", "yuv444p", "-c:v", "ffv1",
+                    "-c:a", "aac", "-aac_coder", "1", "-aac_ms", "1", "-aac_is", "0",
+                    "-b:a", "192K", "-q:a", "1",
+                    _pag_tmp_mkv,
+                ]
+                try:
+                    _pag_proc1 = subprocess.Popen(
+                        _pag_cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    )
+                    _pag_proc2 = subprocess.Popen(
+                        _pag_cmd2, stdin=_pag_proc1.stdout,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    )
+                    _pag_proc1.stdout.close()
+                    _pag_out2, _pag_err2 = _pag_proc2.communicate(timeout=600)
+                    _pag_proc1.wait(timeout=60)
+                    _pag_err1 = _pag_proc1.stderr.read()
+                except subprocess.TimeoutExpired:
+                    try:
+                        _pag_proc1.kill()
+                    except Exception:
+                        pass
+                    try:
+                        _pag_proc2.kill()
+                    except Exception:
+                        pass
+                    return False, "pinkandgreenrender: pipeline timed out (600 s)"
+                except Exception as _pag_exc:
+                    return False, f"pinkandgreenrender: pipeline error: {_pag_exc}"
+                if _pag_proc2.returncode != 0:
+                    _pag_e2 = (_pag_err2 or b"").decode("utf-8", errors="replace").strip()
+                    _pag_e1 = (_pag_err1 or b"").decode("utf-8", errors="replace").strip()
+                    return False, f"pinkandgreenrender: second-pass failed: {_pag_e2 or _pag_e1}"
+                if _pag_proc1.returncode != 0:
+                    _pag_e1 = (_pag_err1 or b"").decode("utf-8", errors="replace").strip()
+                    return False, f"pinkandgreenrender: first-pass failed: {_pag_e1}"
+                ok, err = _run_ffmpeg_raw([
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", _pag_tmp_mkv,
+                    "-c:v", "copy", "-c:a", "copy",
+                    out,
+                ], timeout=120)
+                if not ok:
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", _pag_tmp_mkv,
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                        out,
+                    ], timeout=300)
+                    if not ok:
+                        return False, f"pinkandgreenrender: remux failed: {err}"
                 current = out
                 continue
 
@@ -8038,6 +8137,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.8",
+        "date": "2026-06-30",
+        "heavy": [
+            "**t!ihtx** — new pipe effect `pinkandgreenrender` (alias `p&g`): two-pass ASF/H264 pipe blend. Pass 1 encodes to H264 ASF (ultrafast, high444, crf 17, pcm_s16le audio) piped to Pass 2 which blends with `a.mp4` (stream-looped) using `blend=shortest=true` on `yuvj444p`, outputs ffv1+aac. Place `a.mp4` in the project root or `bot/` directory.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v6.7",
         "date": "2026-06-30",
