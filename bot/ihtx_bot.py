@@ -7826,7 +7826,7 @@ _HELP_ENTRIES: list[dict] = [
     {
         "cat": "fun",
         "name": "t!chat <prompt>  (aliases: ask, ai)",
-        "value": "Chat with Clankered Thatoneguynobodyinvited using Gemini 2.5 Flash. Pure Google GenAI pipeline.",
+        "value": "Chat with T1GNI IHTX and Fun Bot using Groq.",
     },
     {
         "cat": "fun",
