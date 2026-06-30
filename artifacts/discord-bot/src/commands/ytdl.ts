@@ -67,6 +67,7 @@ export async function runYtdl(message: Message): Promise<void> {
       "--output", outTemplate,
       "--no-warnings",
       "--socket-timeout", "30",
+      "--extractor-args", "youtube:player_client=ios,android_vr,web_embedded,tv_embedded",
     ];
 
     logger.info({ target }, "Starting yt-dlp download");
