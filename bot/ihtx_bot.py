@@ -8142,6 +8142,7 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-30",
         "heavy": [
             "**t!ihtx** — new pipe effect `pinkandgreenrender` (alias `p&g`): two-pass ASF/H264 pipe blend. Pass 1 encodes to H264 ASF (ultrafast, high444, crf 17, pcm_s16le audio) piped to Pass 2 which blends with `a.mp4` (stream-looped) using `blend=shortest=true` on `yuvj444p`, outputs ffv1+aac. Place `a.mp4` in the project root or `bot/` directory.",
+            "**t!setalpha** (aliases: `setpag`, `seta`) — owner-only: download and save a video as `a.mp4` for use with `pinkandgreenrender`/`p&g`. Accepts an attachment, a replied-to attachment, or a direct URL.",
         ],
         "fun": [],
         "owner": [],
@@ -11729,6 +11730,64 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         return
     print(f"[error] Unhandled command error in {ctx.command}: {type(error).__name__}: {error}")
     raise error
+
+
+@bot.command(name="setalpha", aliases=["setpag", "seta"])
+@commands.check(_is_owner)
+async def setalpha_cmd(ctx: commands.Context, url: str = ""):
+    """Owner-only: save an attached video (or URL) as a.mp4 for pinkandgreenrender / p&g.
+
+      t!setalpha           (with a video file attached)
+      t!setalpha <url>     (direct video URL)
+    """
+    _alpha_dest = os.path.join(os.getcwd(), "a.mp4")
+
+    # Resolve source: attachment > replied-message attachment > explicit URL
+    src_url: str | None = None
+    src_filename: str = "a.mp4"
+
+    if ctx.message.attachments:
+        src_url = ctx.message.attachments[0].url
+        src_filename = ctx.message.attachments[0].filename
+    elif ctx.message.reference:
+        try:
+            _ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            if _ref.attachments:
+                src_url = _ref.attachments[0].url
+                src_filename = _ref.attachments[0].filename
+        except Exception:
+            pass
+    if not src_url and url:
+        src_url = url.strip()
+
+    if not src_url:
+        await ctx.reply(
+            "📎 attach a video file or provide a URL — e.g. `t!setalpha` with an attachment, "
+            "or `t!setalpha https://example.com/clip.mp4`"
+        )
+        return
+
+    status = await ctx.reply(f"⬇️ downloading `{src_filename}` → `a.mp4`…")
+    try:
+        async with aiohttp.ClientSession() as _sess:
+            async with _sess.get(
+                src_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot)"},
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as _resp:
+                if _resp.status != 200:
+                    await status.edit(content=f"❌ download failed: HTTP {_resp.status}")
+                    return
+                _data = await _resp.read()
+        with open(_alpha_dest, "wb") as _f:
+            _f.write(_data)
+        _size_kb = len(_data) / 1024
+        await status.edit(
+            content=f"✅ saved as `a.mp4` ({_size_kb:.1f} KB) — "
+            f"`pinkandgreenrender` / `p&g` will now use it."
+        )
+    except Exception as _e:
+        await status.edit(content=f"❌ setalpha failed: {_e}")
 
 
 if __name__ == "__main__":
