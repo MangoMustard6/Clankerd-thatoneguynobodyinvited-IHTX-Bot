@@ -4275,7 +4275,7 @@ def _generate_hald_cluts(workdir: str) -> list[str]:
         # hslhue_22: hue shift 22° → fraction 0.06, mod = 0.06*200+100 = 112
         ("hslhue_22.ppm", 100, 100, 112),
         # hslhue_108_30: hue shift 108° + saturation boost → fraction 0.3, mod = 0.3*200+200 = 260
-        ("hslhue_108_30.ppm", 100, 130, 260),
+        ("hslhue_108_30.ppm", 100, 100, 0),
     ]
     paths = []
     for i, (filename, brightness, saturation, hue_mod) in enumerate(clut_specs):
