@@ -992,12 +992,17 @@ def _run_tvsim(
             return False, f"TV simulator displacement map not found: {_TVSIM_DISPLACE_MAP}"
 
         contrast = (1.0 - line_sync) * 2.366666
+        # Cap output to max 854px wide to keep encoding fast regardless of source resolution.
+        # The displacement runs internally at 854×854 anyway; scaling up to 4K just slows encoding.
+        out_w = min(w, 854)
+        out_h = int(round(out_w * h / w / 2) * 2) if w else 480  # even height
+
         base_fc = (
             f"[0]scale=854:854,format=bgr32[00];"
             f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
-            f"eq=contrast={contrast:.6f}:eval=frame,format=bgr32,hue=b=-0.033[x];"
+            f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[x];"
             f"color=s=854x854:c=#808080,format=bgr32[y];"
-            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
+            f"[00][x][y]displace=edge=wrap,scale={out_w}:{out_h},setsar=1,format=yuv444p"
         )
         if optional:
             full_fc = base_fc + "," + ",".join(optional)
@@ -1011,12 +1016,12 @@ def _run_tvsim(
             "-filter_complex", full_fc,
             "-map", "0:a?",
             "-pix_fmt", "yuv420p",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:a", "aac",
             output_path,
         ]
 
-    return _run_ffmpeg_raw(cmd, timeout=300)
+    return _run_ffmpeg_raw(cmd, timeout=600)
 
 
 # ---------- Folk Valley ----------
@@ -8051,6 +8056,7 @@ _UPDATELOG: list[dict] = [
         "heavy": [
             "**t!ihtx** — new video effects: `watermark=<url>` `ring[=url]` `miui` `reddit` (PNG overlay via scale2ref+overlay), `caption=<text>` (drawtext), `orb` / `deorb` (v360 sphere warp), `vebfisheye2/3[=N]` / `vebdefisheye2/3[=N]` (v360 projection, stackable), `chromashift` (RGB channel displacement), `🥸🥸` (hue π), `﷽` / `𒐫` (v360 combos), `gm4` (selectivecolor), `realgm4` (curves invert)",
             "**t!ihtx** — new audio effects: `acontrast[=N]` (audio contrast), `adestroy` (5× acontrast=100), `audioequalizer=sub|bass|lowmids|mids|highmids` (5-band EQ), `4ormulator[=dial]` (rubberband formant), `avflip` (rubberband crush + afftfilt + expand), `areverse` now adds `asetpts=PTS-STARTPTS` for correct timing",
+            "**t!tvsim / tvsim pipe** — fixed timeout: removed `eval=frame` from eq filter, capped output to max 854 px wide (displacement runs at 854×854 internally anyway), switched preset to `veryfast`, timeout raised 300 → 600 s",
         ],
         "fun": [],
         "owner": [],
