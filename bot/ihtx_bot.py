@@ -900,6 +900,7 @@ def _run_huehsv(
 # ---------- TV Simulator ----------
 
 _TVSIM_DISPLACE_MAP = Path(__file__).parent / "displacemaps" / "tvsimulator.mov"
+_TVSIM_DISPLACE_MAP_URL = "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
 
 
 def _run_tvsim(
@@ -911,8 +912,15 @@ def _run_tvsim(
     phosphorescence: float = 0.0,
     interlacing: float = 0.0,
     scan_phasing: float = 0.0,
+    _in_split: bool = False,
 ) -> tuple[bool, str]:
     """Apply TV-simulator CRT effect via FFmpeg displacement map.
+
+    Standalone mode (default): uses a left/right split filter_complex — left half is
+    passed through, right half gets the tvsim displacement, then hstacked.
+
+    Split-inner mode (_in_split=True): applies displacement directly to the full input
+    (which is already a cropped half from leftsplit/rightsplit) without re-splitting.
 
     Args:
         line_sync       — 0-1, displacement strength (0=max, 1=none). Required.
@@ -921,6 +929,7 @@ def _run_tvsim(
         phosphorescence — CRT phosphor glow tint (default 0 = off)
         interlacing     — scanline darkening strength (default 0 = off)
         scan_phasing    — ripple/phasing on scanlines (default 0 = off)
+        _in_split       — when True, skip internal left/right split (called from leftsplit/rightsplit)
     """
     line_sync = max(0.0, min(1.0, line_sync))
 
@@ -934,7 +943,7 @@ def _run_tvsim(
     except Exception:
         fr = 30.0
 
-    # Build optional filter list (order matches original TS script)
+    # Build optional vf filters that go into {pipeeffects} slot on the right half
     optional: list[str] = []
 
     if vertical_sync != 1.0:
@@ -960,7 +969,6 @@ def _run_tvsim(
             f"b='min(p(X,Y)+max(cos(Y/H*5-mod(T*16.666666*{sp},5))*128-64,0),255)'"
         )
 
-    # Order of interlacing vs scan_phasing depends on line_sync (matches TS)
     if line_sync == 1.0:
         if scan_phasing != 0.0:
             optional.append(_scanphase_filter(scan_phasing))
@@ -973,7 +981,7 @@ def _run_tvsim(
             optional.append(_scanphase_filter(scan_phasing))
 
     if line_sync == 1.0:
-        # No displacement map — just apply optional filters
+        # No displacement — just apply optional filters (or passthrough)
         if optional:
             vf = ",".join(optional) + ",format=yuv420p"
             cmd = [
@@ -987,33 +995,55 @@ def _run_tvsim(
         else:
             cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                    "-i", input_path, "-c", "copy", output_path]
-    else:
-        if not _TVSIM_DISPLACE_MAP.exists():
-            return False, f"TV simulator displacement map not found: {_TVSIM_DISPLACE_MAP}"
+        return _run_ffmpeg_raw(cmd, timeout=600)
 
-        contrast = (1.0 - line_sync) * 2.366666
-        # Cap output to max 854px wide to keep encoding fast regardless of source resolution.
-        # The displacement runs internally at 854×854 anyway; scaling up to 4K just slows encoding.
-        out_w = min(w, 854)
-        out_h = int(round(out_w * h / w / 2) * 2) if w else 480  # even height
+    contrast = (1.0 - line_sync) * 2.366666
+    pipeeffects_str = ("," + ",".join(optional)) if optional else ""
 
-        base_fc = (
-            f"[0]scale=854:854,format=bgr32[00];"
+    if _in_split:
+        # Already operating on a half-video from leftsplit/rightsplit — just apply
+        # displacement directly with no internal split. Stream from URL.
+        fc = (
+            f"[0]scale=854:854{pipeeffects_str},format=bgr32[00];"
             f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
             f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[x];"
-            f"color=s=854x854:c=#808080,format=bgr32[y];"
-            f"[00][x][y]displace=edge=wrap,scale={out_w}:{out_h},setsar=1,format=yuv444p"
+            f"color=s=854x854:c=gray,format=bgr32[y];"
+            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
         )
-        if optional:
-            full_fc = base_fc + "," + ",".join(optional)
-        else:
-            full_fc = base_fc
-
         cmd = [
             "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
             "-i", input_path,
-            "-stream_loop", "-1", "-i", str(_TVSIM_DISPLACE_MAP),
-            "-filter_complex", full_fc,
+            "-stream_loop", "-1", "-i", _TVSIM_DISPLACE_MAP_URL,
+            "-filter_complex", fc,
+            "-map", "0:a?",
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac",
+            output_path,
+        ]
+    else:
+        # Standalone mode: internal left/right split — left passthrough, right gets tvsim.
+        # filter_complex structure from user spec:
+        #   split → left: crop left-half passthrough (gbrp)
+        #         → right: scale 854x854, {pipeeffects}, displace, scale back, crop back (gbrp)
+        #   hstack
+        fc = (
+            f"split[_tvl][_tvr];"
+            f"[_tvl]crop=trunc(iw/4)*2:ih:0:0,format=gbrp[_tvlout];"
+            f"[_tvr]scale=854:854{pipeeffects_str},format=bgr32[_tv00];"
+            f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
+            f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[_tvx];"
+            f"color=s=854x854:c=gray,format=bgr32[_tvy];"
+            f"[_tv00][_tvx][_tvy]displace=edge=wrap,"
+            f"scale={w}:{h},setsar=1,format=yuv444p,"
+            f"crop=trunc(iw/4)*2:ih:trunc(iw/4)*2:0,format=gbrp[_tvrout];"
+            f"[_tvlout][_tvrout]hstack"
+        )
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+            "-stream_loop", "-1", "-i", _TVSIM_DISPLACE_MAP_URL,
+            "-filter_complex", fc,
             "-map", "0:a?",
             "-pix_fmt", "yuv420p",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
@@ -2767,6 +2797,7 @@ def _apply_pipe_effects(
                     phosphorescence=_tp(3, 0.0),
                     interlacing=_tp(4, 0.0),
                     scan_phasing=_tp(5, 0.0),
+                    _in_split=_in_split,
                 )
                 if not ok:
                     return False, f"tvsim failed: {err}"
@@ -8057,6 +8088,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.9",
+        "date": "2026-06-30",
+        "heavy": [
+            "**tvsim pipe** — rewrote `_run_tvsim` with new displacement map URL (`file.garden/...tv_sim_displacement_map.mov`). Standalone mode now uses the split filter_complex: left half passes through (gbrp), right half gets `scale=854:854 → {pipeeffects} → displace → scale back → crop back`, then `hstack`. Inside `leftsplit`/`rightsplit` (`_in_split=True`), applies displacement directly to the half-video without re-splitting.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v6.8",
         "date": "2026-06-30",
