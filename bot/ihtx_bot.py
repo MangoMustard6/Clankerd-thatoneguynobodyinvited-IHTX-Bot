@@ -2001,6 +2001,9 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
     if name == "ccshue":
         # Handled as a special case in _apply_pipe_effects (needs ImageMagick preprocessing)
         return None
+    if name in ("nepeta", "watermark", "ring", "miui", "reddit"):
+        # Overlay effects — handled in _apply_pipe_effects (need second input via -i)
+        return None
     if name == "frei0r":
         # frei0r=plugin:p1:p2:…  (colon-separated params)
         plugin = params[0] if params else ""
