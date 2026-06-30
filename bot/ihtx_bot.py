@@ -900,6 +900,7 @@ def _run_huehsv(
 # ---------- TV Simulator ----------
 
 _TVSIM_DISPLACE_MAP = Path(__file__).parent / "displacemaps" / "tvsimulator.mov"
+_TVSIM_DISPLACE_MAP_URL = "https://file.garden/aTXso15ukD3mnuPI/tv_sim_displacement_map.mov"
 
 
 def _run_tvsim(
@@ -911,8 +912,15 @@ def _run_tvsim(
     phosphorescence: float = 0.0,
     interlacing: float = 0.0,
     scan_phasing: float = 0.0,
+    _in_split: bool = False,
 ) -> tuple[bool, str]:
     """Apply TV-simulator CRT effect via FFmpeg displacement map.
+
+    Standalone mode (default): uses a left/right split filter_complex — left half is
+    passed through, right half gets the tvsim displacement, then hstacked.
+
+    Split-inner mode (_in_split=True): applies displacement directly to the full input
+    (which is already a cropped half from leftsplit/rightsplit) without re-splitting.
 
     Args:
         line_sync       — 0-1, displacement strength (0=max, 1=none). Required.
@@ -921,6 +929,7 @@ def _run_tvsim(
         phosphorescence — CRT phosphor glow tint (default 0 = off)
         interlacing     — scanline darkening strength (default 0 = off)
         scan_phasing    — ripple/phasing on scanlines (default 0 = off)
+        _in_split       — when True, skip internal left/right split (called from leftsplit/rightsplit)
     """
     line_sync = max(0.0, min(1.0, line_sync))
 
@@ -934,7 +943,7 @@ def _run_tvsim(
     except Exception:
         fr = 30.0
 
-    # Build optional filter list (order matches original TS script)
+    # Build optional vf filters that go into {pipeeffects} slot on the right half
     optional: list[str] = []
 
     if vertical_sync != 1.0:
@@ -960,7 +969,6 @@ def _run_tvsim(
             f"b='min(p(X,Y)+max(cos(Y/H*5-mod(T*16.666666*{sp},5))*128-64,0),255)'"
         )
 
-    # Order of interlacing vs scan_phasing depends on line_sync (matches TS)
     if line_sync == 1.0:
         if scan_phasing != 0.0:
             optional.append(_scanphase_filter(scan_phasing))
@@ -973,7 +981,7 @@ def _run_tvsim(
             optional.append(_scanphase_filter(scan_phasing))
 
     if line_sync == 1.0:
-        # No displacement map — just apply optional filters
+        # No displacement — just apply optional filters (or passthrough)
         if optional:
             vf = ",".join(optional) + ",format=yuv420p"
             cmd = [
@@ -987,33 +995,55 @@ def _run_tvsim(
         else:
             cmd = ["ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                    "-i", input_path, "-c", "copy", output_path]
-    else:
-        if not _TVSIM_DISPLACE_MAP.exists():
-            return False, f"TV simulator displacement map not found: {_TVSIM_DISPLACE_MAP}"
+        return _run_ffmpeg_raw(cmd, timeout=600)
 
-        contrast = (1.0 - line_sync) * 2.366666
-        # Cap output to max 854px wide to keep encoding fast regardless of source resolution.
-        # The displacement runs internally at 854×854 anyway; scaling up to 4K just slows encoding.
-        out_w = min(w, 854)
-        out_h = int(round(out_w * h / w / 2) * 2) if w else 480  # even height
+    contrast = (1.0 - line_sync) * 2.366666
+    pipeeffects_str = ("," + ",".join(optional)) if optional else ""
 
-        base_fc = (
-            f"[0]scale=854:854,format=bgr32[00];"
+    if _in_split:
+        # Already operating on a half-video from leftsplit/rightsplit — just apply
+        # displacement directly with no internal split. Stream from URL.
+        fc = (
+            f"[0]scale=854:854{pipeeffects_str},format=bgr32[00];"
             f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
             f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[x];"
-            f"color=s=854x854:c=#808080,format=bgr32[y];"
-            f"[00][x][y]displace=edge=wrap,scale={out_w}:{out_h},setsar=1,format=yuv444p"
+            f"color=s=854x854:c=gray,format=bgr32[y];"
+            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
         )
-        if optional:
-            full_fc = base_fc + "," + ",".join(optional)
-        else:
-            full_fc = base_fc
-
         cmd = [
             "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
             "-i", input_path,
-            "-stream_loop", "-1", "-i", str(_TVSIM_DISPLACE_MAP),
-            "-filter_complex", full_fc,
+            "-stream_loop", "-1", "-i", _TVSIM_DISPLACE_MAP_URL,
+            "-filter_complex", fc,
+            "-map", "0:a?",
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac",
+            output_path,
+        ]
+    else:
+        # Standalone mode: internal left/right split — left passthrough, right gets tvsim.
+        # filter_complex structure from user spec:
+        #   split → left: crop left-half passthrough (gbrp)
+        #         → right: scale 854x854, {pipeeffects}, displace, scale back, crop back (gbrp)
+        #   hstack
+        fc = (
+            f"split[_tvl][_tvr];"
+            f"[_tvl]crop=trunc(iw/4)*2:ih:0:0,format=gbrp[_tvlout];"
+            f"[_tvr]scale=854:854{pipeeffects_str},format=bgr32[_tv00];"
+            f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
+            f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[_tvx];"
+            f"color=s=854x854:c=gray,format=bgr32[_tvy];"
+            f"[_tv00][_tvx][_tvy]displace=edge=wrap,"
+            f"scale={w}:{h},setsar=1,format=yuv444p,"
+            f"crop=trunc(iw/4)*2:ih:trunc(iw/4)*2:0,format=gbrp[_tvrout];"
+            f"[_tvlout][_tvrout]hstack"
+        )
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", input_path,
+            "-stream_loop", "-1", "-i", _TVSIM_DISPLACE_MAP_URL,
+            "-filter_complex", fc,
             "-map", "0:a?",
             "-pix_fmt", "yuv420p",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
@@ -2306,6 +2336,7 @@ def _apply_pipe_effects(
     input_path: str,
     output_path: str,
     effects: list[tuple[str, list[str]]],
+    _in_split: bool = False,
 ) -> tuple[bool, str]:
     """Apply pipe effects sequentially — each effect is rendered individually
     before the next begins (no filter batching).
@@ -2689,6 +2720,24 @@ def _apply_pipe_effects(
                 continue
 
 
+            # Inside a split, mirror=left/right → hflip; top/bottom → vflip
+            # (avoids the split-within-split crop+stack which breaks on half-width video)
+            if _in_split and name == "mirror":
+                _m_dir = (params[0] if params else "").lower().strip()
+                _m_dir = {"l": "left", "r": "right", "t": "top", "b": "bottom"}.get(_m_dir, _m_dir)
+                _m_vf = "vflip" if _m_dir in ("top", "bottom") else "hflip"
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-vf", _m_vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"mirror (split-inner) failed: {err}"
+                current = out
+                continue
+
             # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
             if vf:
@@ -2748,6 +2797,7 @@ def _apply_pipe_effects(
                     phosphorescence=_tp(3, 0.0),
                     interlacing=_tp(4, 0.0),
                     scan_phasing=_tp(5, 0.0),
+                    _in_split=_in_split,
                 )
                 if not ok:
                     return False, f"tvsim failed: {err}"
@@ -3282,7 +3332,7 @@ def _apply_pipe_effects(
                     if not ok:
                         return False, f"leftsplit: crop left failed: {err}"
                     # Step 2: Apply inner effects to left half
-                    ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects)
+                    ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects, _in_split=True)
                     if not ok:
                         return False, f"leftsplit: inner effects failed: {err}"
                     # Step 3: hstack left_fx (unchanged) + hflip(left_fx) to create mirror.
@@ -3371,7 +3421,7 @@ def _apply_pipe_effects(
                     if not ok:
                         return False, f"rightsplit: crop right failed: {err}"
                     # Step 3: Apply inner effects to right half
-                    ok, err = _apply_pipe_effects(right_raw, right_fx, inner_effects)
+                    ok, err = _apply_pipe_effects(right_raw, right_fx, inner_effects, _in_split=True)
                     if not ok:
                         return False, f"rightsplit: inner effects failed: {err}"
                     # Step 4: hstack left + right(affected)
@@ -7776,7 +7826,7 @@ _HELP_ENTRIES: list[dict] = [
     {
         "cat": "fun",
         "name": "t!chat <prompt>  (aliases: ask, ai)",
-        "value": "Chat with Clankered Thatoneguynobodyinvited using Gemini 2.5 Flash. Pure Google GenAI pipeline.",
+        "value": "Chat with T1GNI IHTX and Fun Bot using Groq.",
     },
     {
         "cat": "fun",
@@ -7917,10 +7967,25 @@ _HELP_CATS = {
 }
 
 
-def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> discord.Embed:
-    """Build a help embed for a category, or for an arbitrary list of entries (search results)."""
+_HELP_PAGE_SIZE = 6  # entries per page — keeps total embed chars well under 6000
+
+
+def _build_help_embed(
+    cat: str | None,
+    entries: list[dict] | None = None,
+    page: int = 0,
+    page_size: int = _HELP_PAGE_SIZE,
+) -> tuple[discord.Embed, int, int]:
+    """Build a paginated help embed.
+
+    Returns (embed, current_page_clamped, total_pages).
+    """
     if entries is None:
         entries = [e for e in _HELP_ENTRIES if e["cat"] == cat]
+
+    total_pages = max(1, -(-len(entries) // page_size))  # ceil division
+    page = max(0, min(page, total_pages - 1))
+    page_entries = entries[page * page_size : (page + 1) * page_size]
 
     if cat and cat in _HELP_CATS:
         title, color = _HELP_CATS[cat]
@@ -7928,20 +7993,25 @@ def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> dis
         title, color = "🔍 Search Results", discord.Color.gold()
 
     embed = discord.Embed(title=title, color=color)
-    for entry in entries[:25]:
+    for entry in page_entries:
         copyable_value = f"`{entry['name']}`\n{entry['value']}"
         if len(copyable_value) > 1024:
             copyable_value = copyable_value[:1020] + "…"
         embed.add_field(name=entry["name"], value=copyable_value, inline=False)
 
+    footer_parts: list[str] = []
     if cat == "heavy":
-        embed.set_footer(
-            text=f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB"
+        footer_parts.append(
+            f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB"
         )
     elif cat == "owner":
-        embed.set_footer(text="All owner commands are restricted to the configured owner ID(s).")
+        footer_parts.append("All owner commands are restricted to the configured owner ID(s).")
+    if total_pages > 1:
+        footer_parts.append(f"Page {page + 1}/{total_pages}")
+    if footer_parts:
+        embed.set_footer(text=" · ".join(footer_parts))
 
-    return embed
+    return embed, page, total_pages
 
 
 def _build_home_embed() -> discord.Embed:
@@ -7983,11 +8053,19 @@ class _HelpSelect(discord.ui.Select):
             )
         try:
             choice = self.values[0]
+            view: _HelpView = self.view  # type: ignore
             if choice == "home":
+                view._cat = None
+                view._page = 0
                 embed = _build_home_embed()
+                view._update_nav_buttons(1)
+                await interaction.response.edit_message(embed=embed, view=view)
             else:
-                embed = _build_help_embed(choice)
-            await interaction.response.edit_message(embed=embed, view=self.view)
+                view._cat = choice
+                view._page = 0
+                embed, _, total = _build_help_embed(choice, page=0)
+                view._update_nav_buttons(total)
+                await interaction.response.edit_message(embed=embed, view=view)
         except Exception as exc:
             try:
                 await interaction.response.send_message(
@@ -7997,15 +8075,52 @@ class _HelpSelect(discord.ui.Select):
                 pass
 
 
+class _HelpNavButton(discord.ui.Button):
+    def __init__(self, direction: int, invoker_id: int, **kwargs):
+        super().__init__(**kwargs)
+        self._direction = direction
+        self._invoker_id = invoker_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self._invoker_id:
+            return await interaction.response.send_message(
+                "Only the person who ran this command can use this menu.", ephemeral=True
+            )
+        view: _HelpView = self.view  # type: ignore
+        view._page = max(0, view._page + self._direction)
+        try:
+            embed, view._page, total = _build_help_embed(view._cat, page=view._page)
+            view._update_nav_buttons(total)
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as exc:
+            try:
+                await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            except Exception:
+                pass
+
+
 class _HelpView(discord.ui.View):
     def __init__(self, invoker_id: int):
         super().__init__(timeout=300)
-        self.add_item(_HelpSelect(invoker_id))
+        self._invoker_id = invoker_id
+        self._cat: str | None = None
+        self._page: int = 0
+
+        self._select = _HelpSelect(invoker_id)
+        self._btn_prev = _HelpNavButton(-1, invoker_id, label="◀ Prev", style=discord.ButtonStyle.secondary, disabled=True)
+        self._btn_next = _HelpNavButton(+1, invoker_id, label="Next ▶", style=discord.ButtonStyle.secondary, disabled=True)
+
+        self.add_item(self._select)
+        self.add_item(self._btn_prev)
+        self.add_item(self._btn_next)
+
+    def _update_nav_buttons(self, total_pages: int) -> None:
+        self._btn_prev.disabled = (self._page <= 0)
+        self._btn_next.disabled = (self._page >= total_pages - 1)
 
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        # message ref not stored — Discord will leave it as-is after timeout
 
 
 @bot.command(name="ihtxhelp", aliases=["bothelp"])
@@ -8025,8 +8140,11 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
                     color=discord.Color.red(),
                 )
             )
-        embed = _build_help_embed(None, results)
-        embed.set_footer(text=f"{len(results)} result(s) for '{query}'")
+        embed, _, total = _build_help_embed(None, results)
+        footer = f"{len(results)} result(s) for '{query}'"
+        if total > 1:
+            footer += f" · Page 1/{total}"
+        embed.set_footer(text=footer)
         return await ctx.reply(embed=embed)
 
     # ── Browse mode ────────────────────────────────────────────────────────
@@ -8038,6 +8156,34 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+
+        "version": "v7.0",
+        "date": "2026-06-30",
+        "heavy": [],
+        "fun": [
+            "**t!ihtxhelp** — heavy commands no longer cause an interaction error. Help embed is now paginated (6 entries per page, ◀ Prev / Next ▶ buttons). All categories benefit from pagination when large.",
+        ],
+        "owner": [],
+    },
+    {
+        "version": "v6.9",
+        "date": "2026-06-30",
+        "heavy": [
+            "**tvsim pipe** — rewrote `_run_tvsim` with new displacement map URL (`file.garden/...tv_sim_displacement_map.mov`). Standalone mode now uses the split filter_complex: left half passes through (gbrp), right half gets `scale=854:854 → {pipeeffects} → displace → scale back → crop back`, then `hstack`. Inside `leftsplit`/`rightsplit` (`_in_split=True`), applies displacement directly to the half-video without re-splitting.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
+        "version": "v6.8",
+        "date": "2026-06-30",
+        "heavy": [
+            "**t!ihtx** — fixed `mirror=left/right/top/bottom` inside `leftsplit`/`rightsplit`: now does a plain `hflip` (left/right) or `vflip` (top/bottom) on the half-video instead of the broken split-within-split crop+stack; inner effects passed with `_in_split=True` context.",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
 
         "version": "v6.7",
