@@ -1803,6 +1803,15 @@ PIPE_EFFECT_NAMES = {
     "scroll",
     "pan",
     "tile",
+    "watermark", "ring", "miui", "reddit",
+    "caption",
+    "orb", "deorb",
+    "vebfisheye2", "vebdefisheye2", "vebfisheye3", "vebdefisheye3",
+    "chromashift",
+    "🥸🥸", "﷽", "𒐫",
+    "gm4", "realgm4",
+    "acontrast", "adestroy", "audioequalizer",
+    "avflip",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -2163,7 +2172,7 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         depth = params[1] if len(params) > 1 else "0.5"
         return f"vibrato=f={freq}:d={depth}"
     if name == "areverse":
-        return "areverse"
+        return "areverse,asetpts=PTS-STARTPTS"
     if name == "alimiter":
         level_in = params[0] if len(params) > 0 else "1"
         limit    = params[1] if len(params) > 1 else "1"
@@ -2188,6 +2197,101 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f":gr={gg.split(':')[0]}:gg={gg.split(':')[1]}:gb={gg.split(':')[2]}"
             f":br={bb.split(':')[0]}:bg={bb.split(':')[1]}:bb={bb.split(':')[2]}"
         )
+    # ── Video effects (TS port) ─────────────────────────────────────────────
+    if name == "caption":
+        raw_text = " ".join(params) if params else ""
+        escaped = raw_text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        return (
+            f"drawtext=text='{escaped}':fontsize=h/15:fontcolor=white"
+            f":borderw=3:bordercolor=black:x=(w-text_w)/2:y=20"
+        )
+    if name == "orb":
+        return (
+            "scroll=0.05,v360=e:hammer,v360=fisheye:22:7,"
+            "scale=iw/2:ih/2,format=yuv444p,"
+            "geq='p((W/2)+(X-(W/2))/1,(H/2)+(Y-(H/2))/1)',"
+            "scale=iw:ih,format=yuv420p"
+        )
+    if name == "deorb":
+        return (
+            "scroll=-0.05,v360=hammer:e,v360=22:fisheye:7,"
+            "scale=iw*2:ih*2,format=yuv444p,"
+            "geq='p((W/2)+(X-(W/2))/1,(H/2)+(Y-(H/2))/1)',"
+            "scale=iw:ih,format=yuv420p"
+        )
+    if name == "vebfisheye2":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=e:hammer", "scale=iw:ih", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "vebdefisheye2":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=hammer:e", "scale=iw:ih", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "vebfisheye3":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=fisheye:22:7", "scale=iw:ih", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "vebdefisheye3":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=22:fisheye:7", "scale=iw*2:ih*2", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "chromashift":
+        return (
+            "format=rgb24,"
+            "geq="
+            "r='p(mod((255-g(X,Y)*0.593*3)+X,W),mod((255-b(X,Y)*0.926*3)+Y,H))'"
+            ":g='p(mod((255-g(X,Y)*0.593*3)+X,W),mod((255-b(X,Y)*0.926*3)+Y,H))'"
+            ":b='p(mod((255-g(X,Y)*0.593*3)+X,W),mod((255-b(X,Y)*0.926*3)+Y,H))',"
+            "format=yuv420p,hue=s=0"
+        )
+    if name == "🥸🥸":
+        return "hue=h=3.14159265"
+    if name == "﷽":
+        return "v360=e:ball,v360=fisheye:22:7"
+    if name == "𒐫":
+        return "v360=ball:hammer"
+    if name == "gm4":
+        return "selectivecolor=blacks='0 0 0 0':whites='1 1 1 1',format=yuv420p"
+    if name == "realgm4":
+        return "curves=all='0/0 0.5/1 1/0'"
+    # ── Audio effects (TS port — used via -af path in _apply_pipe_effects) ──
+    if name == "acontrast":
+        val = params[0] if params else "33"
+        return f"acontrast={val}"
+    if name == "adestroy":
+        return "acontrast=100,acontrast=100,acontrast=100,acontrast=100,acontrast=100"
+    if name == "audioequalizer":
+        bands = [
+            ("40",   params[0] if len(params) > 0 else "0"),
+            ("150",  params[1] if len(params) > 1 else "0"),
+            ("375",  params[2] if len(params) > 2 else "0"),
+            ("1000", params[3] if len(params) > 3 else "0"),
+            ("3000", params[4] if len(params) > 4 else "0"),
+        ]
+        return ",".join(f"equalizer=f={f}:width_type=q:width=1:g={g}" for f, g in bands)
+    if name == "4ormulator":
+        dial = params[0] if params else "712923000"
+        return f"rubberband=tempo=1:formant={dial}:pitch=1"
     return None
 
 
@@ -2426,7 +2530,8 @@ def _apply_pipe_effects(
                 continue
 
             # Named audio filters — rendered immediately
-            if name in ("volume", "vibrato", "areverse", "alimiter"):
+            if name in ("volume", "vibrato", "areverse", "alimiter",
+                        "acontrast", "adestroy", "audioequalizer", "4ormulator"):
                 af = _build_ffmpeg_pipe_vf(name, params)
                 if af:
                     # pcm_s16le is lossless but requires a container that supports it.
@@ -3307,6 +3412,74 @@ def _apply_pipe_effects(
                     ], timeout=120)
                     if not ok:
                         return False, f"rightsplit: audio mux failed: {err}"
+                current = out
+                continue
+
+            # watermark / ring / miui / reddit — overlay a transparent PNG as a watermark
+            if name in ("watermark", "ring", "miui", "reddit"):
+                _WM_DEFAULTS = {
+                    "ring":   "https://files.catbox.moe/r8l5ay.png",
+                    "miui":   "https://files.catbox.moe/z0gkil.png",
+                    "reddit": "https://files.catbox.moe/3ce714.png",
+                }
+                if name == "watermark":
+                    wm_url = params[0] if params else ""
+                    if not wm_url:
+                        return False, "watermark: provide a URL as the parameter"
+                else:
+                    wm_url = params[0] if params else _WM_DEFAULTS[name]
+                wm_path = os.path.join(tmpdir, f"wm_{i}.png")
+                try:
+                    import urllib.request as _ur
+                    import ssl as _ssl
+                    _ssl_ctx = _ssl.create_default_context()
+                    _req = _ur.Request(wm_url, headers={"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot)"})
+                    with _ur.urlopen(_req, context=_ssl_ctx, timeout=30) as _resp:
+                        with open(wm_path, "wb") as _f:
+                            _f.write(_resp.read())
+                except Exception as _wme:
+                    return False, f"{name}: failed to download watermark from {wm_url}: {_wme}"
+                fc = (
+                    "[1:v]format=rgba,loop=loop=-1:size=1[_wmraw];"
+                    "[_wmraw][0:v]scale2ref=w=ref_w:h=ref_h:flags=lanczos[_wm][_vid];"
+                    "[_vid][_wm]overlay=0:0:eof_action=repeat[vout]"
+                )
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-i", wm_path,
+                    "-filter_complex", fc,
+                    "-map", "[vout]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+                if not ok:
+                    return False, f"{name}: ffmpeg overlay failed: {err}"
+                current = out
+                continue
+
+            # avflip — extreme audio warp: rubberband tempo crush + afftfilt + rubberband expand
+            if name == "avflip":
+                _avflip_fc = (
+                    "[0:a]aresample=44100,"
+                    "rubberband=tempo=0.05:smoothing=712923000:window=long,"
+                    "afftfilt=real='real((1216000/b),ch)':imag='imag((1216000/b),ch)'"
+                    ":overlap=1:win_size=65536:win_func=bharris,"
+                    "rubberband=tempo=20:smoothing=712923000:window=long,"
+                    "volume=8,aformat=channel_layouts=mono[aout]"
+                )
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-filter_complex", _avflip_fc,
+                    "-map", "0:v?", "-map", "[aout]",
+                    "-c:v", "copy", "-c:a", "pcm_s16le",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"avflip: ffmpeg failed: {err}"
                 current = out
                 continue
 
@@ -7872,6 +8045,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.7",
+        "date": "2026-06-30",
+        "heavy": [
+            "**t!ihtx** — new video effects: `watermark=<url>` `ring[=url]` `miui` `reddit` (PNG overlay via scale2ref+overlay), `caption=<text>` (drawtext), `orb` / `deorb` (v360 sphere warp), `vebfisheye2/3[=N]` / `vebdefisheye2/3[=N]` (v360 projection, stackable), `chromashift` (RGB channel displacement), `🥸🥸` (hue π), `﷽` / `𒐫` (v360 combos), `gm4` (selectivecolor), `realgm4` (curves invert)",
+            "**t!ihtx** — new audio effects: `acontrast[=N]` (audio contrast), `adestroy` (5× acontrast=100), `audioequalizer=sub|bass|lowmids|mids|highmids` (5-band EQ), `4ormulator[=dial]` (rubberband formant), `avflip` (rubberband crush + afftfilt + expand), `areverse` now adds `asetpts=PTS-STARTPTS` for correct timing",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v6.6",
         "date": "2026-06-29",
