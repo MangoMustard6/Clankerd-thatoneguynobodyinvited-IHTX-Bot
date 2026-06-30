@@ -7967,10 +7967,25 @@ _HELP_CATS = {
 }
 
 
-def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> discord.Embed:
-    """Build a help embed for a category, or for an arbitrary list of entries (search results)."""
+_HELP_PAGE_SIZE = 6  # entries per page — keeps total embed chars well under 6000
+
+
+def _build_help_embed(
+    cat: str | None,
+    entries: list[dict] | None = None,
+    page: int = 0,
+    page_size: int = _HELP_PAGE_SIZE,
+) -> tuple[discord.Embed, int, int]:
+    """Build a paginated help embed.
+
+    Returns (embed, current_page_clamped, total_pages).
+    """
     if entries is None:
         entries = [e for e in _HELP_ENTRIES if e["cat"] == cat]
+
+    total_pages = max(1, -(-len(entries) // page_size))  # ceil division
+    page = max(0, min(page, total_pages - 1))
+    page_entries = entries[page * page_size : (page + 1) * page_size]
 
     if cat and cat in _HELP_CATS:
         title, color = _HELP_CATS[cat]
@@ -7978,20 +7993,25 @@ def _build_help_embed(cat: str | None, entries: list[dict] | None = None) -> dis
         title, color = "🔍 Search Results", discord.Color.gold()
 
     embed = discord.Embed(title=title, color=color)
-    for entry in entries[:25]:
+    for entry in page_entries:
         copyable_value = f"`{entry['name']}`\n{entry['value']}"
         if len(copyable_value) > 1024:
             copyable_value = copyable_value[:1020] + "…"
         embed.add_field(name=entry["name"], value=copyable_value, inline=False)
 
+    footer_parts: list[str] = []
     if cat == "heavy":
-        embed.set_footer(
-            text=f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB"
+        footer_parts.append(
+            f"Formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))} · Max {MAX_FILE_SIZE // (1024*1024)} MB"
         )
     elif cat == "owner":
-        embed.set_footer(text="All owner commands are restricted to the configured owner ID(s).")
+        footer_parts.append("All owner commands are restricted to the configured owner ID(s).")
+    if total_pages > 1:
+        footer_parts.append(f"Page {page + 1}/{total_pages}")
+    if footer_parts:
+        embed.set_footer(text=" · ".join(footer_parts))
 
-    return embed
+    return embed, page, total_pages
 
 
 def _build_home_embed() -> discord.Embed:
@@ -8033,11 +8053,19 @@ class _HelpSelect(discord.ui.Select):
             )
         try:
             choice = self.values[0]
+            view: _HelpView = self.view  # type: ignore
             if choice == "home":
+                view._cat = None
+                view._page = 0
                 embed = _build_home_embed()
+                view._update_nav_buttons(1)
+                await interaction.response.edit_message(embed=embed, view=view)
             else:
-                embed = _build_help_embed(choice)
-            await interaction.response.edit_message(embed=embed, view=self.view)
+                view._cat = choice
+                view._page = 0
+                embed, _, total = _build_help_embed(choice, page=0)
+                view._update_nav_buttons(total)
+                await interaction.response.edit_message(embed=embed, view=view)
         except Exception as exc:
             try:
                 await interaction.response.send_message(
@@ -8047,15 +8075,52 @@ class _HelpSelect(discord.ui.Select):
                 pass
 
 
+class _HelpNavButton(discord.ui.Button):
+    def __init__(self, direction: int, invoker_id: int, **kwargs):
+        super().__init__(**kwargs)
+        self._direction = direction
+        self._invoker_id = invoker_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self._invoker_id:
+            return await interaction.response.send_message(
+                "Only the person who ran this command can use this menu.", ephemeral=True
+            )
+        view: _HelpView = self.view  # type: ignore
+        view._page = max(0, view._page + self._direction)
+        try:
+            embed, view._page, total = _build_help_embed(view._cat, page=view._page)
+            view._update_nav_buttons(total)
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as exc:
+            try:
+                await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            except Exception:
+                pass
+
+
 class _HelpView(discord.ui.View):
     def __init__(self, invoker_id: int):
         super().__init__(timeout=300)
-        self.add_item(_HelpSelect(invoker_id))
+        self._invoker_id = invoker_id
+        self._cat: str | None = None
+        self._page: int = 0
+
+        self._select = _HelpSelect(invoker_id)
+        self._btn_prev = _HelpNavButton(-1, invoker_id, label="◀ Prev", style=discord.ButtonStyle.secondary, disabled=True)
+        self._btn_next = _HelpNavButton(+1, invoker_id, label="Next ▶", style=discord.ButtonStyle.secondary, disabled=True)
+
+        self.add_item(self._select)
+        self.add_item(self._btn_prev)
+        self.add_item(self._btn_next)
+
+    def _update_nav_buttons(self, total_pages: int) -> None:
+        self._btn_prev.disabled = (self._page <= 0)
+        self._btn_next.disabled = (self._page >= total_pages - 1)
 
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        # message ref not stored — Discord will leave it as-is after timeout
 
 
 @bot.command(name="ihtxhelp", aliases=["bothelp"])
@@ -8075,8 +8140,11 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
                     color=discord.Color.red(),
                 )
             )
-        embed = _build_help_embed(None, results)
-        embed.set_footer(text=f"{len(results)} result(s) for '{query}'")
+        embed, _, total = _build_help_embed(None, results)
+        footer = f"{len(results)} result(s) for '{query}'"
+        if total > 1:
+            footer += f" · Page 1/{total}"
+        embed.set_footer(text=footer)
         return await ctx.reply(embed=embed)
 
     # ── Browse mode ────────────────────────────────────────────────────────
@@ -8088,6 +8156,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v7.0",
+        "date": "2026-06-30",
+        "heavy": [],
+        "fun": [
+            "**t!ihtxhelp** — heavy commands no longer cause an interaction error. Help embed is now paginated (6 entries per page, ◀ Prev / Next ▶ buttons). All categories benefit from pagination when large.",
+        ],
+        "owner": [],
+    },
     {
         "version": "v6.9",
         "date": "2026-06-30",
