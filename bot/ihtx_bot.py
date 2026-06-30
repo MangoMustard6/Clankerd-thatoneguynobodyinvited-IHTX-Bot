@@ -1817,7 +1817,6 @@ PIPE_EFFECT_NAMES = {
     "gm4", "realgm4",
     "acontrast", "adestroy", "audioequalizer",
     "avflip",
-    "pinkandgreenrender", "p&g",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -2307,6 +2306,7 @@ def _apply_pipe_effects(
     input_path: str,
     output_path: str,
     effects: list[tuple[str, list[str]]],
+    _in_split: bool = False,
 ) -> tuple[bool, str]:
     """Apply pipe effects sequentially — each effect is rendered individually
     before the next begins (no filter batching).
@@ -2689,6 +2689,24 @@ def _apply_pipe_effects(
                 current = out
                 continue
 
+
+            # Inside a split, mirror=left/right → hflip; top/bottom → vflip
+            # (avoids the split-within-split crop+stack which breaks on half-width video)
+            if _in_split and name == "mirror":
+                _m_dir = (params[0] if params else "").lower().strip()
+                _m_dir = {"l": "left", "r": "right", "t": "top", "b": "bottom"}.get(_m_dir, _m_dir)
+                _m_vf = "vflip" if _m_dir in ("top", "bottom") else "hflip"
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-vf", _m_vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"mirror (split-inner) failed: {err}"
+                current = out
+                continue
 
             # Named video filters — rendered immediately
             vf = _build_ffmpeg_pipe_vf(name, params)
@@ -3283,7 +3301,7 @@ def _apply_pipe_effects(
                     if not ok:
                         return False, f"leftsplit: crop left failed: {err}"
                     # Step 2: Apply inner effects to left half
-                    ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects)
+                    ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects, _in_split=True)
                     if not ok:
                         return False, f"leftsplit: inner effects failed: {err}"
                     # Step 3: hstack left_fx (unchanged) + hflip(left_fx) to create mirror.
@@ -3372,7 +3390,7 @@ def _apply_pipe_effects(
                     if not ok:
                         return False, f"rightsplit: crop right failed: {err}"
                     # Step 3: Apply inner effects to right half
-                    ok, err = _apply_pipe_effects(right_raw, right_fx, inner_effects)
+                    ok, err = _apply_pipe_effects(right_raw, right_fx, inner_effects, _in_split=True)
                     if not ok:
                         return False, f"rightsplit: inner effects failed: {err}"
                     # Step 4: hstack left + right(affected)
@@ -3406,104 +3424,6 @@ def _apply_pipe_effects(
                     ], timeout=120)
                     if not ok:
                         return False, f"rightsplit: audio mux failed: {err}"
-                current = out
-                continue
-
-            # pinkandgreenrender / p&g — two-pass ASF pipe blend with a.mp4 using ffv1+aac
-            # Pass 1: encode input → ASF/H264 pipe → stdout
-            # Pass 2: stdin + a.mp4 (looped) → blend → ffv1 mkv → remux to out
-            if name in ("pinkandgreenrender", "p&g"):
-                _pag_candidates = [
-                    os.path.join(os.getcwd(), "a.mp4"),
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "a.mp4"),
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "a.mp4"),
-                ]
-                _pag_amp4 = next((p for p in _pag_candidates if os.path.isfile(p)), None)
-                if _pag_amp4 is None:
-                    return False, (
-                        "pinkandgreenrender: `a.mp4` not found — place it in the project root "
-                        "or bot/ directory."
-                    )
-                _pag_info = _ffprobe_video_info(current)
-                _pag_w, _pag_h = _pag_info["width"], _pag_info["height"]
-                if _pag_w == 0 or _pag_h == 0:
-                    return False, "pinkandgreenrender: could not read video dimensions"
-                _pag_tmp_mkv = os.path.join(tmpdir, f"pag_{i}.mkv")
-                _pag_cmd1 = [
-                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                    "-i", current,
-                    "-f", "asf", "-c:v", "h264", "-preset", "ultrafast",
-                    "-profile:v", "high444", "-tune", "zerolatency",
-                    "-q:v", "1", "-r", "29.97",
-                    "-x264-params",
-                    "ref=2:slices=4:vbv-maxrate=1000000:vbv-bufsize=500000:pframes=69:weightp=999",
-                    "-bf", "9", "-g", "8", "-crf", "17",
-                    "-c:a", "pcm_s16le", "-ar", "48000",
-                    "pipe:1",
-                ]
-                _pag_cmd2 = [
-                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                    "-f", "asf", "-i", "pipe:0",
-                    "-stream_loop", "-1", "-i", _pag_amp4,
-                    "-af", "atrim=0.0214",
-                    "-filter_complex",
-                    (
-                        f"[0]format=yuvj444p[00];"
-                        f"[1]scale={_pag_w}:{_pag_h},format=yuvj444p[11];"
-                        f"[00][11]blend=shortest=true"
-                    ),
-                    "-pix_fmt", "yuv444p", "-c:v", "ffv1",
-                    "-c:a", "aac", "-aac_coder", "1", "-aac_ms", "1", "-aac_is", "0",
-                    "-b:a", "192K", "-q:a", "1",
-                    _pag_tmp_mkv,
-                ]
-                try:
-                    _pag_proc1 = subprocess.Popen(
-                        _pag_cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                    )
-                    _pag_proc2 = subprocess.Popen(
-                        _pag_cmd2, stdin=_pag_proc1.stdout,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                    )
-                    _pag_proc1.stdout.close()
-                    _pag_out2, _pag_err2 = _pag_proc2.communicate(timeout=600)
-                    _pag_proc1.wait(timeout=60)
-                    _pag_err1 = _pag_proc1.stderr.read()
-                except subprocess.TimeoutExpired:
-                    try:
-                        _pag_proc1.kill()
-                    except Exception:
-                        pass
-                    try:
-                        _pag_proc2.kill()
-                    except Exception:
-                        pass
-                    return False, "pinkandgreenrender: pipeline timed out (600 s)"
-                except Exception as _pag_exc:
-                    return False, f"pinkandgreenrender: pipeline error: {_pag_exc}"
-                if _pag_proc2.returncode != 0:
-                    _pag_e2 = (_pag_err2 or b"").decode("utf-8", errors="replace").strip()
-                    _pag_e1 = (_pag_err1 or b"").decode("utf-8", errors="replace").strip()
-                    return False, f"pinkandgreenrender: second-pass failed: {_pag_e2 or _pag_e1}"
-                if _pag_proc1.returncode != 0:
-                    _pag_e1 = (_pag_err1 or b"").decode("utf-8", errors="replace").strip()
-                    return False, f"pinkandgreenrender: first-pass failed: {_pag_e1}"
-                ok, err = _run_ffmpeg_raw([
-                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                    "-i", _pag_tmp_mkv,
-                    "-c:v", "copy", "-c:a", "copy",
-                    out,
-                ], timeout=120)
-                if not ok:
-                    ok, err = _run_ffmpeg_raw([
-                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                        "-i", _pag_tmp_mkv,
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                        out,
-                    ], timeout=300)
-                    if not ok:
-                        return False, f"pinkandgreenrender: remux failed: {err}"
                 current = out
                 continue
 
@@ -8141,8 +8061,7 @@ _UPDATELOG: list[dict] = [
         "version": "v6.8",
         "date": "2026-06-30",
         "heavy": [
-            "**t!ihtx** — new pipe effect `pinkandgreenrender` (alias `p&g`): two-pass ASF/H264 pipe blend. Pass 1 encodes to H264 ASF (ultrafast, high444, crf 17, pcm_s16le audio) piped to Pass 2 which blends with `a.mp4` (stream-looped) using `blend=shortest=true` on `yuvj444p`, outputs ffv1+aac. Place `a.mp4` in the project root or `bot/` directory.",
-            "**t!setalpha** (aliases: `setpag`, `seta`) — owner-only: download and save a video as `a.mp4` for use with `pinkandgreenrender`/`p&g`. Accepts an attachment, a replied-to attachment, or a direct URL.",
+            "**t!ihtx** — fixed `mirror=left/right/top/bottom` inside `leftsplit`/`rightsplit`: now does a plain `hflip` (left/right) or `vflip` (top/bottom) on the half-video instead of the broken split-within-split crop+stack; inner effects passed with `_in_split=True` context.",
         ],
         "fun": [],
         "owner": [],
@@ -11730,64 +11649,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         return
     print(f"[error] Unhandled command error in {ctx.command}: {type(error).__name__}: {error}")
     raise error
-
-
-@bot.command(name="setalpha", aliases=["setpag", "seta"])
-@commands.check(_is_owner)
-async def setalpha_cmd(ctx: commands.Context, url: str = ""):
-    """Owner-only: save an attached video (or URL) as a.mp4 for pinkandgreenrender / p&g.
-
-      t!setalpha           (with a video file attached)
-      t!setalpha <url>     (direct video URL)
-    """
-    _alpha_dest = os.path.join(os.getcwd(), "a.mp4")
-
-    # Resolve source: attachment > replied-message attachment > explicit URL
-    src_url: str | None = None
-    src_filename: str = "a.mp4"
-
-    if ctx.message.attachments:
-        src_url = ctx.message.attachments[0].url
-        src_filename = ctx.message.attachments[0].filename
-    elif ctx.message.reference:
-        try:
-            _ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            if _ref.attachments:
-                src_url = _ref.attachments[0].url
-                src_filename = _ref.attachments[0].filename
-        except Exception:
-            pass
-    if not src_url and url:
-        src_url = url.strip()
-
-    if not src_url:
-        await ctx.reply(
-            "📎 attach a video file or provide a URL — e.g. `t!setalpha` with an attachment, "
-            "or `t!setalpha https://example.com/clip.mp4`"
-        )
-        return
-
-    status = await ctx.reply(f"⬇️ downloading `{src_filename}` → `a.mp4`…")
-    try:
-        async with aiohttp.ClientSession() as _sess:
-            async with _sess.get(
-                src_url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot)"},
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as _resp:
-                if _resp.status != 200:
-                    await status.edit(content=f"❌ download failed: HTTP {_resp.status}")
-                    return
-                _data = await _resp.read()
-        with open(_alpha_dest, "wb") as _f:
-            _f.write(_data)
-        _size_kb = len(_data) / 1024
-        await status.edit(
-            content=f"✅ saved as `a.mp4` ({_size_kb:.1f} KB) — "
-            f"`pinkandgreenrender` / `p&g` will now use it."
-        )
-    except Exception as _e:
-        await status.edit(content=f"❌ setalpha failed: {_e}")
 
 
 if __name__ == "__main__":
