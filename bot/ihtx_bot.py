@@ -1009,7 +1009,7 @@ def _run_tvsim(
             "-i", input_path,
             "-stream_loop", "-1", "-i", str(_TVSIM_DISPLACE_MAP),
             "-filter_complex", full_fc,
-            "-map", "0:a",
+            "-map", "0:a?",
             "-pix_fmt", "yuv420p",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac",
@@ -7872,6 +7872,16 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v6.6",
+        "date": "2026-06-29",
+        "heavy": [
+            "**t!tvsim** — fixed crash on audio-less inputs (`-map 0:a` → `-map 0:a?`)",
+            "**t!ihtx** — fixed `leftsplit`/`rightsplit` corrupting video after many iterations (removed `-shortest` from audio mux)",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
         "version": "v6.5",
         "date": "2026-06-29",
