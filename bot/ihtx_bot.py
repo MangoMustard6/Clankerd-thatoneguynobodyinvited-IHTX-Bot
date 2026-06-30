@@ -137,7 +137,7 @@ def _is_bot_mod(ctx: commands.Context) -> bool:
 _load_owner_ids()
 
 # Heavy command rate limiting
-HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "download", "dl", "dlv", "chat", "ask", "ai"}
+HEAVY_COMMANDS = {"ihtxgen", "ihtx", "effect", "destroy", "ihtxcustom", "icustom", "preview1280", "p1280", "oppositep1280", "op1280", "preview1280with640x360resize", "p1280ff!3", "p1280w16:9r", "multipitch", "mp", "multi", "lexg", "chat", "ask", "ai"}
 HEAVY_LIMIT_DEFAULT = 20
 HEAVY_LIMIT_OWNER = 5340
 LIMITS_FILE = Path("bot/limits.json")
@@ -992,12 +992,17 @@ def _run_tvsim(
             return False, f"TV simulator displacement map not found: {_TVSIM_DISPLACE_MAP}"
 
         contrast = (1.0 - line_sync) * 2.366666
+        # Cap output to max 854px wide to keep encoding fast regardless of source resolution.
+        # The displacement runs internally at 854×854 anyway; scaling up to 4K just slows encoding.
+        out_w = min(w, 854)
+        out_h = int(round(out_w * h / w / 2) * 2) if w else 480  # even height
+
         base_fc = (
             f"[0]scale=854:854,format=bgr32[00];"
             f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
-            f"eq=contrast={contrast:.6f}:eval=frame,format=bgr32,hue=b=-0.033[x];"
+            f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[x];"
             f"color=s=854x854:c=#808080,format=bgr32[y];"
-            f"[00][x][y]displace=edge=wrap,scale={w}:{h},setsar=1,format=yuv444p"
+            f"[00][x][y]displace=edge=wrap,scale={out_w}:{out_h},setsar=1,format=yuv444p"
         )
         if optional:
             full_fc = base_fc + "," + ",".join(optional)
@@ -1009,14 +1014,14 @@ def _run_tvsim(
             "-i", input_path,
             "-stream_loop", "-1", "-i", str(_TVSIM_DISPLACE_MAP),
             "-filter_complex", full_fc,
-            "-map", "0:a",
+            "-map", "0:a?",
             "-pix_fmt", "yuv420p",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
             "-c:a", "aac",
             output_path,
         ]
 
-    return _run_ffmpeg_raw(cmd, timeout=300)
+    return _run_ffmpeg_raw(cmd, timeout=600)
 
 
 # ---------- Folk Valley ----------
@@ -1803,6 +1808,15 @@ PIPE_EFFECT_NAMES = {
     "scroll",
     "pan",
     "tile",
+    "watermark", "ring", "miui", "reddit",
+    "caption",
+    "orb", "deorb",
+    "vebfisheye2", "vebdefisheye2", "vebfisheye3", "vebdefisheye3",
+    "chromashift",
+    "🥸🥸", "﷽", "𒐫",
+    "gm4", "realgm4",
+    "acontrast", "adestroy", "audioequalizer",
+    "avflip",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -1888,6 +1902,16 @@ def _parse_pipe_effects(pipe_str: str) -> list[tuple[str, list[str]]]:
                 current_name = None
                 current_params = []
             effects.append(("ffmpeg", [ffmpeg_m.group(1).strip()]))
+            continue
+
+        # leftsplit(...) / rightsplit(...) — inner effects in parens
+        split_m = re.match(r'^(leftsplit|rightsplit)\s*\((.+)\)\s*$', part, re.IGNORECASE | re.DOTALL)
+        if split_m:
+            if current_name is not None:
+                effects.append((current_name, current_params))
+                current_name = None
+                current_params = []
+            effects.append((split_m.group(1).lower(), [split_m.group(2).strip()]))
             continue
 
         if "=" in part:
@@ -2153,7 +2177,7 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
         depth = params[1] if len(params) > 1 else "0.5"
         return f"vibrato=f={freq}:d={depth}"
     if name == "areverse":
-        return "areverse"
+        return "areverse,asetpts=PTS-STARTPTS"
     if name == "alimiter":
         level_in = params[0] if len(params) > 0 else "1"
         limit    = params[1] if len(params) > 1 else "1"
@@ -2178,6 +2202,101 @@ def _build_ffmpeg_pipe_vf(name: str, params: list[str]) -> str | None:
             f":gr={gg.split(':')[0]}:gg={gg.split(':')[1]}:gb={gg.split(':')[2]}"
             f":br={bb.split(':')[0]}:bg={bb.split(':')[1]}:bb={bb.split(':')[2]}"
         )
+    # ── Video effects (TS port) ─────────────────────────────────────────────
+    if name == "caption":
+        raw_text = " ".join(params) if params else ""
+        escaped = raw_text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        return (
+            f"drawtext=text='{escaped}':fontsize=h/15:fontcolor=white"
+            f":borderw=3:bordercolor=black:x=(w-text_w)/2:y=20"
+        )
+    if name == "orb":
+        return (
+            "scroll=0.05,v360=e:hammer,v360=fisheye:22:7,"
+            "scale=iw/2:ih/2,format=yuv444p,"
+            "geq='p((W/2)+(X-(W/2))/1,(H/2)+(Y-(H/2))/1)',"
+            "scale=iw:ih,format=yuv420p"
+        )
+    if name == "deorb":
+        return (
+            "scroll=-0.05,v360=hammer:e,v360=22:fisheye:7,"
+            "scale=iw*2:ih*2,format=yuv444p,"
+            "geq='p((W/2)+(X-(W/2))/1,(H/2)+(Y-(H/2))/1)',"
+            "scale=iw:ih,format=yuv420p"
+        )
+    if name == "vebfisheye2":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=e:hammer", "scale=iw:ih", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "vebdefisheye2":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=hammer:e", "scale=iw:ih", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "vebfisheye3":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=fisheye:22:7", "scale=iw:ih", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "vebdefisheye3":
+        try:
+            count = max(1, min(int(params[0]), 10)) if params else 1
+        except (ValueError, TypeError):
+            count = 1
+        parts = []
+        for _ in range(count):
+            parts += ["v360=22:fisheye:7", "scale=iw*2:ih*2", "setsar=1:1"]
+        return ",".join(parts)
+    if name == "chromashift":
+        return (
+            "format=rgb24,"
+            "geq="
+            "r='p(mod((255-g(X,Y)*0.593*3)+X,W),mod((255-b(X,Y)*0.926*3)+Y,H))'"
+            ":g='p(mod((255-g(X,Y)*0.593*3)+X,W),mod((255-b(X,Y)*0.926*3)+Y,H))'"
+            ":b='p(mod((255-g(X,Y)*0.593*3)+X,W),mod((255-b(X,Y)*0.926*3)+Y,H))',"
+            "format=yuv420p,hue=s=0"
+        )
+    if name == "🥸🥸":
+        return "hue=h=3.14159265"
+    if name == "﷽":
+        return "v360=e:ball,v360=fisheye:22:7"
+    if name == "𒐫":
+        return "v360=ball:hammer"
+    if name == "gm4":
+        return "selectivecolor=blacks='0 0 0 0':whites='1 1 1 1',format=yuv420p"
+    if name == "realgm4":
+        return "curves=all='0/0 0.5/1 1/0'"
+    # ── Audio effects (TS port — used via -af path in _apply_pipe_effects) ──
+    if name == "acontrast":
+        val = params[0] if params else "33"
+        return f"acontrast={val}"
+    if name == "adestroy":
+        return "acontrast=100,acontrast=100,acontrast=100,acontrast=100,acontrast=100"
+    if name == "audioequalizer":
+        bands = [
+            ("40",   params[0] if len(params) > 0 else "0"),
+            ("150",  params[1] if len(params) > 1 else "0"),
+            ("375",  params[2] if len(params) > 2 else "0"),
+            ("1000", params[3] if len(params) > 3 else "0"),
+            ("3000", params[4] if len(params) > 4 else "0"),
+        ]
+        return ",".join(f"equalizer=f={f}:width_type=q:width=1:g={g}" for f, g in bands)
+    if name == "4ormulator":
+        dial = params[0] if params else "712923000"
+        return f"rubberband=tempo=1:formant={dial}:pitch=1"
     return None
 
 
@@ -2416,7 +2535,8 @@ def _apply_pipe_effects(
                 continue
 
             # Named audio filters — rendered immediately
-            if name in ("volume", "vibrato", "areverse", "alimiter"):
+            if name in ("volume", "vibrato", "areverse", "alimiter",
+                        "acontrast", "adestroy", "audioequalizer", "4ormulator"):
                 af = _build_ffmpeg_pipe_vf(name, params)
                 if af:
                     # pcm_s16le is lossless but requires a container that supports it.
@@ -3127,7 +3247,7 @@ def _apply_pipe_effects(
             # Process: split → crop left half → apply inner effects to left half →
             #          crop right half → hstack (with hflip for mirror effect)
             if name == "leftsplit":
-                inner_str = ";".join(params) if params else ""
+                inner_str = params[0] if params else ""
                 if not inner_str:
                     # No inner effects — just pass through
                     if current != out:
@@ -3150,7 +3270,6 @@ def _apply_pipe_effects(
                 with tempfile.TemporaryDirectory() as split_tmp:
                     left_raw = os.path.join(split_tmp, "left_raw.mp4")
                     left_fx = os.path.join(split_tmp, "left_fx.mp4")
-                    right_raw = os.path.join(split_tmp, "right_raw.mp4")
                     # Step 1: Extract left half
                     ok, err = _run_ffmpeg_raw([
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
@@ -3166,24 +3285,13 @@ def _apply_pipe_effects(
                     ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects)
                     if not ok:
                         return False, f"leftsplit: inner effects failed: {err}"
-                    # Step 3: Extract right half (no effects)
-                    ok, err = _run_ffmpeg_raw([
-                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                        "-i", current,
-                        "-vf", f"crop={half_w}:{h}:{half_w}:0",
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                        "-pix_fmt", "yuv420p", "-c:a", "copy",
-                        right_raw,
-                    ], timeout=300)
-                    if not ok:
-                        return False, f"leftsplit: crop right failed: {err}"
-                    # Step 4: hflip left half, then hstack left(hflipped)+right
+                    # Step 3: hstack left_fx (unchanged) + hflip(left_fx) to create mirror.
+                    # right_raw is not used — the right side is the processed left reflected.
                     ok, err = _run_ffmpeg_raw([
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                         "-i", left_fx,
-                        "-i", right_raw,
                         "-filter_complex",
-                        f"[0:v]hflip[lflipped];[lflipped][1:v]hstack=inputs=2[vout]",
+                        "[0:v]split[l][r];[r]hflip[rflipped];[l][rflipped]hstack=inputs=2[vout]",
                         "-map", "[vout]",
                         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                         "-pix_fmt", "yuv420p",
@@ -3192,22 +3300,22 @@ def _apply_pipe_effects(
                     ], timeout=300)
                     if not ok:
                         return False, f"leftsplit: hstack failed: {err}"
-                # Copy audio from original
-                has_audio = bool(info.get("audio_codec"))
-                if has_audio:
-                    with tempfile.TemporaryDirectory() as mux_tmp:
-                        muted_out = os.path.join(mux_tmp, "muted.mp4")
-                        os.replace(out, muted_out)
-                        ok, err = _run_ffmpeg_raw([
-                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                            "-i", muted_out,
-                            "-i", current,
-                            "-map", "0:v", "-map", "1:a",
-                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                            out,
-                        ], timeout=120)
-                        if not ok:
-                            return False, f"leftsplit: audio mux failed: {err}"
+                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream.
+                # Do NOT use -shortest: it causes compounding duration truncation across iterations,
+                # eventually producing a 0-duration/unreadable file. Let the video drive duration.
+                with tempfile.TemporaryDirectory() as mux_tmp:
+                    muted_out = os.path.join(mux_tmp, "muted.mp4")
+                    os.replace(out, muted_out)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", muted_out,
+                        "-i", current,
+                        "-map", "0:v", "-map", "1:a?",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                        out,
+                    ], timeout=120)
+                    if not ok:
+                        return False, f"leftsplit: audio mux failed: {err}"
                 current = out
                 continue
 
@@ -3217,7 +3325,7 @@ def _apply_pipe_effects(
             # Process: split → crop right half → apply inner effects to right half →
             #          crop left half → hstack left+right(affected)
             if name == "rightsplit":
-                inner_str = ";".join(params) if params else ""
+                inner_str = params[0] if params else ""
                 if not inner_str:
                     if current != out:
                         import shutil as _shutil
@@ -3281,22 +3389,90 @@ def _apply_pipe_effects(
                     ], timeout=300)
                     if not ok:
                         return False, f"rightsplit: hstack failed: {err}"
-                # Copy audio from original
-                has_audio = bool(info.get("audio_codec"))
-                if has_audio:
-                    with tempfile.TemporaryDirectory() as mux_tmp:
-                        muted_out = os.path.join(mux_tmp, "muted.mp4")
-                        os.replace(out, muted_out)
-                        ok, err = _run_ffmpeg_raw([
-                            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                            "-i", muted_out,
-                            "-i", current,
-                            "-map", "0:v", "-map", "1:a",
-                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                            out,
-                        ], timeout=120)
-                        if not ok:
-                            return False, f"rightsplit: audio mux failed: {err}"
+                # Always mux audio from the original input; -map 1:a? is a no-op if no audio stream.
+                # Do NOT use -shortest: it causes compounding duration truncation across iterations,
+                # eventually producing a 0-duration/unreadable file. Let the video drive duration.
+                with tempfile.TemporaryDirectory() as mux_tmp:
+                    muted_out = os.path.join(mux_tmp, "muted.mp4")
+                    os.replace(out, muted_out)
+                    ok, err = _run_ffmpeg_raw([
+                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                        "-i", muted_out,
+                        "-i", current,
+                        "-map", "0:v", "-map", "1:a?",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                        out,
+                    ], timeout=120)
+                    if not ok:
+                        return False, f"rightsplit: audio mux failed: {err}"
+                current = out
+                continue
+
+            # watermark / ring / miui / reddit — overlay a transparent PNG as a watermark
+            if name in ("watermark", "ring", "miui", "reddit"):
+                _WM_DEFAULTS = {
+                    "ring":   "https://files.catbox.moe/r8l5ay.png",
+                    "miui":   "https://files.catbox.moe/z0gkil.png",
+                    "reddit": "https://files.catbox.moe/3ce714.png",
+                }
+                if name == "watermark":
+                    wm_url = params[0] if params else ""
+                    if not wm_url:
+                        return False, "watermark: provide a URL as the parameter"
+                else:
+                    wm_url = params[0] if params else _WM_DEFAULTS[name]
+                wm_path = os.path.join(tmpdir, f"wm_{i}.png")
+                try:
+                    import urllib.request as _ur
+                    import ssl as _ssl
+                    _ssl_ctx = _ssl.create_default_context()
+                    _req = _ur.Request(wm_url, headers={"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot)"})
+                    with _ur.urlopen(_req, context=_ssl_ctx, timeout=30) as _resp:
+                        with open(wm_path, "wb") as _f:
+                            _f.write(_resp.read())
+                except Exception as _wme:
+                    return False, f"{name}: failed to download watermark from {wm_url}: {_wme}"
+                fc = (
+                    "[1:v]format=rgba,loop=loop=-1:size=1[_wmraw];"
+                    "[_wmraw][0:v]scale2ref=w=ref_w:h=ref_h:flags=lanczos[_wm][_vid];"
+                    "[_vid][_wm]overlay=0:0:eof_action=repeat[vout]"
+                )
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-i", wm_path,
+                    "-filter_complex", fc,
+                    "-map", "[vout]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+                if not ok:
+                    return False, f"{name}: ffmpeg overlay failed: {err}"
+                current = out
+                continue
+
+            # avflip — extreme audio warp: rubberband tempo crush + afftfilt + rubberband expand
+            if name == "avflip":
+                _avflip_fc = (
+                    "[0:a]aresample=44100,"
+                    "rubberband=tempo=0.05:smoothing=712923000:window=long,"
+                    "afftfilt=real='real((1216000/b),ch)':imag='imag((1216000/b),ch)'"
+                    ":overlap=1:win_size=65536:win_func=bharris,"
+                    "rubberband=tempo=20:smoothing=712923000:window=long,"
+                    "volume=8,aformat=channel_layouts=mono[aout]"
+                )
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current,
+                    "-filter_complex", _avflip_fc,
+                    "-map", "0:v?", "-map", "[aout]",
+                    "-c:v", "copy", "-c:a", "pcm_s16le",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=180)
+                if not ok:
+                    return False, f"avflip: ffmpeg failed: {err}"
                 current = out
                 continue
 
@@ -7320,7 +7496,7 @@ _HELP_ENTRIES: list[dict] = [
             "`saturation=<val>` `swapuv` `invlum` `invertrgb=r;g;b` `gm91deform` `randomjitter=<strength>`\n"
             "**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`\n"
             "**Scroll:** `scroll=hpos=V` · `scroll=hpos=V;ypos=V` · `scroll=h;v` (continuous) · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n"
-            "**Split:** `leftsplit=<inner_effects>` · `rightsplit=<inner_effects>` — apply inner effects to one half, mirror/combine\n"
+            "**Split:** `leftsplit(<inner_effects>)` · `rightsplit(<inner_effects>)` — apply inner effects to one half, mirror/combine\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
@@ -7440,10 +7616,10 @@ _HELP_ENTRIES: list[dict] = [
         "name": "leftsplit / rightsplit pipe effects",
         "value": (
             "Split the video in half, apply inner effects to one half, then recombine.\\n"
-            "\u2022 **leftsplit=<effects>** \u2014 apply inner effects to left half, then hflip+hstack with right half\\n"
-            "\u2022 **rightsplit=<effects>** \u2014 apply inner effects to right half, then hstack with left half\\n"
-            "Example: `t!ihtx 3 1.0 - mp4 leftsplit=grayscale`\\n"
-            "Example (chained): `t!ihtx 3 1.0 - mp4 rightsplit=huehsv=0.5;brightness=0.2`"
+            "\u2022 **leftsplit(<effects>)** \u2014 apply inner effects to left half, then hflip+hstack with right half\\n"
+            "\u2022 **rightsplit(<effects>)** \u2014 apply inner effects to right half, then hstack with left half\\n"
+            "Example: `t!ihtx 3 1.0 - mp4 leftsplit(grayscale)`\\n"
+            "Example (chained): `t!ihtx 3 1.0 - mp4 rightsplit(huehsv=0.5,brightness=0.2)`"
         ),
     },
     {
@@ -7591,11 +7767,6 @@ _HELP_ENTRIES: list[dict] = [
         "cat": "fun",
         "name": "t!trim <start> <end>",
         "value": "Trim audio, video, or GIF. Supports HH:MM:SS.frac and plain seconds.",
-    },
-    {
-        "cat": "fun",
-        "name": "t!dl <url>  (aliases: dv, download, dlv)",
-        "value": "Download a video or image from a URL and upload it to Discord.",
     },
     {
         "cat": "fun",
@@ -7868,13 +8039,39 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+
+        "version": "v6.7",
+        "date": "2026-06-30",
+        "heavy": [
+            "**t!ihtx** — new video effects: `watermark=<url>` `ring[=url]` `miui` `reddit` (PNG overlay via scale2ref+overlay), `caption=<text>` (drawtext), `orb` / `deorb` (v360 sphere warp), `vebfisheye2/3[=N]` / `vebdefisheye2/3[=N]` (v360 projection, stackable), `chromashift` (RGB channel displacement), `🥸🥸` (hue π), `﷽` / `𒐫` (v360 combos), `gm4` (selectivecolor), `realgm4` (curves invert)",
+            "**t!ihtx** — new audio effects: `acontrast[=N]` (audio contrast), `adestroy` (5× acontrast=100), `audioequalizer=sub|bass|lowmids|mids|highmids` (5-band EQ), `4ormulator[=dial]` (rubberband formant), `avflip` (rubberband crush + afftfilt + expand), `areverse` now adds `asetpts=PTS-STARTPTS` for correct timing",
+            "**t!tvsim / tvsim pipe** — fixed timeout: removed `eval=frame` from eq filter, capped output to max 854 px wide (displacement runs at 854×854 internally anyway), switched preset to `veryfast`, timeout raised 300 → 600 s",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
+        "version": "v6.6",
+        "date": "2026-06-29",
+        "heavy": [
+            "**t!tvsim** — fixed crash on audio-less inputs (`-map 0:a` → `-map 0:a?`)",
+            "**t!ihtx** — fixed `leftsplit`/`rightsplit` corrupting video after many iterations (removed `-shortest` from audio mux)",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
         "version": "v6.5",
         "date": "2026-06-29",
-        "heavy": [],
-        "fun": [],
-        "owner": [
-            "**t!dl / t!download** — Improved yt-dlp error handling: specific user-friendly messages for common failures (video not available, private, age-restricted, geo-blocked, copyright takedown, live stream, premium-only, playlists). Added --no-playlist and --age-limit flags. Errors are no longer silently swallowed.",
+        "heavy": [
+            "**t!ihtx** — `leftsplit` and `rightsplit` now use paren syntax: `leftsplit(filters)` / `rightsplit(filters)` — inner effects are comma-separated just like the outer pipe",
+            "**t!ihtx** — fixed `leftsplit`/`rightsplit` producing silent output (audio was never muxed back due to missing `audio_codec` field in ffprobe result)",
         ],
+        "fun": [
+            "**t!dl / t!dlv** — removed; replaced by **t!ytdl** (TypeScript bot) — supports URLs and search queries, auto-uploads to catbox if file exceeds Discord limit",
+        ],
+        "owner": [],
+
     },
     {
         "version": "v6.4",
@@ -8546,133 +8743,6 @@ async def lexg_command(ctx: commands.Context, duration: float = 5.0):
             await status_msg.edit(content=f"❌ Failed to upload: {e}")
 
 
-# ---------- Download video ----------
-
-@bot.command(name="dl", aliases=["dv", "download", "dlv"])
-async def dl_command(ctx: commands.Context, url: str = ""):
-    """Download a video or image from a URL.
-
-    Works with:
-    - Direct video/image links
-    - YouTube, TikTok, etc (via yt-dlp if available)
-    - Images too
-    """
-    # If no URL provided, try to get one from message content
-    if not url:
-        if ctx.message:
-            # Try to find a URL in the message content
-            parts = ctx.message.content.split()
-            for p in parts[1:]:  # Skip command name
-                if p.startswith("http://") or p.startswith("https://"):
-                    url = p
-                    break
-
-    if not url:
-        await ctx.reply(
-            "**t!dl** — Download a video or image from a URL.\n\n"
-            "Usage:\n"
-            "`t!dl <url>`\n"
-            "`t!dlv https://youtube.com/watch?v=...`\n"
-            "`t!dl https://example.com/image.png`\n\n"
-            "Aliases: `t!dv`, `t!dlv`, `t!download`"
-        )
-        return
-
-    status_msg = await ctx.reply(f"\u2699\ufe0f Downloading from URL...")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Try yt-dlp first if it's a video URL
-        if yt_dlp and re.search(r"(youtube|youtu\.be|tiktok|x\.com|twitter|instagram|reddit|vimeo|twitch|fb\.watch|facebook|bilibili)", url, re.I):
-            try:
-                output_path = os.path.join(tmpdir, "downloaded")
-                ydl_opts = {
-                    "format": "best[filesize<25M]/bestvideo[height<=720][filesize<25M]+bestaudio/best[filesize<25M]/best",
-                    "outtmpl": output_path + ".%(ext)s",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "max_filesize": MAX_FILE_SIZE,
-                    "cookiefile": None,
-                    "noplaylist": True,
-                    "age_limit": 99,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    downloaded = ydl.prepare_filename(info)
-                    if os.path.exists(downloaded):
-                        out_size = os.path.getsize(downloaded)
-                        if out_size > MAX_FILE_SIZE:
-                            await status_msg.edit(content="\u274c Downloaded file too large (>25 MB).")
-                            return
-                        filename = os.path.basename(downloaded)
-                        await ctx.reply(
-                            content=f"\u2705 Downloaded via yt-dlp: `{info.get('title', 'Untitled')}`",
-                            file=discord.File(downloaded, filename=filename),
-                        )
-                        await status_msg.delete()
-                        return
-            except Exception as e:
-                err_msg = str(e).strip()
-                # Classify common yt-dlp errors and show user-friendly messages
-                if "not available" in err_msg.lower() or "not found" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c This video is not available. It may have been removed or made private.\n-# `{err_msg[:200]}`")
-                    return
-                elif "private" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c This video is private and cannot be downloaded.\n-# `{err_msg[:200]}`")
-                    return
-                elif "age" in err_msg.lower() or "sign in" in err_msg.lower() or "inappropriate" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c This video is age-restricted and cannot be downloaded without authentication.\n-# `{err_msg[:200]}`")
-                    return
-                elif "geo" in err_msg.lower() or "country" in err_msg.lower() or "region" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c This video is geo-blocked and not available in this region.\n-# `{err_msg[:200]}`")
-                    return
-                elif "copyright" in err_msg.lower() or "takedown" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c This video has been removed due to a copyright claim.\n-# `{err_msg[:200]}`")
-                    return
-                elif "live" in err_msg.lower() and ("stream" in err_msg.lower() or "broadcast" in err_msg.lower()):
-                    await status_msg.edit(content=f"\u274c Live streams cannot be downloaded while in progress.\n-# `{err_msg[:200]}`")
-                    return
-                elif "premium" in err_msg.lower() or "members" in err_msg.lower() or "subscriber" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c This video requires a premium/membership and cannot be downloaded.\n-# `{err_msg[:200]}`")
-                    return
-                elif "format" in err_msg.lower() and ("not found" in err_msg.lower() or "requested" in err_msg.lower()):
-                    # Format issue — try falling back to direct download
-                    pass
-                elif "playlist" in err_msg.lower():
-                    await status_msg.edit(content=f"\u274c Playlists are not supported. Please provide a single video URL.\n-# `{err_msg[:200]}`")
-                    return
-                else:
-                    # Generic yt-dlp error — show it to the user rather than silently falling back
-                    await status_msg.edit(content=f"\u274c yt-dlp download failed: {err_msg[:300]}")
-                    return
-
-        # Direct download
-        try:
-            import urllib.request
-            import ssl
-            ssl_ctx = ssl.create_default_context()
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            )
-            # Try to guess extension from URL
-            parsed = urllib.parse.urlparse(url)
-            ext = Path(parsed.path).suffix or ".mp4"
-            output_path = os.path.join(tmpdir, f"downloaded{ext}")
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as resp:
-                with open(output_path, "wb") as f:
-                    f.write(resp.read())
-            out_size = os.path.getsize(output_path)
-            if out_size > MAX_FILE_SIZE:
-                await status_msg.edit(content="\u274c Downloaded file too large (>25 MB).")
-                return
-            filename = os.path.basename(output_path)
-            await ctx.reply(
-                content=f"\u2705 Downloaded from URL!",
-                file=discord.File(output_path, filename=filename),
-            )
-            await status_msg.delete()
-        except Exception as e:
-            await status_msg.edit(content=f"\u274c Failed to download: {e}")
 
 
 # ---------- Owner-only moderation / utility commands ----------
@@ -9533,7 +9603,7 @@ Heavy (media processing):
 - t!lexg — re-apply last export effect chain to new media
 
 Downloads & Upload:
-- t!dl <url> — download video/image from URL
+- t!ytdl <url or search> — download video from YouTube/URL or search query (TypeScript bot)
 - t!catbox — upload file to catbox.moe (up to 200 MB)
 
 AI & Chat:
