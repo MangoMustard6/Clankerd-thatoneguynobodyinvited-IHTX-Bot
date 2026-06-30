@@ -1847,6 +1847,7 @@ PIPE_EFFECT_NAMES = {
     "gm4", "realgm4",
     "acontrast", "adestroy", "audioequalizer",
     "avflip",
+    "nepeta",
 }
 
 def _split_effect_params(value: str) -> list[str]:
@@ -3499,6 +3500,42 @@ def _apply_pipe_effects(
                 ok, err = _run_ffmpeg_raw(cmd, timeout=120)
                 if not ok:
                     return False, f"{name}: ffmpeg overlay failed: {err}"
+                current = out
+                continue
+
+            # nepeta — overlay the Nepeta cat-ear PNG (or custom URL) scaled to video dims
+            if name == "nepeta":
+                _NEPETA_DEFAULT_URL = "https://files.catbox.moe/i4d60t.png"
+                nepeta_url = params[0] if params else _NEPETA_DEFAULT_URL
+                nepeta_path = os.path.join(tmpdir, f"nepeta_{i}.png")
+                try:
+                    import urllib.request as _ur
+                    import ssl as _ssl
+                    _ssl_ctx = _ssl.create_default_context()
+                    _req = _ur.Request(nepeta_url, headers={"User-Agent": "Mozilla/5.0 (compatible; IHTX-Bot)"})
+                    with _ur.urlopen(_req, context=_ssl_ctx, timeout=30) as _resp:
+                        with open(nepeta_path, "wb") as _f:
+                            _f.write(_resp.read())
+                except Exception as _ne:
+                    return False, f"nepeta: failed to download overlay from {nepeta_url}: {_ne}"
+                fc = (
+                    "[1:v]format=rgba,loop=loop=-1:size=1[_nepeta];"
+                    "[_nepeta][0:v]scale2ref=w=ref_w:h=ref_h:flags=lanczos[_nimg][_vid];"
+                    "[_vid][_nimg]overlay=0:0:eof_action=repeat[vout]"
+                )
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+                    "-i", current, "-i", nepeta_path,
+                    "-filter_complex", fc,
+                    "-map", "[vout]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy",
+                    "-shortest",
+                    out,
+                ]
+                ok, err = _run_ffmpeg_raw(cmd, timeout=120)
+                if not ok:
+                    return False, f"nepeta: ffmpeg overlay failed: {err}"
                 current = out
                 continue
 
@@ -7552,6 +7589,7 @@ _HELP_ENTRIES: list[dict] = [
             "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
             "**Swirl:** `swirl=strength[;radius;xc;yc;fallout;is1to1]`\n"
             "**Aesthetics:** `folkvalley` / `fv` — music replacement + brightness + overlay\n"
+            "**Overlay:** `nepeta[=url]` (cat-ear PNG or custom image scaled to video) `watermark=<url>` `ring[=url]` `miui` `reddit` `caption=<text>`\n"
             "**Raw / FX:** `ffmpeg(<args>)` `frei0r=plugin:params` `lut=<url>` `speed=<factor>`"
         ),
     },
@@ -7680,6 +7718,17 @@ _HELP_ENTRIES: list[dict] = [
             "\u2022 **amt** \u2014 zoom multiplier (default 2.0, must be > 0.1)\\n"
             "Example: `t!ihtx 3 1.0 - mp4 zoom=2`\\n"
             "Example (subtle): `t!ihtx 3 1.0 - mp4 zoom=1.5`"
+        ),
+    },
+    {
+        "cat": "heavy",
+        "name": "nepeta pipe effect  (nepeta[=url])",
+        "value": (
+            "Overlay the Nepeta cat-ear PNG (or a custom image URL) scaled to fit the video dimensions.\\n"
+            "The image loops for the entire video duration; -shortest ensures the output ends when the video track ends.\\n"
+            "\u2022 **url** (optional) \u2014 custom PNG/JPG overlay URL (default: Nepeta cat-ear image)\\n"
+            "Example: `t!ihtx 1 5 - mp4 nepeta`\\n"
+            "Example (custom): `t!ihtx 1 5 - mp4 nepeta=https://example.com/my-overlay.png`"
         ),
     },
     {
@@ -8156,6 +8205,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 # ---------- Update Log ----------
 
 _UPDATELOG: list[dict] = [
+    {
+        "version": "v7.1",
+        "date": "2026-06-30",
+        "heavy": [
+            "**t!ihtx** — new pipe effect: `nepeta[=url]` — overlays the Nepeta cat-ear PNG (or custom image URL) scaled to fit the video dimensions, with `-shortest` to handle short videos correctly",
+        ],
+        "fun": [],
+        "owner": [],
+    },
     {
 
         "version": "v7.0",

@@ -45,6 +45,7 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
             '**Distortion:** `mirror=<deg|preset>` `zoom=<amt>` `ripple=spd|freq|amp|phase` `pan=px|py` `tile=tx|ty` `pinch&punch=str;r;cx;cy` `shake=<h>|<v>` `wave=hSpd|hFreq|hAmp|hPhase|vSpd|vFreq|vAmp|vPhase[|sep][|noclip]`',
             '**Scroll:** `scroll=hpos=V` · `scroll=h;v` · `scroll=x1:y1:x2:y2[:dur]` (animated pan)\n**Split:** `leftsplit(<inner>)` · `rightsplit(<inner>)` — apply inner effects to one half\n**Reverse:** `vreverse` (frames) · `areverse` (audio)',
             '**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio`',
+            '**Overlay:** `nepeta[=url]` (cat-ear PNG or custom image scaled to video) `watermark=<url>` `ring[=url]` `miui` `reddit` `caption=<text>`',
             '**Plugins:** `frei0r=plugin:params` `lut=<url>` `speed=<factor>` `ffmpeg(<args>)`',
           ].join('\n'),
         },

@@ -580,3 +580,65 @@ export async function applyRightSplit(
     ctx.outputFile,
   ], { timeout: ctx.timeout || PROCESS_TIMEOUTS.FFMPEG_MS });
 }
+
+// ── Nepeta overlay ──────────────────────────────────────────────────────
+// Overlays the Nepeta cat-ear PNG (or custom URL) scaled to video dimensions.
+// The PNG loops for the entire video duration; -shortest ensures the output
+// ends when the video track ends (fixes the "video goes short" case).
+
+const NEPETA_DEFAULT_URL = 'https://files.catbox.moe/i4d60t.png';
+
+export async function applyNepeta(
+  ctx: ProcessorContext,
+  imageUrl?: string,
+): Promise<void> {
+  const url = imageUrl || NEPETA_DEFAULT_URL;
+
+  // Download the overlay image to a temp file
+  const https = await import('node:https');
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const tmpDir = os.tmpdir();
+  const imgPath = path.join(tmpDir, `nepeta_${Date.now()}.png`);
+
+  await new Promise<void>((resolve, reject) => {
+    const file = fs.createWriteStream(imgPath);
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IHTX-Bot)' } }, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        // Follow redirect
+        https.get(res.headers.location, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IHTX-Bot)' } }, (res2) => {
+          res2.pipe(file);
+          file.on('finish', () => { file.close(); resolve(); });
+        }).on('error', reject);
+      } else {
+        res.pipe(file);
+        file.on('finish', () => { file.close(); resolve(); });
+      }
+    }).on('error', reject);
+  });
+
+  // Build filter_complex: loop the PNG, scale2ref to video dims, overlay at (0,0)
+  const fc = [
+    '[1:v]format=rgba,loop=loop=-1:size=1[_nepeta];',
+    '[_nepeta][0:v]scale2ref=w=ref_w:h=ref_h:flags=lanczos[_nimg][_vid];',
+    '[_vid][_nimg]overlay=0:0:eof_action=repeat[vout]',
+  ].join('');
+
+  await spawnAsync('ffmpeg', [
+    '-loglevel', 'error', '-hide_banner', '-y',
+    '-i', ctx.inputFile,
+    '-i', imgPath,
+    '-filter_complex', fc,
+    '-map', '[vout]',
+    '-map', '0:a?',
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'copy',
+    '-shortest',
+    ctx.outputFile,
+  ], { timeout: ctx.timeout || PROCESS_TIMEOUTS.FFMPEG_MS });
+
+  // Cleanup temp image
+  try { fs.unlinkSync(imgPath); } catch {}
+}
