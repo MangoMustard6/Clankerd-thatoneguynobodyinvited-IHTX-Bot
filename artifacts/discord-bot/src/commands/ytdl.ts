@@ -66,6 +66,7 @@ export async function runYtdl(message: Message): Promise<void> {
       "--max-filesize", "200m",
       "--output", outTemplate,
       "--no-warnings",
+      "--age-limit", "99",
       "--socket-timeout", "30",
       "--extractor-args", "youtube:player_client=ios,android_vr,web_embedded,tv_embedded",
     ];
@@ -111,7 +112,27 @@ export async function runYtdl(message: Message): Promise<void> {
   } catch (err) {
     logger.error({ err }, "t!ytdl failed");
     const msg = err instanceof Error ? err.message : "Unknown error";
-    await statusMsg.edit(`❌ Download failed: \`${msg.slice(0, 400)}\``);
+    const msgLower = msg.toLowerCase();
+    // Classify common yt-dlp errors into user-friendly messages
+    if (msgLower.includes("not available") || msgLower.includes("not found")) {
+      await statusMsg.edit(`❌ This video is not available. It may have been removed or made private.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("private")) {
+      await statusMsg.edit(`❌ This video is private and cannot be downloaded.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("age") || msgLower.includes("sign in") || msgLower.includes("inappropriate")) {
+      await statusMsg.edit(`❌ This video is age-restricted and cannot be downloaded without authentication.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("geo") || msgLower.includes("country") || msgLower.includes("region")) {
+      await statusMsg.edit(`❌ This video is geo-blocked and not available in this region.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("copyright") || msgLower.includes("takedown")) {
+      await statusMsg.edit(`❌ This video has been removed due to a copyright claim.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("live") && (msgLower.includes("stream") || msgLower.includes("broadcast"))) {
+      await statusMsg.edit(`❌ Live streams cannot be downloaded while in progress.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("premium") || msgLower.includes("members") || msgLower.includes("subscriber")) {
+      await statusMsg.edit(`❌ This video requires a premium/membership and cannot be downloaded.\n-# \`${msg.slice(0, 200)}\``);
+    } else if (msgLower.includes("playlist")) {
+      await statusMsg.edit(`❌ Playlists are not supported. Please provide a single video URL.\n-# \`${msg.slice(0, 200)}\``);
+    } else {
+      await statusMsg.edit(`❌ Download failed: \`${msg.slice(0, 400)}\``);
+    }
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }

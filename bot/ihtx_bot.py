@@ -8157,6 +8157,7 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+
         "version": "v7.0",
         "date": "2026-06-30",
         "heavy": [],
@@ -8184,6 +8185,7 @@ _UPDATELOG: list[dict] = [
         "owner": [],
     },
     {
+
         "version": "v6.7",
         "date": "2026-06-30",
         "heavy": [
@@ -8215,6 +8217,7 @@ _UPDATELOG: list[dict] = [
             "**t!dl / t!dlv** — removed; replaced by **t!ytdl** (TypeScript bot) — supports URLs and search queries, auto-uploads to catbox if file exceeds Discord limit",
         ],
         "owner": [],
+
     },
     {
         "version": "v6.4",
@@ -8884,6 +8887,8 @@ async def lexg_command(ctx: commands.Context, duration: float = 5.0):
             await status_msg.delete()
         except discord.HTTPException as e:
             await status_msg.edit(content=f"❌ Failed to upload: {e}")
+
+
 
 
 # ---------- Owner-only moderation / utility commands ----------
