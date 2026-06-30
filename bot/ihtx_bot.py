@@ -1016,7 +1016,7 @@ def _run_tvsim(
             "-filter_complex", full_fc,
             "-map", "0:a?",
             "-pix_fmt", "yuv420p",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
             "-c:a", "aac",
             output_path,
         ]
@@ -3270,7 +3270,6 @@ def _apply_pipe_effects(
                 with tempfile.TemporaryDirectory() as split_tmp:
                     left_raw = os.path.join(split_tmp, "left_raw.mp4")
                     left_fx = os.path.join(split_tmp, "left_fx.mp4")
-                    right_raw = os.path.join(split_tmp, "right_raw.mp4")
                     # Step 1: Extract left half
                     ok, err = _run_ffmpeg_raw([
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
@@ -3286,24 +3285,13 @@ def _apply_pipe_effects(
                     ok, err = _apply_pipe_effects(left_raw, left_fx, inner_effects)
                     if not ok:
                         return False, f"leftsplit: inner effects failed: {err}"
-                    # Step 3: Extract right half (no effects)
-                    ok, err = _run_ffmpeg_raw([
-                        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
-                        "-i", current,
-                        "-vf", f"crop={half_w}:{h}:{half_w}:0",
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                        "-pix_fmt", "yuv420p", "-c:a", "copy",
-                        right_raw,
-                    ], timeout=300)
-                    if not ok:
-                        return False, f"leftsplit: crop right failed: {err}"
-                    # Step 4: hflip left half, then hstack left(hflipped)+right
+                    # Step 3: hstack left_fx (unchanged) + hflip(left_fx) to create mirror.
+                    # right_raw is not used — the right side is the processed left reflected.
                     ok, err = _run_ffmpeg_raw([
                         "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
                         "-i", left_fx,
-                        "-i", right_raw,
                         "-filter_complex",
-                        f"[0:v]hflip[lflipped];[lflipped][1:v]hstack=inputs=2[vout]",
+                        "[0:v]split[l][r];[r]hflip[rflipped];[l][rflipped]hstack=inputs=2[vout]",
                         "-map", "[vout]",
                         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                         "-pix_fmt", "yuv420p",
