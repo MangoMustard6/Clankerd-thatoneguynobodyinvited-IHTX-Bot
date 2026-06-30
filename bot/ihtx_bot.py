@@ -7868,6 +7868,15 @@ async def help_command(ctx: commands.Context, *, query: str = ""):
 
 _UPDATELOG: list[dict] = [
     {
+        "version": "v6.5",
+        "date": "2026-06-29",
+        "heavy": [],
+        "fun": [],
+        "owner": [
+            "**t!dl / t!download** — Improved yt-dlp error handling: specific user-friendly messages for common failures (video not available, private, age-restricted, geo-blocked, copyright takedown, live stream, premium-only, playlists). Added --no-playlist and --age-limit flags. Errors are no longer silently swallowed.",
+        ],
+    },
+    {
         "version": "v6.4",
         "date": "2026-06-28",
         "heavy": [
@@ -8583,6 +8592,8 @@ async def dl_command(ctx: commands.Context, url: str = ""):
                     "no_warnings": True,
                     "max_filesize": MAX_FILE_SIZE,
                     "cookiefile": None,
+                    "noplaylist": True,
+                    "age_limit": 99,
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -8600,8 +8611,39 @@ async def dl_command(ctx: commands.Context, url: str = ""):
                         await status_msg.delete()
                         return
             except Exception as e:
-                # Fall back to direct download
-                pass
+                err_msg = str(e).strip()
+                # Classify common yt-dlp errors and show user-friendly messages
+                if "not available" in err_msg.lower() or "not found" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c This video is not available. It may have been removed or made private.\n-# `{err_msg[:200]}`")
+                    return
+                elif "private" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c This video is private and cannot be downloaded.\n-# `{err_msg[:200]}`")
+                    return
+                elif "age" in err_msg.lower() or "sign in" in err_msg.lower() or "inappropriate" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c This video is age-restricted and cannot be downloaded without authentication.\n-# `{err_msg[:200]}`")
+                    return
+                elif "geo" in err_msg.lower() or "country" in err_msg.lower() or "region" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c This video is geo-blocked and not available in this region.\n-# `{err_msg[:200]}`")
+                    return
+                elif "copyright" in err_msg.lower() or "takedown" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c This video has been removed due to a copyright claim.\n-# `{err_msg[:200]}`")
+                    return
+                elif "live" in err_msg.lower() and ("stream" in err_msg.lower() or "broadcast" in err_msg.lower()):
+                    await status_msg.edit(content=f"\u274c Live streams cannot be downloaded while in progress.\n-# `{err_msg[:200]}`")
+                    return
+                elif "premium" in err_msg.lower() or "members" in err_msg.lower() or "subscriber" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c This video requires a premium/membership and cannot be downloaded.\n-# `{err_msg[:200]}`")
+                    return
+                elif "format" in err_msg.lower() and ("not found" in err_msg.lower() or "requested" in err_msg.lower()):
+                    # Format issue — try falling back to direct download
+                    pass
+                elif "playlist" in err_msg.lower():
+                    await status_msg.edit(content=f"\u274c Playlists are not supported. Please provide a single video URL.\n-# `{err_msg[:200]}`")
+                    return
+                else:
+                    # Generic yt-dlp error — show it to the user rather than silently falling back
+                    await status_msg.edit(content=f"\u274c yt-dlp download failed: {err_msg[:300]}")
+                    return
 
         # Direct download
         try:
