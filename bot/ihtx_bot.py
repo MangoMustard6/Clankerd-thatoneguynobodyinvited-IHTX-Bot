@@ -1045,22 +1045,14 @@ def _run_tvsim(
             output_path,
         ]
     else:
-        # Standalone mode: internal left/right split — left passthrough, right gets tvsim.
-        # filter_complex structure from user spec:
-        #   split → left: crop left-half passthrough (gbrp)
-        #         → right: scale 854x854, {pipeeffects}, displace, scale back, crop back (gbrp)
-        #   hstack
+        # Standalone mode: apply displacement to the full video (no internal split).
         fc = (
-            f"split[_tvl][_tvr];"
-            f"[_tvl]crop=trunc(iw/4)*2:ih:0:0,format=gbrp[_tvlout];"
-            f"[_tvr]scale=854:854{pipeeffects_str},format=bgr32[_tv00];"
+            f"[0]scale=854:854{pipeeffects_str},format=bgr32[_tv00];"
             f"[1]crop=iw:ih/{detail_zoom}:0:0,scale=854:854,"
             f"eq=contrast={contrast:.6f},format=bgr32,hue=b=-0.033[_tvx];"
             f"color=s=854x854:c=gray,format=bgr32[_tvy];"
             f"[_tv00][_tvx][_tvy]displace=edge=wrap,"
-            f"scale={w}:{h},setsar=1,format=yuv444p,"
-            f"crop=trunc(iw/4)*2:ih:trunc(iw/4)*2:0,format=gbrp[_tvrout];"
-            f"[_tvlout][_tvrout]hstack"
+            f"scale={w}:{h},setsar=1,format=yuv444p"
         )
         cmd = [
             "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
