@@ -912,6 +912,8 @@ def _run_tvsim(
     phosphorescence: float = 0.0,
     interlacing: float = 0.0,
     scan_phasing: float = 0.0,
+    aperture_grill: float = 0.0,
+    static_noise: float = 0.0,
     _in_split: bool = False,
 ) -> tuple[bool, str]:
     """Apply TV-simulator CRT effect via FFmpeg displacement map.
@@ -929,6 +931,8 @@ def _run_tvsim(
         phosphorescence — CRT phosphor glow tint (default 0 = off)
         interlacing     — scanline darkening strength (default 0 = off)
         scan_phasing    — ripple/phasing on scanlines (default 0 = off)
+        aperture_grill  — vertical phosphor stripe mask (0 = off, 1 = full, Trinitron-style)
+        static_noise    — random TV static noise strength (0 = off, 1 = heavy)
         _in_split       — when True, skip internal left/right split (called from leftsplit/rightsplit)
     """
     line_sync = max(0.0, min(1.0, line_sync))
@@ -969,6 +973,19 @@ def _run_tvsim(
             f"b='min(p(X,Y)+max(cos(Y/H*5-mod(T*16.666666*{sp},5))*128-64,0),255)'"
         )
 
+    def _aperture_grill_filter(ag: float) -> str:
+        # Vertical phosphor stripe mask — Trinitron-style CRT aperture grill
+        return (
+            f"geq=r='p(X,Y)*lerp(1,(sin(X*3.14159*6/W)+1)/2,{ag})':"
+            f"g='p(X,Y)*lerp(1,(sin(X*3.14159*6/W)+1)/2,{ag})':"
+            f"b='p(X,Y)*lerp(1,(sin(X*3.14159*6/W)+1)/2,{ag})'"
+        )
+
+    def _static_filter(st: float) -> str:
+        # Random temporal noise — TV static
+        strength = max(1, int(st * 60))
+        return f"noise=alls={strength}:allf=t+u"
+
     if line_sync == 1.0:
         if scan_phasing != 0.0:
             optional.append(_scanphase_filter(scan_phasing))
@@ -979,6 +996,12 @@ def _run_tvsim(
             optional.append(_interlace_filter(interlacing))
         if scan_phasing != 0.0:
             optional.append(_scanphase_filter(scan_phasing))
+
+    if aperture_grill != 0.0:
+        optional.append(_aperture_grill_filter(aperture_grill))
+
+    if static_noise != 0.0:
+        optional.append(_static_filter(static_noise))
 
     if line_sync == 1.0:
         # No displacement — just apply optional filters (or passthrough)
@@ -2801,6 +2824,8 @@ def _apply_pipe_effects(
                     phosphorescence=_tp(3, 0.0),
                     interlacing=_tp(4, 0.0),
                     scan_phasing=_tp(5, 0.0),
+                    aperture_grill=_tp(6, 0.0),
+                    static_noise=_tp(7, 0.0),
                     _in_split=_in_split,
                 )
                 if not ok:
@@ -7203,7 +7228,7 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
     """Apply a TV/CRT simulator effect to an attached video.
 
     Usage:
-      t!tvsim <line_sync> [detail_zoom] [vertical_sync] [phosphorescence] [interlacing] [scan_phasing]
+      t!tvsim <line_sync> [detail_zoom] [vertical_sync] [phosphorescence] [interlacing] [scan_phasing] [aperture_grill] [static]
 
     Parameters (all separated by spaces or pipes):
       line_sync       — 0-1, displacement strength (0=max CRT warp, 1=no warp). Required.
@@ -7212,10 +7237,13 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
       phosphorescence — CRT phosphor color tint (default 0 = off)
       interlacing     — scanline darkening (default 0 = off)
       scan_phasing    — scanline ripple/phase shift (default 0 = off)
+      aperture_grill  — vertical phosphor stripe mask 0-1 (default 0 = off)
+      static          — TV static noise strength 0-1 (default 0 = off)
 
     Examples:
       t!tvsim 0.5
-      t!tvsim 0.3 1 1 0.4 0.5 0
+      t!tvsim 0.3 1 1 0.4 0.5 0 0.6 0
+      t!tvsim 0.5 1 1 0 0 0 0 1
     """
     # Parse params
     tokens = re.split(r"[|\s]+", args.strip()) if args.strip() else []
@@ -7230,9 +7258,9 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply(
             "**t!tvsim** — CRT/TV simulator effect\n"
             "Attach a video and provide `line_sync` (0–1, required).\n\n"
-            "**Usage:** `t!tvsim <line_sync> [detail_zoom] [vertical_sync] [phosphorescence] [interlacing] [scan_phasing]`\n"
+            "**Usage:** `t!tvsim <line_sync> [detail_zoom] [vert_sync] [phosphor] [interlace] [scan_phase] [aperture_grill] [static]`\n"
             "**Example:** `t!tvsim 0.5`\n"
-            "**Full example:** `t!tvsim 0.3 1 1 0.4 0.5 0`\n"
+            "**Full example:** `t!tvsim 0.3 1 1 0.4 0.5 0 0.6 0`\n"
             "**As pipe effect:** `t!ihtx 1 5 - mp4 tvsim=0.5`\n"
             "Aliases: `t!tv` `t!tvsimulator`"
         )
@@ -7248,6 +7276,8 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
     phosphorescence = _tp(3, 0.0)
     interlacing     = _tp(4, 0.0)
     scan_phasing    = _tp(5, 0.0)
+    aperture_grill  = _tp(6, 0.0)
+    static_noise    = _tp(7, 0.0)
 
     # Resolve attachment
     attachment = None
@@ -7296,6 +7326,7 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
             input_path, output_path,
             line_sync, detail_zoom, vertical_sync,
             phosphorescence, interlacing, scan_phasing,
+            aperture_grill, static_noise,
         )
 
         if not ok:
@@ -7317,7 +7348,11 @@ async def tvsim_command(ctx: commands.Context, *, args: str = ""):
         try:
             embed = discord.Embed(
                 title="IHTX Bot — t!tvsim",
-                description=f"line_sync={line_sync} · detail_zoom={detail_zoom} · vert_sync={vertical_sync} · phosphor={phosphorescence} · interlace={interlacing} · scan={scan_phasing}",
+                description=(
+                    f"line_sync={line_sync} · zoom={detail_zoom} · vert={vertical_sync} · "
+                    f"phosphor={phosphorescence} · interlace={interlacing} · scan={scan_phasing} · "
+                    f"aperture={aperture_grill} · static={static_noise}"
+                ),
                 color=11578404,
             )
             embed.set_thumbnail(url="https://files.catbox.moe/xli8jw.png")
@@ -7589,7 +7624,7 @@ _HELP_ENTRIES: list[dict] = [
             "**Split:** `leftsplit(<inner_effects>)` · `rightsplit(<inner_effects>)` — apply inner effects to one half, mirror/combine\n"
             "**Reverse:** `vreverse` (video frames) · `areverse` (audio)\n"
             "**Audio:** `multipitch=semis` `volume=<val>` `vibrato=freq;depth` `syncaudio` `vocoder=mode;url` `ilvocodex=url` `orangevocoder=url` `4ormulator=url` `audacity=url`\n"
-            "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase]`\n"
+            "**CRT:** `tvsim=line_sync[;detail_zoom;vert_sync;phosphor;interlace;scan_phase;aperture_grill;static]`\n"
             "**Swirl:** `swirl=strength[;radius;xc;yc;fallout;is1to1]`\n"
             "**Aesthetics:** `folkvalley` / `fv` — music replacement + brightness + overlay\n"
             "**Overlay:** `nepeta[=url]` (cat-ear PNG or custom image scaled to video) `watermark=<url>` `ring[=url]` `miui` `reddit` `caption=<text>`\n"
@@ -7804,12 +7839,15 @@ _HELP_ENTRIES: list[dict] = [
             "• `vertical_sync` — vertical scroll speed (default 1 = off)\n"
             "• `phosphorescence` — CRT phosphor color tint 0–1 (default 0 = off)\n"
             "• `interlacing` — scanline darkening 0–1 (default 0 = off)\n"
-            "• `scan_phasing` — animated scanline ripple 0–1 (default 0 = off)\n\n"
+            "• `scan_phasing` — animated scanline ripple 0–1 (default 0 = off)\n"
+            "• `aperture_grill` — Trinitron-style vertical phosphor stripe mask 0–1 (default 0 = off)\n"
+            "• `static` — random TV static noise strength 0–1 (default 0 = off)\n\n"
             "**Examples:**\n"
             "`t!tvsim 0.5` — moderate CRT warp\n"
-            "`t!tvsim 0.3 1 1 0.4 0.5 0` — warp + phosphor + interlace\n"
+            "`t!tvsim 0.3 1 1 0.4 0.5 0 0.6 0` — warp + phosphor + interlace + aperture grill\n"
+            "`t!tvsim 0.5 1 1 0 0 0 0 1` — warp + full static\n"
             "**As pipe effect:** `t!ihtx 1 5 - mp4 tvsim=0.5`\n"
-            "Full pipe syntax: `tvsim=line_sync;detail_zoom;vert_sync;phosphor;interlace;scan_phase`"
+            "Full pipe syntax: `tvsim=line_sync;detail_zoom;vert_sync;phosphor;interlace;scan_phase;aperture_grill;static`"
         ),
     },
     {
@@ -8213,6 +8251,15 @@ _UPDATELOG: list[dict] = [
         "date": "2026-06-30",
         "heavy": [
             "**t!ihtx** — new pipe effect: `nepeta[=url]` — overlays the Nepeta cat-ear PNG (or custom image URL) scaled to fit the video dimensions, with `-shortest` to handle short videos correctly",
+        ],
+        "fun": [],
+        "owner": [],
+    },
+    {
+        "version": "v7.1",
+        "date": "2026-06-30",
+        "heavy": [
+            "**t!tvsim / tvsim pipe** — two new params: `aperture_grill` (0–1, Trinitron-style vertical phosphor stripe mask via geq sin on X) and `static` (0–1, random TV noise via `noise=alls=N:allf=t+u`). Full pipe syntax: `tvsim=line_sync;detail_zoom;vert_sync;phosphor;interlace;scan_phase;aperture_grill;static`",
         ],
         "fun": [],
         "owner": [],
