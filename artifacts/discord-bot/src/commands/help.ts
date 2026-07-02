@@ -22,7 +22,7 @@ export async function handleHelp(message: Message, ownerId: string): Promise<voi
         iconURL: message.author.displayAvatarURL(),
       })
       .setTitle('IHTX Bot — Commands  (1/3)')
-      .setDescription(`Prefix: \`${PREFIX}\`  •  \`t!\` for all commands`)
+      .setDescription(`Prefix: \`${PREFIX}\`  •  \`roxi \` for all commands`)
       .addFields(
         {
           name: '🔥 Heavy Effects  *(slow/rate-limited)*',

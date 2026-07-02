@@ -27,7 +27,7 @@ function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
 export async function runYtdl(message: Message): Promise<void> {
   const trimmed = message.content.trim();
 
-  const PREFIXES = ["t!youtubedownload", "t!ytdl"];
+  const PREFIXES = ["roxi youtubedownload", "roxi ytdl"];
   const matchedPrefix = PREFIXES.find((p) =>
     trimmed.toLowerCase().startsWith(p + " ") || trimmed.toLowerCase() === p
   );
