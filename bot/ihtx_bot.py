@@ -474,7 +474,7 @@ _load_tags()
 # Intents and bot
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="t!", intents=intents)
+bot = commands.Bot(command_prefix="roxi ", intents=intents)
 
 # Maps user message id → list of bot reply message ids.
 # Used to delete old responses when the user edits their command.

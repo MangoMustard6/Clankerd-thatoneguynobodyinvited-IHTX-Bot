@@ -721,6 +721,13 @@ class EconomyCog(commands.Cog, name="Economy"):
                     result_embed = _make_base_embed()
                     result_embed.add_field(name="Effect:", value=_applied, inline=True)
                     result_embed.add_field(name="Resolution:", value=f"{res_str} ({ar_str}) · {fps_str}", inline=True)
+                    if use_pipe:
+                        _dur_label = duration if duration != "vidlen" else "full video"
+                        result_embed.add_field(
+                            name="​",
+                            value=f"✅ IHTX Command — `powers={repetitions}` `notrim={str(no_trim).lower()}` `duration={_dur_label}`",
+                            inline=False,
+                        )
                     result_embed.add_field(
                         name="Reminder:",
                         value="Make sure you use `.t sync+` or `.t sync+ alt` afterwards to make sure the video is synced to the audio",
@@ -743,6 +750,13 @@ class EconomyCog(commands.Cog, name="Economy"):
             result_embed = _make_base_embed()
             result_embed.add_field(name="Effect:", value=_applied, inline=True)
             result_embed.add_field(name="Resolution:", value=f"{res_str} ({ar_str}) · {fps_str}", inline=True)
+            if use_pipe:
+                _dur_label = duration if duration != "vidlen" else "full video"
+                result_embed.add_field(
+                    name="​",
+                    value=f"✅ IHTX Command — `powers={repetitions}` `notrim={str(no_trim).lower()}` `duration={_dur_label}`",
+                    inline=False,
+                )
             result_embed.add_field(
                 name="Reminder:",
                 value="Make sure you use `.t sync+` or `.t sync+ alt` afterwards to make sure the video is synced to the audio",
