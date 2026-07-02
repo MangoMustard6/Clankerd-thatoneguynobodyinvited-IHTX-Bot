@@ -1,9 +1,9 @@
 """
 EconomyCog — Server Economy, RPG Inventory & Fun Commands for IHTX Bot.
 
-Commands (all hybrid — work as text prefix t! AND slash /):
+Commands (all hybrid — work as text prefix roxi  AND slash /):
   /profile [user]   — Rich profile card with Edit Bio modal + Inventory view
-  /ihtxgen          — Slash-native t!ihtx pipeline with live embed feedback
+  /ihtxgen          — Slash-native roxi ihtx pipeline with live embed feedback
   /slot             — Slot machine (777 → +200 XP), 1-hour cooldown
 
 Data persistence: JSON file at bot/economy_data.json (zero external deps).
@@ -310,7 +310,7 @@ def _slots_embed(
         f"╚══════════════╝"
     )
     if jackpot and xp_total is not None:
-        embed.add_field(name="🏆 Jackpot!", value=f"+200 XP awarded!\nTotal XP: **{xp_total}**", inline=False)
+        embed.add_field(name="🏆 Jackporoxi ", value=f"+200 XP awarded!\nTotal XP: **{xp_total}**", inline=False)
     elif win:
         embed.add_field(name="🎉 Match!", value="Two matching symbols — keep spinning!", inline=False)
     else:
@@ -466,7 +466,7 @@ class EconomyCog(commands.Cog, name="Economy"):
             if effect_lower in PRESET_FILTERS:
                 effect = effect_lower
             else:
-                # Try full t!ihtx custom-syntax string in the effect field
+                # Try full roxi ihtx custom-syntax string in the effect field
                 # e.g. "10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7"
                 _custom_parsed = _parse_ihtx_custom_args(effect.strip())
                 if _custom_parsed is not None:
@@ -485,9 +485,9 @@ class EconomyCog(commands.Cog, name="Economy"):
                             description=(
                                 f"**Presets:** {preset_list}\n\n"
                                 "**Pipe-effects shorthand** *(1 rep, full duration, mp4)*:\n"
-                                "`t!ihtx <pipe effects>`\n"
-                                "Example: `t!ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)`\n"
-                                "Example: `t!ihtx negate,huehsv=0.5`\n\n"
+                                "`roxi ihtx <pipe effects>`\n"
+                                "Example: `roxi ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)`\n"
+                                "Example: `roxi ihtx negate,huehsv=0.5`\n\n"
                                 "**Full custom syntax:**\n"
                                 "`<exports> <duration> <no_trim> <format> <pipe effects>`\n"
                                 "Example: `10 0.483 - mp4 huehsv 0.5;negate;multipitch=1|6|7`"
@@ -778,7 +778,7 @@ class EconomyCog(commands.Cog, name="Economy"):
                 await ctx.send(file=discord.File(output_path, filename=out_filename))
 
     # -----------------------------------------------------------------------
-    # t!ihtx / t!effect / t!destroy — prefix-only alias that consumes the
+    # roxi ihtx / roxi effect / roxi destroy — prefix-only alias that consumes the
     # full rest of the message as one string, avoiding discord.py's per-token
     # argument parsing (which breaks the "1 5 - mp4 negate" custom syntax).
     # -----------------------------------------------------------------------
@@ -814,9 +814,9 @@ class EconomyCog(commands.Cog, name="Economy"):
             # syntax) and isn't a known preset name, treat the entire string as
             # pipe effects with defaults (1 rep, full video duration, mp4).
             # This lets users write:
-            #   t!ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)
-            #   t!ihtx negate,huehsv=0.5
-            #   t!ihtx ffmpeg(-vf negate),speed=0.5
+            #   roxi ihtx ffmpeg(-vf huesaturation=saturation=1:strength=100)
+            #   roxi ihtx negate,huehsv=0.5
+            #   roxi ihtx ffmpeg(-vf negate),speed=0.5
             if args and not first[:1].isdigit() and first not in PRESET_FILTERS:
                 await ctx.invoke(
                     self.ihtxgen,
