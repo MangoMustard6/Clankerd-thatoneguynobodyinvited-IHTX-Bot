@@ -11,6 +11,7 @@
 - [Night Shift game](nightshift-game.md) — `/nightshift` renders all frames procedurally in memory and runs as a per-channel interactive game cog.
 - [Night Shift difficulty](nightshift-difficulty.md) — Easy, Normal, and Hard tune battery drain and animatronic movement; Normal is the default.
 - [Discord message length](discord-message-length.md) — clip FFmpeg and exception diagnostics before Discord replies or edits to stay under 2,000 characters.
+- [Discord thread access](discord-thread-access.md) — join accessible threads before command replies and log permission/archive failures instead of appearing silent.
 - [SCGV TypeScript paths](scgv-typescript-paths.md) — keep SCGV available through both the reusable pipe-effect runner and the standalone prefix command.
 - [Pitchtransition separators](pitchtransition-separators.md) — accept semicolon-separated voice pairs and the space-normalized form produced by custom exports.
 - [Pitchtransition export timing](pitchtransition-export-timing.md) — compensate Rubber Band look-ahead and reset audio/video PTS through every IHTX export pass.
