@@ -14,3 +14,4 @@ description: User requires BOT_OWNER_ID to always be a mandatory secret with no 
 - TypeScript bots: read `process.env.BOT_OWNER_ID`, check it is truthy immediately at startup (alongside the token check), and `process.exit(1)` if missing.
 - Always list `BOT_OWNER_ID` as a required secret in `replit.md`.
 - Request it via `requestSecrets` when setting up secrets for the user.
+- Keep `BOT_OWNER_ID` in the runtime owner set even when a saved owner-ID file exists; owner-only recovery commands such as channel unblocking must not be locked out by persisted state.
