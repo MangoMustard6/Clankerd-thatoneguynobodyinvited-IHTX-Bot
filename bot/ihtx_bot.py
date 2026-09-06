@@ -716,6 +716,28 @@ def _is_channel_blocked_for_user(channel, user) -> bool:
         return False
     return channel.id in channel_blocks
 
+
+async def _ensure_thread_membership(channel) -> None:
+    """Join an accessible thread before trying to reply inside it."""
+    if not isinstance(channel, discord.Thread):
+        return
+    if channel.archived or channel.locked:
+        print(
+            f"[thread] Cannot reply in archived/locked thread {channel.id}.",
+            flush=True,
+        )
+        return
+    try:
+        await channel.join()
+    except discord.Forbidden:
+        print(
+            f"[thread] Cannot join thread {channel.id}; check View Channel and Send Messages in Threads permissions.",
+            flush=True,
+        )
+    except discord.HTTPException as exc:
+        print(f"[thread] Joining thread {channel.id} failed: {exc}", flush=True)
+
+
 # Per-channel keyword blocklist
 KEYWORD_BLOCK_FILE = Path("bot/keyword_blocks.json")
 KEYWORD_BLOCK_MSG_FILE = Path("bot/keyword_block_messages.json")
@@ -936,9 +958,15 @@ _BOT_PREFIXES = [_BOT_PREFIX]
 bot = commands.Bot(command_prefix=_BOT_PREFIXES, intents=intents, help_command=None)
 
 
+@bot.before_invoke
+async def _ensure_prefix_thread_access(ctx: commands.Context) -> None:
+    await _ensure_thread_membership(ctx.channel)
+
+
 @bot.tree.interaction_check
 async def _slash_global_check(interaction: discord.Interaction) -> bool:
     """Mirror the prefix command global checks for slash (/) commands."""
+    await _ensure_thread_membership(interaction.channel)
     # Blocked users — owners are exempt so they can always unblock themselves
     if (
         (
