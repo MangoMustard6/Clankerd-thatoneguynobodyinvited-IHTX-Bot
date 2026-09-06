@@ -20,6 +20,9 @@ fileaa flags (passed through to the binary on every segment):
   --preserve-formants         Preserve formants
   --no-normalize              Disable peak normalisation
   --rubberband-args "<flags>" Rubber Band CLI flags (e.g. "-2 --pitch-hc")
+  --signalsmith-args "<opts>" Signalsmith settings (e.g. "preset=voice split=2")
+  --bungee-args "<opts>"      Bungee settings (e.g. "chunk=8192 flush=4096")
+  --soundtouch-args "<opts>"  SoundTouch settings (e.g. "aa=1 quickseek=1")
 
 Script-only flag:
   --seg N   Segment duration in seconds (default: 0.4)
@@ -45,15 +48,24 @@ import subprocess
 import sys
 import tempfile
 
-# ── Locate the fileaa binary next to this script ────────────────────────────
+# ── Locate the renamed multipitch binary next to this script ────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-_FILEAA_BIN = os.path.join(_SCRIPT_DIR, "fileaa")
+_FILEAA_BIN = os.path.join(_SCRIPT_DIR, "multipitch")
+if not os.path.isfile(_FILEAA_BIN):
+    # Keep older local checkouts and explicitly uploaded fileaa assets working.
+    _FILEAA_BIN = os.path.join(_SCRIPT_DIR, "fileaa")
 
 # fileaa flags that this script recognises and passes through
 _FILEAA_FLAGS = {
     "--bungee", "--soundtouch", "--basic", "--preserve-formants", "--no-normalize",
 }
-_FILEAA_FLAG_WITH_VALUE = {"--backend", "--rubberband-args"}
+_FILEAA_FLAG_WITH_VALUE = {
+    "--backend",
+    "--rubberband-args",
+    "--signalsmith-args",
+    "--bungee-args",
+    "--soundtouch-args",
+}
 
 
 def _die(msg: str) -> None:

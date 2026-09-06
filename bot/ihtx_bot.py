@@ -8,6 +8,7 @@ Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp
 ImageMagick/sox/etc. depending on advanced effects.
 
 _UPDATELOG (newest first):
+- 2026-09-06: [Python] Added owner-only timed `th>block`/`th>unblock` commands, enforced timed blocks across prefix and slash commands, and switched the bundled pitch engine to the renamed `multipitch` binary with expanded engine options.
 - 2026-09-03: [Python] Limited startup restart notices to exactly the two newest update-log changes instead of summarizing the full history.
 - 2026-09-03: [Python] Fixed owner th>ihtx `ffmpeg(...)` Bash substitutions so quoted `$()`/backtick filter payloads keep commas intact and execute through Bash.
 - 2026-09-02: [Python] Added owner-only th>ihtx Bash/Python worker attachments with FILE_1/OUTPUT_FILE context and dynamic-prefix bothelp rendering.
@@ -252,6 +253,7 @@ import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import TypedDict
 import urllib.parse
 import base64
 try:
@@ -597,6 +599,81 @@ def _save_blocklist():
 
 _load_blocklist()
 
+# Timed user blocks (th>block / th>unblock)
+TIMED_BLOCKS_FILE = Path("data/blocks.json")
+OWNER_USERNAME = "meatloaf_fan534"
+
+
+class TimedBlockEntry(TypedDict):
+    until: int
+    username: str
+
+
+TimedBlockStore = dict[str, TimedBlockEntry]
+
+
+def _load_timed_blocks() -> TimedBlockStore:
+    """Read timed block state, returning an empty store for missing/bad JSON."""
+    if not TIMED_BLOCKS_FILE.exists():
+        return {}
+    try:
+        with TIMED_BLOCKS_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(user_id): {
+                "until": int(entry["until"]),
+                "username": str(entry.get("username", user_id)),
+            }
+            for user_id, entry in data.items()
+            if isinstance(entry, dict) and "until" in entry
+        }
+    except (OSError, TypeError, ValueError, KeyError):
+        return {}
+
+
+def _save_timed_blocks(store: TimedBlockStore) -> None:
+    """Ensure the data directory exists and persist timed block state."""
+    TIMED_BLOCKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with TIMED_BLOCKS_FILE.open("w", encoding="utf-8") as handle:
+        json.dump(store, handle, indent=2)
+
+
+def _is_timed_blocked(user_id: int) -> bool:
+    """Return whether a user has an active timed block and clean expired state."""
+    user_key = str(user_id)
+    store = _load_timed_blocks()
+    entry = store.get(user_key)
+    if not entry:
+        return False
+
+    if int(time.time() * 1000) >= entry["until"]:
+        del store[user_key]
+        _save_timed_blocks(store)
+        return False
+    return True
+
+
+def _get_timed_block_info(user_id: int) -> TimedBlockEntry | None:
+    """Return active timed block metadata, or None when unblocked/expired."""
+    user_key = str(user_id)
+    store = _load_timed_blocks()
+    entry = store.get(user_key)
+    if not entry:
+        return None
+    if int(time.time() * 1000) >= entry["until"]:
+        del store[user_key]
+        _save_timed_blocks(store)
+        return None
+    return entry
+
+
+def _is_timed_block_owner(ctx: commands.Context) -> bool:
+    """Support the configured owner username while retaining owner-ID auth."""
+    return ctx.author.name == OWNER_USERNAME or _is_owner(ctx)
+
+
 # Channel blocklist
 CHANNEL_BLOCK_FILE = Path("bot/channel_blocks.json")
 channel_blocks: set[int] = set()
@@ -845,7 +922,14 @@ bot = commands.Bot(command_prefix=_BOT_PREFIXES, intents=intents, help_command=N
 async def _slash_global_check(interaction: discord.Interaction) -> bool:
     """Mirror the prefix command global checks for slash (/) commands."""
     # Blocked users — owners are exempt so they can always unblock themselves
-    if interaction.user.id in blocklist and interaction.user.id not in owner_ids:
+    if (
+        (
+            interaction.user.id in blocklist
+            or _is_timed_blocked(interaction.user.id)
+        )
+        and interaction.user.id not in owner_ids
+        and getattr(interaction.user, "name", "") != OWNER_USERNAME
+    ):
         try:
             await interaction.response.send_message("❌ You are blocked from using this bot.", ephemeral=True)
         except Exception:
@@ -986,7 +1070,14 @@ async def _global_checks(ctx: commands.Context) -> bool:
     if ctx.channel.id in channel_blocks:
         return False
     # User blocked — owners are always exempt so they can unblock themselves
-    if ctx.author.id in blocklist and ctx.author.id not in owner_ids:
+    if (
+        (
+            ctx.author.id in blocklist
+            or _is_timed_blocked(ctx.author.id)
+        )
+        and ctx.author.id not in owner_ids
+        and ctx.author.name != OWNER_USERNAME
+    ):
         return False
     # Heavy command rate limiting
     if ctx.command and ctx.command.name in HEAVY_COMMANDS:
@@ -6539,8 +6630,9 @@ def _run_ihtx_tagscript_workflow(
 
 MAX_PITCHES = 100
 
-# Path to the Signalsmith multi-pitch binary (downloaded at startup)
-_MULTIPITCH_BIN = os.path.join(os.path.dirname(__file__), "fileaa")
+# Path to the multi-pitch binary (downloaded at startup).
+# The upstream executable was renamed from fileaa to multipitch.
+_MULTIPITCH_BIN = os.path.join(os.path.dirname(__file__), "multipitch")
 _MULTIPITCH_URL = "https://file.garden/aTXso15ukD3mnuPI/multipitch"
 _MULTIPITCH_BIN_OVERRIDE: ContextVar[str | None] = ContextVar(
     "ihtx_multipitch_bin_override", default=None
@@ -6566,6 +6658,8 @@ def _ensure_multipitch_bin() -> bool:
     so we skip the download and return False immediately — callers must then
     fall through to the rubberband/FFmpeg fallback path.
     """
+    import platform
+
     override = _MULTIPITCH_BIN_OVERRIDE.get()
     if override is not None:
         if os.path.isfile(override):
@@ -6580,13 +6674,13 @@ def _ensure_multipitch_bin() -> bool:
         # Even if the file exists, it might be the wrong architecture
         # (e.g. checked into the repo or downloaded on a different machine).
         if not _is_native_arch("x86_64"):
-            print(f"[multipitch] skipping fileaa — host is {platform.machine()}, binary is x86-64 only")
+            print(f"[multipitch] skipping multipitch — host is {platform.machine()}, binary is x86-64 only")
             return False
         return True
 
     # Only x86_64 hosts can run the binary
     if not _is_native_arch("x86_64"):
-        print(f"[multipitch] skipping fileaa download — host is {platform.machine()}, binary is x86-64 only")
+        print(f"[multipitch] skipping multipitch download — host is {platform.machine()}, binary is x86-64 only")
         return False
 
     try:
@@ -6863,12 +6957,13 @@ def _run_multipitch_custom(
     output_path: str,
     params: list[str],
 ) -> tuple[bool, str]:
-    """Run fileaa with custom pitch values and passthrough engine options.
+    """Run multipitch with custom pitch values and passthrough engine options.
 
     The first parameter is the pitch list. Additional parameters are
     tokenized as fileaa arguments, for example:
       mpcustom=-3.5|5::--backend bungee::--no-normalize
       mpcustom=-3.5|5::--bungee-args="chunk=8192 flush=4096"
+      mpcustom=-3.5|5::--signalsmith-args="preset=voice split=2"
     """
     if not params or not params[0].strip():
         return False, "❌ Custom multipitch requires pitch values."
@@ -16072,6 +16167,103 @@ def _parse_digits(s: str) -> int:
         return int(s)
     except Exception:
         raise ValueError("Could not parse id")
+
+
+@bot.command(name="block")
+async def block_command(
+    ctx: commands.Context,
+    target_raw: str = "",
+    hours_raw: str = "",
+) -> None:
+    """Temporarily block a user from using the bot.
+
+    Usage: th>block <@mention|userId> <hours>
+    """
+    if not _is_timed_block_owner(ctx):
+        await ctx.reply("❌ Only the bot owner can use this command.")
+        return
+
+    try:
+        hours = float(hours_raw)
+    except (TypeError, ValueError):
+        hours = 0.0
+
+    if not target_raw or hours <= 0:
+        await ctx.reply("❌ Usage: `th>block <@mention|userId> <hours>`")
+        return
+
+    mention_match = re.fullmatch(r"<@!?(\d+)>", target_raw)
+    if mention_match:
+        target_id = mention_match.group(1)
+    elif target_raw.isdigit():
+        target_id = target_raw
+    else:
+        await ctx.reply("❌ Please specify a user via `@mention` or numeric user ID.")
+        return
+
+    target_username = target_raw
+    if ctx.guild:
+        member = ctx.guild.get_member(int(target_id))
+        if member is None:
+            try:
+                member = await ctx.guild.fetch_member(int(target_id))
+            except discord.HTTPException:
+                member = None
+        if member is not None:
+            target_username = member.name
+
+    if target_id == str(ctx.author.id):
+        await ctx.reply("❌ You cannot block yourself.")
+        return
+
+    until = int(time.time() * 1000) + round(hours * 3_600_000)
+    store = _load_timed_blocks()
+    store[target_id] = {"until": until, "username": target_username}
+    _save_timed_blocks(store)
+
+    unix_sec = until // 1000
+    await ctx.reply(
+        f"✅ **{target_username}** is blocked from using the bot for **{hours}h** "
+        f"(until <t:{unix_sec}:F>)."
+    )
+
+
+@bot.command(name="unblock")
+async def unblock_command(ctx: commands.Context, target_raw: str = "") -> None:
+    """Remove an active timed block from a user.
+
+    Usage: th>unblock <@mention|userId>
+    """
+    if not _is_timed_block_owner(ctx):
+        await ctx.reply("❌ Only the bot owner can use this command.")
+        return
+
+    if not target_raw:
+        await ctx.reply("❌ Usage: `th>unblock <@mention|userId>`")
+        return
+
+    mention_match = re.fullmatch(r"<@!?(\d+)>", target_raw)
+    if mention_match:
+        target_id = mention_match.group(1)
+    elif target_raw.isdigit():
+        target_id = target_raw
+    else:
+        await ctx.reply("❌ Please specify a user via `@mention` or numeric user ID.")
+        return
+
+    store = _load_timed_blocks()
+    entry = store.get(target_id)
+    if entry is None or int(time.time() * 1000) >= entry["until"]:
+        if entry is not None:
+            del store[target_id]
+            _save_timed_blocks(store)
+        await ctx.reply("ℹ️ That user is not currently blocked.")
+        return
+
+    name = entry["username"]
+    del store[target_id]
+    _save_timed_blocks(store)
+    await ctx.reply(f"✅ **{name}** has been unblocked.")
 
 
 @bot.command(name="blockuser")
