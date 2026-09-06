@@ -8,6 +8,7 @@ Dependencies required at runtime: ffmpeg, aiohttp, discord.py, optionally yt-dlp
 ImageMagick/sox/etc. depending on advanced effects.
 
 _UPDATELOG (newest first):
+- 2026-09-06: [Python] Fixed blocked threads trapping owners by exempting configured owners from channel-block checks across prefix and slash commands, preserving the required BOT_OWNER_ID alongside saved owner IDs so accidental thread blocks can be removed.
 - 2026-09-06: [Python] Added owner-only timed `th>block`/`th>unblock` commands, enforced timed blocks across prefix and slash commands, and switched the bundled pitch engine to the renamed `multipitch` binary with expanded engine options.
 - 2026-09-03: [Python] Limited startup restart notices to exactly the two newest update-log changes instead of summarizing the full history.
 - 2026-09-03: [Python] Fixed owner th>ihtx `ffmpeg(...)` Bash substitutions so quoted `$()`/backtick filter payloads keep commas intact and execute through Bash.
@@ -332,7 +333,7 @@ def _load_owner_ids():
     try:
         if OWNER_IDS_FILE.exists():
             with OWNER_IDS_FILE.open() as f:
-                owner_ids = set(int(x) for x in json.load(f))
+                owner_ids = {OWNER_ID, *(int(x) for x in json.load(f))}
         else:
             owner_ids = {OWNER_ID}
     except Exception:
@@ -698,6 +699,23 @@ def _save_channel_blocks():
 
 _load_channel_blocks()
 
+
+def _is_channel_blocked_for_user(channel, user) -> bool:
+    """Check channel blocks without trapping owners in a blocked thread.
+
+    Threads have their own Discord channel IDs, so explicit thread blocks stay
+    scoped to that thread. Owners can always reach the unblock command to
+    recover from an accidental block.
+    """
+    if channel is None:
+        return False
+    if user is not None and (
+        _is_owner_by_id(getattr(user, "id", 0))
+        or getattr(user, "name", "") == OWNER_USERNAME
+    ):
+        return False
+    return channel.id in channel_blocks
+
 # Per-channel keyword blocklist
 KEYWORD_BLOCK_FILE = Path("bot/keyword_blocks.json")
 KEYWORD_BLOCK_MSG_FILE = Path("bot/keyword_block_messages.json")
@@ -936,7 +954,7 @@ async def _slash_global_check(interaction: discord.Interaction) -> bool:
             pass
         return False
     # Blocked channels
-    if interaction.channel and interaction.channel.id in channel_blocks:
+    if _is_channel_blocked_for_user(interaction.channel, interaction.user):
         return False
     return True
 
@@ -1067,7 +1085,7 @@ One command, pipe-style syntax:
 @bot.check
 async def _global_checks(ctx: commands.Context) -> bool:
     # Channel blocked
-    if ctx.channel.id in channel_blocks:
+    if _is_channel_blocked_for_user(ctx.channel, ctx.author):
         return False
     # User blocked — owners are always exempt so they can unblock themselves
     if (
