@@ -224,5 +224,13 @@
     "guild_id": "1124758333883158638",
     "guild_name": "VideoEditBot Collection 1.0",
     "submitted_at": "2026-08-28T12:38:27.127143+00:00"
+  },
+  "dark_night_skies": {
+    "effects": "ffmpeg(-i $(curl -s \"https\"\"://file.garden/aX9mS1junENdw7e-/Project%20Name%2010.mov\" -filter_complex \"[0]format=gbrp[o];[1]scale=$w:$h[i];[o][i]blend=all_mode=normal:all_mode=overlay,format=yuv420p[out]\" -map \"[out]\" -map 0:a),ffmpeg(-vf \"movie=$(ffmpeg -stream_loop -1 -i \"https\"\"://file.garden/aX9mS1junENdw7e-/Project%20Name%209.mp4\" -t $d -preset ultrafast -an ./c.mp4; echo ./c.mp4):loop=(2^31)-1,trim=duration=$d[d];[0]hflip,scale=2160:2160,format=bgr32[00];[d]format=yuv444p,geq='p(mod(X,W),mod(Y/2.5,H))',scale=2160:2160,eq=contrast='(1-0.966)*6':eval=frame,format=bgr32,hue=b=-0.033[x];color=s=2160x2160:c=#808080,format=bgr32[y];[00][x][y]displace=edge=wrap,scale=$w:$h,setsar=1,format=yuv444p\",\"split[v0][v1];[v0]format=gbrp[main];[v1]pad=iw*2:ih*2:(ow-iw)*0.5:(oh-ih)*0.5,scale=$w:$h,setsar=1:1,format=gbrp,v360=cylindrical:e:pitch=-90,scale=$w:$w,setsar=1:1,format=gbrp,yaepblur=16[v2];nullsrc=s=${w}x${w},geq=r='if(eq(X,W/2)*between(Y,H/2,H/2),255,0):g=if(eq(X,W/2)*between(Y,H/2,H/2),255,0):b=if(eq(X,W/2)*between(Y,H/2,H/2),255,0)',dblur=90:$h/(20/3)*0.25,geq=r='if(gte(Y,H/2),p(X,Y),0)':g='if(gte(Y,H/2),p(X,Y),0)':b='if(gte(Y,H/2),p(X,Y),0)'[m];[v2][m]convolve=shortest=1,v360=e:cylindrical:pitch=90,scale=$w*2:$h*2,setsar=1:1,crop=$w:$h:(iw-ow)*0.5:(ih-oh)*0.5,lutrgb=val*(255/255):val*(255/255):val*(255/255)[rays];[main][rays]blend=all_mode=lighten,format=gray,curves=r=0/0 0.5/0.23921568627450981 1/1:g=0/0 0.5/0.26666666666666666 1/1:b=0/0 0.5/0.3215686274509804 1/1\",format=yuv420p -preset ultrafast)",
+    "author_id": "1355759019330895973",
+    "author_name": "meatloaf_fan534",
+    "guild_id": "1496091892067209307",
+    "guild_name": "534Video Server",
+    "submitted_at": "2026-09-07T10:31:15.137150+00:00"
   }
 }
